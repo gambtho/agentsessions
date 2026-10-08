@@ -33,7 +33,7 @@ var ErrUnplaceable = errors.New("placement: harness cannot be placed on this run
 
 // Backend is the compute Runtime the Placer drives. It exposes the harness DESCRIPTOR so the Placer
 // can gate CanPlace before Create (placement must not provision compute to learn a harness's needs);
-// the harness itself is reached by dialing Incarnation.Address (Harness.Connect) — the one dial path
+// the harness itself is reached by dialing the incarnation (Harness.Connect) — the one dial path
 // both runtime/local and substrate use. runtime/local satisfies this.
 type Backend interface {
 	api.Runtime
@@ -42,25 +42,38 @@ type Backend interface {
 
 // Placer owns the incarnation lifecycle: Create the compute, mint+bind the fence, drive the controller.
 type Placer struct {
-	backend Backend
-	model   controller.ModelFunc
-	stream  controller.StreamFunc
-	dial    Dialer
-	logger  *slog.Logger
+	backend         Backend
+	model           controller.ModelFunc
+	stream          controller.StreamFunc
+	dial            Dialer
+	incarnationDial IncarnationDialer
+	logger          *slog.Logger
 }
 
 // Dialer opens a Harness.Connect client to the harness at a runtime-specific address and returns a
 // closer for the connection. runtime/local passes a unix-socket address (unix://…); substrate passes
 // the actor's pod IP as host:port (PodIP:80), dialed directly over h2c — the atenet mesh is
 // HTTP/1.1-only to actors, so gRPC bypasses the router. The default dialer handles both forms;
-// WithDialer overrides it (tests). This is the one transport seam the harness rides unchanged.
+// WithDialer overrides address-based dialing.
 type Dialer func(address string) (api.Harness, func() error, error)
+
+// IncarnationDialer opens a Harness.Connect client using the complete backend-provided incarnation
+// and returns a closer for the connection. It receives the incarnation before the Placer mints and
+// stamps its new fence. A Placer may call it concurrently for different sessions.
+type IncarnationDialer func(api.Incarnation) (api.Harness, func() error, error)
 
 // Option configures a Placer.
 type Option func(*Placer)
 
-// WithDialer overrides how the Placer reaches a harness (default: unix-socket dial for runtime/local).
+// WithDialer overrides address-based dialing (default: unix-socket or TCP dial). A non-nil
+// WithIncarnationDialer takes precedence regardless of option order.
 func WithDialer(d Dialer) Option { return func(p *Placer) { p.dial = d } }
+
+// WithIncarnationDialer configures dialing with the complete incarnation. A non-nil callback takes
+// precedence over WithDialer regardless of option order; nil falls back to address-based dialing.
+func WithIncarnationDialer(d IncarnationDialer) Option {
+	return func(p *Placer) { p.incarnationDial = d }
+}
 
 // ExecOption configures a single execution.
 type ExecOption func(*execConfig)
@@ -197,7 +210,7 @@ func (p *Placer) Exec(ctx context.Context, log eventlog.Store, sessionUID string
 		"runtime", inc.Runtime,
 		"transport", addressTransport(inc.Address),
 	)
-	har, closeHarness, err := p.dial(inc.Address)
+	har, closeHarness, err := p.dialHarness(inc)
 	if err != nil {
 		dialFinished(err, "error_kind", "harness_dial_failed")
 		return inc, err
@@ -223,6 +236,13 @@ func (p *Placer) Exec(ctx context.Context, log eventlog.Store, sessionUID string
 		return inc, err
 	}
 	return inc, nil
+}
+
+func (p *Placer) dialHarness(inc api.Incarnation) (api.Harness, func() error, error) {
+	if p.incarnationDial != nil {
+		return p.incarnationDial(inc)
+	}
+	return p.dial(inc.Address)
 }
 
 // defaultDial reaches a harnesswire server by address form: runtime/local passes a unix-socket
@@ -324,7 +344,7 @@ func (p *Placer) Resume(ctx context.Context, log eventlog.Store, sessionUID stri
 		"runtime", inc.Runtime,
 		"transport", addressTransport(inc.Address),
 	)
-	har, closeHarness, err := p.dial(inc.Address)
+	har, closeHarness, err := p.dialHarness(inc)
 	if err != nil {
 		dialFinished(err, "error_kind", "harness_dial_failed")
 		return err

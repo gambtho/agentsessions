@@ -9,6 +9,10 @@ provide.
 
 ### Compatibility
 
+- Placement supports `WithIncarnationDialer` for transport routing from the complete backend-provided
+  incarnation, before the Placer stamps its new fence. A non-nil callback takes precedence over
+  `WithDialer` regardless of option order; nil preserves address-based dialing. Existing `Dialer`,
+  `WithDialer`, and default transports are unchanged.
 - Every new execution records `EXECUTION_START`, including default-config turns, so interrupted
   recovery can reject partially committed inputs. Binaries older than this release fail chain
   verification with a `content_hash` mismatch for sessions containing this event. Rollback is not
