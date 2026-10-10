@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aramase/agentsessions/api"
+	"github.com/aramase/agentsessions/eventlog"
 )
 
 // ErrSessionNotFound is returned for a session UID with no metadata row. It is distinct from an
@@ -51,12 +52,16 @@ type SessionMeta struct {
 	Identity    string
 }
 
-// SessionInfo is the stored metadata plus the two fields the store derives: the log cursor, and the
-// compute state projected from the session's lifecycle events.
+// SessionInfo adds the store-owned log cursor, compute projection and permanent deletion intent
+// to caller metadata. Deletion timestamps are absent (zero time) while ACTIVE.
 type SessionInfo struct {
 	SessionMeta
-	LastSeq      int64
-	ComputeState api.ComputeState
+	LastSeq             int64
+	ComputeState        api.ComputeState
+	DeletionState       api.DeletionState
+	DeletionRequestedAt time.Time
+	DeletionCompletedAt time.Time
+	DeletionSeq         int64 // DELETE anchor; its predecessor is the pre-intent audit head
 }
 
 // ListOptions bounds one page of ListSessions.
@@ -105,8 +110,8 @@ func eventComputeState(ev api.Event) (api.ComputeState, bool) {
 
 // PutSession writes a session's metadata, creating the row if the session is new.
 //
-// It deliberately preserves two fields it does not own: `fence` belongs to the incarnation
-// sequence and `compute_state` to the lifecycle projection, so re-registering an existing session
+// It preserves store-owned fields: `fence` belongs to the incarnation sequence, `compute_state`
+// to the lifecycle projection, and deletion intent is permanent. Re-registering an active session
 // updates its metadata without rewinding its identity. This is what lets Fork write child metadata
 // around a controller.Fork that has already fenced and populated the child log.
 //
@@ -136,7 +141,7 @@ func (s *Store) putSession(db execer, m SessionMeta) error {
 	if !explicitCreated {
 		created = now
 	}
-	_, err := db.Exec(
+	result, err := db.Exec(
 		`INSERT INTO sessions(session, fence, project, name, harness, model,
 		                      parent_uid, fork_seq, compute_state, created_at, updated_at,
 		                      labels, annotations, origin, identity)
@@ -154,7 +159,8 @@ func (s *Store) putSession(db execer, m SessionMeta) error {
 		   identity    = excluded.identity,
 		   created_at  = CASE WHEN ? OR sessions.created_at = 0
 		                     THEN excluded.created_at ELSE sessions.created_at END,
-		   updated_at  = excluded.updated_at`,
+		   updated_at  = excluded.updated_at
+		 WHERE sessions.deletion_state = 'ACTIVE'`,
 		m.UID, m.Project, m.Name, m.Harness, m.Model,
 		m.ParentUID, m.ForkSeq, string(api.ComputeNone), created.UnixNano(), now.UnixNano(),
 		m.Labels, m.Annotations, m.Origin, m.Identity,
@@ -162,6 +168,13 @@ func (s *Store) putSession(db execer, m SessionMeta) error {
 	)
 	if err != nil {
 		return fmt.Errorf("sqlitelog: put session %q: %w", m.UID, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("sqlitelog: put session %q: %w", m.UID, err)
+	}
+	if changed == 0 {
+		return fmt.Errorf("sqlitelog: put session %q: %w", m.UID, eventlog.ErrDeleted)
 	}
 	return nil
 }
@@ -173,6 +186,7 @@ const sessionSelect = `
 SELECT s.session, s.project, s.name, s.harness, s.model, s.parent_uid, s.fork_seq,
        s.compute_state, s.created_at, s.updated_at,
        s.labels, s.annotations, s.origin, s.identity,
+       s.deletion_state, s.deletion_requested_at, s.deletion_completed_at, s.deletion_seq,
        COALESCE(MAX(e.seq), 0)
 FROM sessions s LEFT JOIN events e ON e.session = s.session`
 
@@ -191,7 +205,8 @@ func (s *Store) SessionInfo(uid string) (SessionInfo, error) {
 	return info, nil
 }
 
-// ListSessions enumerates one project's sessions, newest first.
+// ListSessions enumerates one project's ACTIVE sessions, newest first. Tombstones are filtered
+// before keyset paging and LIMIT so hidden rows cannot consume page slots.
 //
 // Paging is keyset, not offset: the cursor carries the last row's (created_at, uid) and the next
 // page resumes strictly after it. Sessions are created while a client pages through them, and an
@@ -214,7 +229,7 @@ func (s *Store) ListSessions(opts ListOptions) (SessionPage, error) {
 	}
 
 	args := []any{project}
-	where := `WHERE s.project = ?`
+	where := `WHERE s.project = ? AND s.deletion_state = 'ACTIVE'`
 	if opts.PageToken != "" {
 		createdAt, uid, err := decodeCursor(opts.PageToken)
 		if err != nil {
@@ -264,17 +279,27 @@ func scanSession(row scanner) (SessionInfo, error) {
 		info                 SessionInfo
 		state                string
 		createdAt, updatedAt int64
+		deletionState        string
+		requested, completed int64
 	)
 	if err := row.Scan(
 		&info.UID, &info.Project, &info.Name, &info.Harness, &info.Model,
 		&info.ParentUID, &info.ForkSeq, &state, &createdAt, &updatedAt,
 		&info.Labels, &info.Annotations, &info.Origin, &info.Identity,
+		&deletionState, &requested, &completed, &info.DeletionSeq,
 		&info.LastSeq,
 	); err != nil {
 		return SessionInfo{}, err
 	}
 	info.CreatedAt = time.Unix(0, createdAt)
 	info.UpdatedAt = time.Unix(0, updatedAt)
+	info.DeletionState = api.DeletionState(deletionState)
+	if requested != 0 {
+		info.DeletionRequestedAt = time.Unix(0, requested)
+	}
+	if completed != 0 {
+		info.DeletionCompletedAt = time.Unix(0, completed)
+	}
 	info.ComputeState = api.ComputeState(state)
 	if state == "" {
 		info.ComputeState = api.ComputeNone
