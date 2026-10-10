@@ -27,6 +27,9 @@ provide.
 
 ### Added
 
+- Go SDK `Client.DeleteSession(ctx, uid)` and `agentctl delete --session <uid>` request permanent
+  soft deletion. Get/delete CLI report deletion state and requested/completed times; PENDING output
+  explicitly says durable intent only, with compute and fork pins retained.
 - The chat harness accepts a per-execution `system_prompt` in its JSON config, prepended before
   conversation history and current inputs.
 - `agentsessionsd --harness name=address` registers a harness that is already running, over TCP
@@ -70,7 +73,10 @@ provide.
   Registry/host only, not compute provisioning by an independent host before its first fence.
   The new `LIFECYCLE_DELETE` enum-name hash cannot be verified by older binaries; existing records
   and their canonical hashes are unchanged. The new deletion fields and timestamps are independent
-  of execution and compute state.
+  of execution and compute state. SQLite schema v3 adds tombstone state/times and the internal
+  audit anchor transactionally; existing rows become ACTIVE with absent times, without rewriting
+  old events or hashes. Older binaries refuse the newer schema: back up before upgrading if rollback
+  is needed. Cancel remains unimplemented.
 - New `EXECUTION_START` records include the resolved registry harness name and optional advertised
   harness version (`HarnessDescriptor.version`). Interrupted `Sessions.Resume` uses the recorded
   registry entry, not the session default; an unserved recorded entry or known-version mismatch is

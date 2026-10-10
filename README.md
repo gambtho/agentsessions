@@ -74,6 +74,12 @@ determinism guarantees are exercised by a replay-conformance suite (`conformance
   into host-mediated execution (`CONTROLLER_MEDIATED`), with crash-mid-tool at-most-once re-drive. A
   `REQUIRES_APPROVAL` tier is declared; the approval gate is a tracked follow-up.
 - **Recovery:** an `Exec` with no inputs re-drives the last interrupted execution from history.
+- **Permanent soft deletion:** `DeleteSession` / `agentctl delete --session <uid>` hides the UID from
+  List and refuses Exec, Fork (including historical forks), Resume and Suspend. Get and raw Replay
+  remain audit reads; UID, metadata and journal are retained forever, without cascade or erasure.
+  `PENDING` acknowledges durable intent only: actors, snapshots and fork-child pins remain retained
+  indefinitely. No Stop or cleanup is attempted; ownership and reclamation belong to #88. See
+  [deletion semantics and admission limits](docs/concepts.md#permanent-soft-deletion).
 
 ## Documentation
 
@@ -113,7 +119,7 @@ The sources live in [`docs/`](docs/README.md):
 | `session/` | The `Sessions` gRPC service: the client-facing seam over the log and the Placer. |
 | `client/` | Go client SDK: dialing, the session frame, pagination, and stream draining. |
 | `cmd/agentsessionsd` | The Sessions server: a TCP entry point over the journal and the harness registry. |
-| `cmd/agentctl` | Client CLI (create / exec / replay / fork / suspend / resume). |
+| `cmd/agentctl` | Client CLI (create / list / get / exec / replay / fork / suspend / resume / delete). |
 | `conformance/` | The replay-conformance suite (the neutral determinism checks). |
 | `integrations/substrate/` | The substrate `ControlClient` adapter — a **separate module** so the core stays substrate-free. |
 | `deploy/substrate/`, `.github/workflows/substrate-e2e.yml` | Manifests + CI for the real-substrate conformance. |

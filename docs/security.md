@@ -92,6 +92,21 @@ is whatever answers at its address, as above. `HarnessSpec.descriptor_id` makes 
 turn when the harness there reports another descriptor id, which catches a misdirected address; the
 id is what the harness says about itself, so it does not authenticate the harness.
 
+## Deletion is not erasure or containment
+
+Any caller that can reach Sessions can permanently tombstone a known UID: Delete has no additional
+authorization. `PENDING` acknowledges durable intent only until #88 provides authoritative ownership
+and cleanup. Actors, snapshots and fork-child pins remain retained indefinitely; Delete does not
+call Stop, reclaim resources or stop an actor's independent external activity. The retained metadata
+and journal are audit evidence, not a complete inventory of resources to clean up.
+
+UID, metadata and journal remain forever and are available through Get and raw Replay even when List
+hides them. Deletion is neither data erasure nor access revocation; it does not cascade to children.
+Do not store secrets expecting deletion to remove them. Exec, historical Fork, Resume and Suspend are
+refused for the tombstone, but the same-Registry admission guard does not fence another host's compute
+provisioning before its first durable fence. Keep runtime-side reconciliation separate and scoped to
+provable ownership. See [deletion semantics](concepts.md#permanent-soft-deletion).
+
 ## Deploying it
 
 Given the above, there is one safe shape for this release:

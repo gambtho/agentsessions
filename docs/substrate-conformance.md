@@ -349,9 +349,11 @@ RESUME marker. These tests prove orchestration and retention behavior, not real 
 - **Fork tag lifecycle.** A fork tags the parent snapshot (`fork-<child-uid>`) so `CreateActor` can
   reference it, and a tag is a retention pin. The tag name is derived from the child session UID, so
   `Stop` releases it when the child is torn down and a failed fork releases it on the way out. A
-  child holds one pin on its parent's snapshot indefinitely: `DeleteSession` is unimplemented and
-  no session teardown calls `Stop`. Suspended actors are likewise retained indefinitely. Operators
-  must reclaim actors and fork tags directly in Substrate; there is no automatic retention deadline.
+  child holds one pin on its parent's snapshot indefinitely. `DeleteSession` permanently tombstones
+  the UID and returns `PENDING`: durable deletion intent only, without calling `Stop` or reclaiming
+  resources. Suspended actors and fork pins remain retained. Ownership and cleanup-target persistence,
+  retryable teardown and completion belong to #88; until that lands, operators must reconcile and
+  reclaim actors and fork tags directly in Substrate. There is no automatic retention deadline.
 - **Controller-side I4.** `controller.Exec` sends the full journal as `Start.History` even on the
   post-restore turn; for the general case the controller should send empty `History` on memory-restore.
   The counter's harness-side I4 carries the stateful tier today.

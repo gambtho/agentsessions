@@ -151,7 +151,8 @@ jobs:
 
       - name: Stateless-tier conformance (in-cluster Job)
         # Runs before the expensive micro-VM staging below, so a break in the cheap tier fails fast.
-        run: hack/run-e2e-job.sh '^(TestStatelessReplayOnGVisor|TestSessionSuspendResumeOnGVisor)$' "${E2E_IMAGE}" 600
+        # Add running/suspended intent-only deletion hierarchies; same echo pool, no new template.
+        run: hack/run-e2e-job.sh '^(TestStatelessReplayOnGVisor|TestSessionSuspendResumeOnGVisor|TestSessionDeletePendingOnGVisor)$' "${E2E_IMAGE}" 1200
 
       - name: Deploy the micro-VM sandbox class
         # run-microvm-demo-kind stages the (cached) kata-assets into rustfs and installs the
@@ -178,7 +179,9 @@ jobs:
         # Memory continuity across suspend/restore (the differentiator a plain pod cannot do), and
         # fork: fan out k children from one parent checkpoint and require each to continue at N+1
         # independently — the claim that a stateful fork clones RAM instead of silently cold-booting.
-        run: hack/run-e2e-job.sh 'TestMemorySnapshotSuspendResume|TestFork' "${E2E_IMAGE}" 1500
+        # Two deletion hierarchies add full RAM checkpoints/restores and owned cleanup. Peak remains
+        # five actors (within the existing six-worker pool); budget adds 15 minutes, not new resources.
+        run: hack/run-e2e-job.sh '^(TestMemorySnapshotSuspendResume|TestForkFanOutFromMemorySnapshot|TestForkOfMemoryHarnessAtHistoricalSeqIsRefused|TestSessionDeletePendingOnMicroVM)$' "${E2E_IMAGE}" 2400
 
       - name: Dump diagnostics on failure
         if: failure()

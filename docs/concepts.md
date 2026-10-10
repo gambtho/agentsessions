@@ -104,6 +104,39 @@ provisioning, or journal mutation. Leave it unset to fork; children do not inher
 identity. This does not change `Session.identity`, which remains recorded provenance rather than
 authorization (see [security posture](security.md)).
 
+### Permanent soft deletion
+
+`DeleteSession` atomically appends one session-scoped `DELETE` lifecycle record, advances the fence
+and permanently tombstones the UID. `deletion_state` is independent of execution and compute:
+`ACTIVE` has no deletion timestamps; `PENDING` has the committed request time and no completion time.
+Delete preserves the recorded compute state, not a claim that a running actor has stopped.
+
+`PENDING` acknowledges durable intent only. Until ownership and cleanup are implemented in #88,
+actors, snapshots and fork-child pins remain retained indefinitely: Delete does not call
+`Runtime.Stop`, reclaim resources or produce `COMPLETE`. Metadata and the immutable journal preserve
+route, lineage and snapshot evidence for audit, not an authoritative cleanup-target inventory;
+#88 owns that schema. Do not infer cleanup from gRPC OK.
+
+List hides tombstones before pagination. Get and raw `Sessions.Replay` remain audit reads, including
+`DELETE`; UID, metadata and journal are retained forever. There is no UID reuse, cascade or erasure.
+Existing children and grandchildren retain independent copied prefixes and can continue and fork.
+Exec, Fork (even at a historical sequence), Resume and Suspend refuse a deleted UID with
+`FAILED_PRECONDITION`; neither a new Exec nor restoring a harness can reactivate it. Retrying Delete
+returns the same PENDING snapshot, timestamps, fence, journal and compute projection.
+
+An empty UID is `INVALID_ARGUMENT`, an unknown UID is `NOT_FOUND` without creation, and local overlap
+is `ABORTED` before mutation. Retry busy calls after the holder finishes; use Get or retry after a
+lost response to learn whether intent committed. One Registry serializes Delete, Exec, Fork, Resume
+and Suspend across its Placers. This is not cross-host compute exclusion: an independent host can
+provision before its first durable fence, although tombstones reject subsequent durable writes.
+Direct durable-log wrappers must forward the optional `CheckWritable` preflight to refuse before
+compute; final SQLite write barriers still enforce the permanent tombstone.
+
+Opening an older SQLite journal migrates it transactionally to schema v3, with old sessions ACTIVE
+and deletion times absent. Existing metadata, projections, records and hashes are preserved. Older
+binaries refuse the newer schema; back up before upgrade if rollback is required. Old verifiers
+cannot verify new `LIFECYCLE_DELETE` enum-name hashes; use a descriptor that includes DELETE.
+
 ## Event and the typed log
 
 The session log is a sequence of `Event`s. An event is not an opaque blob: it is typed, so provenance,
@@ -119,7 +152,7 @@ cost, audit, and tool approval are first-class rather than parsed out of text af
 | `TOOL_CALL` / `TOOL_RESULT` | A tool invocation and its outcome. Aligned with an MCP tool call. |
 | `APPROVAL_REQUEST` / `APPROVAL_RESULT` | A human or policy approval gate around a tool. |
 | `USAGE` | Per-call token and cost accounting. |
-| `LIFECYCLE` | A compute or session transition (`SUSPEND`, `RESUME`, `FORK`, `BASELINE`, `CANCEL`). |
+| `LIFECYCLE` | A compute or session transition (`SUSPEND`, `RESUME`, `FORK`, `BASELINE`, `CANCEL`, `DELETE`). |
 | `END` | The terminal state of one execution (`COMPLETED` / `FAILED` / `CANCELED`). |
 | `ERROR` | An error, mirroring a gRPC status. |
 

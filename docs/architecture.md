@@ -189,8 +189,10 @@ stateDiagram-v2
   placement still gates every turn on the live `Describe`. `descriptor_id` is not checked at
   registration, only when a call places the harness, and like the capability check it is not bound
   to the turn's `Connect` stream (see [security.md](security.md)). A registration made by another
-  process sharing the database is served after this host restarts. There is no delete, because
-  `DeleteSession` does not exist yet and a harness with sessions must stay resolvable.
+  process sharing the database is served after this host restarts. Harness-registry deletion is not
+  implemented: `DeleteSession` tombstones a session but retains its metadata and audit log, so its
+  recorded harness identity remains relevant. Session deletion returns `PENDING` without stopping
+  resources; ownership and cleanup-target persistence and teardown belong to #88.
 
 The registry is an admin API and `agentsessionsd` does not serve it. It is wired in-process only, for
 tests and Go embedders; see [security.md](security.md).
