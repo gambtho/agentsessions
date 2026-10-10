@@ -34,8 +34,9 @@ import (
 // session.Service surfaces it as codes.FailedPrecondition.
 var ErrUnplaceable = errors.New("placement: harness cannot be placed on this runtime")
 
-// ErrSessionBusy is returned when Exec, Suspend, or Resume overlaps another operation on the same
-// session through this Placer or its Registry. No compute or journal transition is attempted;
+// ErrSessionBusy is returned when Exec, Suspend, Resume, Fork, or a guarded callback overlaps
+// another operation on the same session through this Placer or its Registry.
+// No compute or journal transition is attempted;
 // session.Service surfaces it as codes.Aborted, independently of any backend transport status.
 var ErrSessionBusy = errors.New("placement: another operation is in progress for this session")
 
@@ -230,7 +231,7 @@ func New(backend Backend, model controller.ModelFunc, opts ...Option) *Placer {
 	return p
 }
 
-// trySessionLock serializes Exec/Suspend/Resume through their compute and journal transitions.
+// trySessionLock serializes mutations through their compute and journal transitions.
 // Refuse overlap rather than queueing a request whose cursor may be stale by the time it runs.
 func (p *Placer) trySessionLock(sessionUID string) (func(), error) {
 	return p.guard.tryLock(sessionUID)
@@ -271,6 +272,9 @@ func (p *Placer) Exec(ctx context.Context, log eventlog.Store, sessionUID string
 	}
 	defer release()
 
+	if err := eventlog.CheckWritable(log); err != nil {
+		return api.Incarnation{}, err
+	}
 	if _, err := p.admit(ctx, sessionUID); err != nil {
 		return api.Incarnation{}, err
 	}
@@ -487,6 +491,9 @@ func (p *Placer) Suspend(ctx context.Context, log eventlog.Store, sessionUID str
 	}
 	defer release()
 
+	if err := eventlog.CheckWritable(log); err != nil {
+		return api.SnapshotRef{}, err
+	}
 	inc := api.Incarnation{ID: sessionUID}
 	ref, err = p.backend.Snapshot(ctx, inc, api.SnapshotExternal)
 	if err != nil {
@@ -527,6 +534,9 @@ func (p *Placer) resume(ctx context.Context, log eventlog.Store, sessionUID stri
 		finish(err, "error_kind", placementErrorKind(err), "incarnation_id", inc.ID, "runtime", inc.Runtime)
 	}()
 
+	if err := eventlog.CheckWritable(log); err != nil {
+		return err
+	}
 	// Gate before Restore, exactly as Exec does before Create: Resume re-drives an interrupted turn,
 	// so it must not reach a harness the backend cannot host.
 	if _, err := p.admit(ctx, sessionUID); err != nil {
@@ -658,6 +668,21 @@ func (p *Placer) Fork(ctx context.Context, parent eventlog.Store, parentUID stri
 	)
 	defer func() { finish(err, "error_kind", placementErrorKind(err)) }()
 
+	release, err := p.trySessionLock(parentUID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := eventlog.CheckWritable(parent); err != nil {
+		return err
+	}
+	// Validate the entire fan-out before checkpointing or provisioning. A refused target
+	// must not alter its parent or earlier siblings, or trigger rollback Stop.
+	for _, child := range children {
+		if err := eventlog.CheckWritable(child.Log); err != nil {
+			return fmt.Errorf("placement: fork child %q: %w", child.UID, err)
+		}
+	}
 	ref, err := p.forkSource(ctx, parent, parentUID, atSeq)
 	if err != nil {
 		return err
@@ -698,9 +723,9 @@ func (p *Placer) Fork(ctx context.Context, parent eventlog.Store, parentUID stri
 // child must not mask the original cause.
 //
 // The cost of per-child budgets is that a wedged control plane parks this goroutine for up to
-// MaxForkChildren × rollbackTimeout. That is bounded and cheap (no lock, no DB handle), and it is
-// the right side of the trade: an overall cap tight enough to matter would abandon the tail of the
-// unwind, stranding exactly the workers this exists to reclaim.
+// MaxForkChildren × rollbackTimeout. The parent session guard stays held throughout rollback,
+// excluding local mutations until the unwind finishes; no database handle is held. An overall
+// cap tight enough to matter would abandon the tail, stranding the workers this exists to reclaim.
 func (p *Placer) rollbackFork(ctx context.Context, childUIDs []string) {
 	for _, uid := range childUIDs {
 		p.stopOrphan(ctx, uid)
@@ -752,8 +777,8 @@ func (p *Placer) forkSource(ctx context.Context, parent eventlog.Store, parentUI
 			ErrUnplaceable, desc.ID, desc.Capabilities.Resumability, head, atSeq)
 	}
 	// Past this point the fork is committing, so superseding the current writer is intended.
-	// Unlike Suspend, Fork is not covered by the session guard. Fencing before the snapshot means
-	// an in-flight turn cannot advance the head underneath a checkpoint that is not undoable.
+	// The shared parent guard excludes local mutations through provisioning and rollback.
+	// Fencing also rejects stale writers outside this Registry before the irreversible snapshot.
 	fence, err := parent.NewFence()
 	if err != nil {
 		return api.SnapshotRef{}, err

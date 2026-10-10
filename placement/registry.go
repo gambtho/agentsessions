@@ -184,6 +184,18 @@ func (r *Registry) For(harness string) (*Placer, error) {
 	return p, nil
 }
 
+// WithSessionGuard runs operation synchronously under the same reclaimable guard as every
+// Placer in this Registry. Contention returns ErrSessionBusy without calling operation.
+// The callback must not call guarded Registry or Placer methods: the guard is not reentrant.
+func (r *Registry) WithSessionGuard(sessionUID string, operation func() error) error {
+	release, err := r.guard.tryLock(sessionUID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return operation()
+}
+
 // RegistryResumeOption configures one Registry.Resume call.
 type RegistryResumeOption func(*registryResumeConfig)
 
@@ -213,6 +225,9 @@ func (r *Registry) Resume(ctx context.Context, log eventlog.Store, sessionUID, s
 	}
 	defer release()
 
+	if err := eventlog.CheckWritable(log); err != nil {
+		return err
+	}
 	invocation, err := controller.ResumeInvocation(log)
 	if err != nil {
 		return err

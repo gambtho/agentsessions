@@ -106,14 +106,21 @@ func sessionProto(info sqlitelog.SessionInfo) (*v1.Session, error) {
 		md.UpdateTime = timestamppb.New(info.UpdatedAt)
 	}
 	out := &v1.Session{
-		Metadata:     md,
-		Harness:      info.Harness,
-		Model:        info.Model,
-		ExecState:    execStateOf(info),
-		ComputeState: wire.ComputeStateToProto(info.ComputeState),
-		LastSeq:      info.LastSeq,
-		ParentUid:    info.ParentUID,
-		ForkSeq:      info.ForkSeq,
+		Metadata:      md,
+		Harness:       info.Harness,
+		Model:         info.Model,
+		ExecState:     execStateOf(info),
+		ComputeState:  wire.ComputeStateToProto(info.ComputeState),
+		LastSeq:       info.LastSeq,
+		ParentUid:     info.ParentUID,
+		ForkSeq:       info.ForkSeq,
+		DeletionState: wire.DeletionStateToProto(info.DeletionState),
+	}
+	if !info.DeletionRequestedAt.IsZero() {
+		out.DeletionRequestedTime = timestamppb.New(info.DeletionRequestedAt)
+	}
+	if !info.DeletionCompletedAt.IsZero() {
+		out.DeletionCompletedTime = timestamppb.New(info.DeletionCompletedAt)
 	}
 	if err := applyMetadata(out, info); err != nil {
 		return nil, status.Errorf(codes.Internal, "session %q: %v", info.UID, err)
@@ -124,8 +131,9 @@ func sessionProto(info sqlitelog.SessionInfo) (*v1.Session, error) {
 // execStateOf reports the execution axis from the metadata row.
 //
 // It is a projection, with the same caveat as compute_state: it says what the log implies, not what
-// is happening right now. A session with no events has never run, so it is PENDING. Anything else
-// is reported COMPLETED, because Exec is synchronous and returns only after the turn reaches END.
+// is happening right now. A session with no pre-deletion events has never run, so it is PENDING.
+// Anything else is reported COMPLETED, because Exec is synchronous and returns only after END.
+// DELETE is an audit intent, not execution evidence: its stored anchor freezes this fallback.
 //
 // The case it cannot see is a turn interrupted mid-flight, which stays COMPLETED here until Resume
 // re-drives it. Distinguishing that needs the kind of the log's last event, and an event body is an
@@ -133,7 +141,11 @@ func sessionProto(info sqlitelog.SessionInfo) (*v1.Session, error) {
 // record per session. That is worth doing when something depends on the distinction; today nothing
 // does, and the recovery path keys off the log rather than off this field.
 func execStateOf(info sqlitelog.SessionInfo) v1.ExecState {
-	if info.LastSeq == 0 {
+	head := info.LastSeq
+	if info.DeletionSeq > 0 {
+		head = info.DeletionSeq - 1
+	}
+	if head == 0 {
 		return v1.ExecState_EXEC_PENDING
 	}
 	return v1.ExecState_EXEC_COMPLETED
@@ -280,8 +292,11 @@ func (s *Service) placerFor(uid, override string) (*placement.Placer, string, er
 	if uid == "" {
 		return nil, "", status.Error(codes.InvalidArgument, "session is required")
 	}
-	info, err := s.store.SessionInfo(uid)
+	info, err := s.mutationSessionInfo(uid)
 	if err != nil {
+		if errors.Is(err, placement.ErrSessionBusy) {
+			return nil, "", withStatusCause(codes.Aborted, err)
+		}
 		if override != "" && errors.Is(err, sqlitelog.ErrSessionNotFound) {
 			// With no session there is no pin, so an unknown override is the caller's first
 			// mistake and stays InvalidArgument.
@@ -290,6 +305,9 @@ func (s *Service) placerFor(uid, override string) (*placement.Placer, string, er
 			}
 		}
 		return nil, "", sessionStoreError(err, uid)
+	}
+	if err := deletedSessionError(info); err != nil {
+		return nil, "", err
 	}
 	harness := info.Harness
 	if harness == "" {
@@ -417,6 +435,20 @@ func harnessError(err error) error {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	return status.Errorf(codes.Internal, "resolve harness: %v", err)
+}
+
+// mutationSessionInfo protects the actual initial lookup, not just a busy probe: a Delete
+// waiting for SQLite's writer lock holds this Store's sole connection. Refuse its overlap
+// before waiting for that connection. Release after the read so routing does not nest the
+// Placer/Registry operation guard; that later guard and writable check remain authoritative
+// if Delete starts after this lookup. Audit reads do not use this admission step.
+func (s *Service) mutationSessionInfo(uid string) (info sqlitelog.SessionInfo, err error) {
+	err = s.registry.WithSessionGuard(uid, func() error {
+		var lookupErr error
+		info, lookupErr = s.store.SessionInfo(uid)
+		return lookupErr
+	})
+	return info, err
 }
 
 // sessionStoreError maps a store lookup failure to a gRPC code. An unknown UID is NotFound rather
@@ -714,6 +746,10 @@ func (s *Service) Fork(ctx context.Context, req *v1.ForkRequest) (response *v1.F
 // the caller knows a retry is meaningful.
 func forkError(err error) error {
 	switch {
+	case errors.Is(err, eventlog.ErrDeleted):
+		return withStatusCause(codes.FailedPrecondition, err)
+	case errors.Is(err, placement.ErrSessionBusy):
+		return status.Error(codes.Aborted, err.Error())
 	case errors.Is(err, placement.ErrUnplaceable), errors.Is(err, placement.ErrDescriptorMismatch):
 		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, placement.ErrHarnessUnavailable):
@@ -740,6 +776,9 @@ func (s *Service) Suspend(ctx context.Context, req *v1.SuspendRequest) (session 
 	}
 	log := s.store.Session(req.GetSession())
 	if _, err := placer.Suspend(ctx, log, req.GetSession()); err != nil {
+		if errors.Is(err, eventlog.ErrDeleted) {
+			return nil, withStatusCause(codes.FailedPrecondition, err)
+		}
 		if errors.Is(err, placement.ErrSessionBusy) {
 			return nil, status.Error(codes.Aborted, err.Error())
 		}
@@ -766,9 +805,15 @@ func (s *Service) Resume(ctx context.Context, req *v1.ResumeRequest) (session *v
 	if uid == "" {
 		return nil, status.Error(codes.InvalidArgument, "session is required")
 	}
-	info, err := s.store.SessionInfo(uid)
+	info, err := s.mutationSessionInfo(uid)
 	if err != nil {
+		if errors.Is(err, placement.ErrSessionBusy) {
+			return nil, withStatusCause(codes.Aborted, err)
+		}
 		return nil, sessionStoreError(err, uid)
+	}
+	if err := deletedSessionError(info); err != nil {
+		return nil, err
 	}
 	log := s.store.Session(uid)
 	stored := info.Harness
@@ -798,6 +843,8 @@ func (s *Service) Resume(ctx context.Context, req *v1.ResumeRequest) (session *v
 
 func resumeError(err error) error {
 	switch {
+	case errors.Is(err, eventlog.ErrDeleted):
+		return withStatusCause(codes.FailedPrecondition, err)
 	case errors.Is(err, placement.ErrSessionBusy):
 		return status.Error(codes.Aborted, err.Error())
 	case errors.Is(err, controller.ErrInheritedToolIntent):
@@ -831,6 +878,8 @@ func admissionInterruptedCode(err error) codes.Code {
 
 func execError(err error) error {
 	switch {
+	case errors.Is(err, eventlog.ErrDeleted):
+		return withStatusCause(codes.FailedPrecondition, err)
 	case errors.Is(err, placement.ErrSessionBusy):
 		return status.Error(codes.Aborted, err.Error())
 	case errors.Is(err, placement.ErrUnplaceable), errors.Is(err, controller.ErrInvalidExecutionLog), errors.Is(err, placement.ErrDescriptorMismatch), errors.Is(err, controller.ErrHarnessMismatch), errors.Is(err, controller.ErrHarnessVersionMismatch):
