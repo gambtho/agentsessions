@@ -97,8 +97,9 @@ The `Placer` wires Sessions to the `Runtime` SPI and owns the incarnation lifecy
   incarnation and the controller. A `Restore` mints a fresh fence so a new incarnation supersedes a zombie.
 - **Dial** — the harness is reached by dialing `Incarnation.Address`. One dial path, two address forms:
   a `unix://` socket for `runtime/local`; a `host:port` (the actor's `PodIP`) for `runtime/substrate`.
-- **Lifecycle map** — session `Suspend → Runtime.Snapshot`, `Resume → Runtime.Restore`, session-end
-  `→ Runtime.Stop`.
+- **Lifecycle map** — session `Suspend → Runtime.Snapshot` checkpoints compute and `Resume →
+  Runtime.Restore` restores it. Execution `END` does not automatically call `Runtime.Stop`.
+  `DeleteSession` records permanent `PENDING` intent without releasing actors, pins or snapshots.
 - **Fork** — capability-driven. A `STATELESS_REPLAY` session replay-forks (the child cold-boots and
   the copied journal reconstructs it, parent untouched). A `REQUIRES_MEMORY_SNAPSHOT` session holds
   live state the journal cannot rebuild (I4), so the Placer checkpoints the parent via

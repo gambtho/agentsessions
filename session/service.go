@@ -288,15 +288,32 @@ func (s *Service) ListSessions(ctx context.Context, req *v1.ListSessionsRequest)
 // let any session run turns on it, retired or not, and a session created on a registration keeps
 // its turns on that registration. Between harnesses that are not registered, the documented
 // per-turn override is unchanged.
-func (s *Service) placerFor(uid, override string) (*placement.Placer, string, error) {
+func (s *Service) placerFor(uid, override string, read func() error) (placer *placement.Placer, harness string, err error) {
 	if uid == "" {
 		return nil, "", status.Error(codes.InvalidArgument, "session is required")
 	}
-	info, err := s.mutationSessionInfo(uid)
-	if err != nil {
-		if errors.Is(err, placement.ErrSessionBusy) {
-			return nil, "", withStatusCause(codes.Aborted, err)
+	// Keep lookup, routing validation and request preparation reads in one SQL phase.
+	// Otherwise Delete can take the sole Store connection between reads and make this
+	// call queue instead of refusing overlap. Runtime methods acquire their own guard
+	// after this phase and recheck writable status.
+	err = s.mutationRead(uid, func() error {
+		var resolveErr error
+		placer, harness, resolveErr = s.resolvePlacer(uid, override)
+		if resolveErr != nil {
+			return resolveErr
 		}
+		if read != nil {
+			return read()
+		}
+		return nil
+	})
+	return placer, harness, err
+}
+
+// resolvePlacer runs only inside placerFor's guarded SQL phase.
+func (s *Service) resolvePlacer(uid, override string) (*placement.Placer, string, error) {
+	info, err := s.store.SessionInfo(uid)
+	if err != nil {
 		if override != "" && errors.Is(err, sqlitelog.ErrSessionNotFound) {
 			// With no session there is no pin, so an unknown override is the caller's first
 			// mistake and stays InvalidArgument.
@@ -437,13 +454,21 @@ func harnessError(err error) error {
 	return status.Errorf(codes.Internal, "resolve harness: %v", err)
 }
 
-// mutationSessionInfo protects the actual initial lookup, not just a busy probe: a Delete
-// waiting for SQLite's writer lock holds this Store's sole connection. Refuse its overlap
-// before waiting for that connection. Release after the read so routing does not nest the
-// Placer/Registry operation guard; that later guard and writable check remain authoritative
-// if Delete starts after this lookup. Audit reads do not use this admission step.
+// mutationRead protects an entire SQL read phase before it can wait for the Store's
+// sole connection. It does not lease the whole RPC: subsequent guarded runtime methods
+// remain authoritative if Delete starts between phases. Audit response reads after a
+// successful operation do not use this admission step.
+func (s *Service) mutationRead(uid string, read func() error) error {
+	err := s.registry.WithSessionGuard(uid, read)
+	if errors.Is(err, placement.ErrSessionBusy) {
+		return withStatusCause(codes.Aborted, err)
+	}
+	return err
+}
+
+// Resume's later routing SQL already runs under Registry.Resume's guard.
 func (s *Service) mutationSessionInfo(uid string) (info sqlitelog.SessionInfo, err error) {
-	err = s.registry.WithSessionGuard(uid, func() error {
+	err = s.mutationRead(uid, func() error {
 		var lookupErr error
 		info, lookupErr = s.store.SessionInfo(uid)
 		return lookupErr
@@ -488,14 +513,26 @@ func (s *Service) Exec(req *v1.ExecRequest, stream v1.Sessions_ExecServer) (err 
 		sess = created
 	}
 
-	placer, harness, err := s.placerFor(uid, req.GetHarness())
+	log := s.store.Session(uid)
+	var headBefore int64
+	placer, harness, err := s.placerFor(uid, req.GetHarness(), func() error {
+		var err error
+		headBefore, err = log.Head()
+		if err != nil {
+			return status.Errorf(codes.Internal, "head: %v", err)
+		}
+		if sess == nil {
+			info, err := s.store.SessionInfo(uid)
+			if err != nil {
+				return sessionStoreError(err, uid)
+			}
+			sess, err = sessionProto(info)
+			return err
+		}
+		return nil
+	})
 	if err != nil {
 		return err
-	}
-	log := s.store.Session(uid)
-	headBefore, err := log.Head()
-	if err != nil {
-		return status.Errorf(codes.Internal, "head: %v", err)
 	}
 
 	// Unset expected_last_seq means "append at the current head": the single-writer check is opt-in,
@@ -506,16 +543,6 @@ func (s *Service) Exec(req *v1.ExecRequest, stream v1.Sessions_ExecServer) (err 
 		expected = req.GetExpectedLastSeq()
 	}
 
-	if sess == nil {
-		info, err := s.store.SessionInfo(uid)
-		if err != nil {
-			return sessionStoreError(err, uid)
-		}
-		sess, err = sessionProto(info)
-		if err != nil {
-			return err
-		}
-	}
 	// The session goes out before the turn runs, so a caller learns the uid of a session created
 	// for it even if the execution then fails.
 	if err := stream.Send(&v1.ExecUpdate{Update: &v1.ExecUpdate_Session{Session: sess}}); err != nil {
@@ -650,18 +677,20 @@ func (s *Service) Fork(ctx context.Context, req *v1.ForkRequest) (response *v1.F
 		return nil, status.Error(codes.InvalidArgument, "ForkRequest.identity is unsupported: per-child principals are not enforced")
 	}
 
-	placer, _, err := s.placerFor(req.GetSession(), "")
-	if err != nil {
-		return nil, err
-	}
 	parent := s.store.Session(req.GetSession())
 	atSeq := req.GetAtSeq()
-	if atSeq <= 0 {
-		h, err := parent.Head()
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "head: %v", err)
+	placer, _, err := s.placerFor(req.GetSession(), "", func() error {
+		if atSeq <= 0 {
+			h, err := parent.Head()
+			if err != nil {
+				return status.Errorf(codes.Internal, "head: %v", err)
+			}
+			atSeq = h
 		}
-		atSeq = h
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	count := int(req.GetCount())
 	if count <= 0 {
@@ -770,7 +799,7 @@ func (s *Service) Suspend(ctx context.Context, req *v1.SuspendRequest) (session 
 	finish := observability.Start(ctx, s.logger, "session", "suspend", "session_uid", req.GetSession())
 	defer func() { finish(err, "error_kind", serviceErrorKind(err)) }()
 
-	placer, _, err := s.placerFor(req.GetSession(), "")
+	placer, _, err := s.placerFor(req.GetSession(), "", nil)
 	if err != nil {
 		return nil, err
 	}

@@ -395,8 +395,296 @@ func TestDeleteSameServiceBusyBeforeMetadataLookup(t *testing.T) {
 	}
 }
 
+// Routing SQL must not queue behind a Delete that starts after the initial ACTIVE lookup.
+// Removing the guarded routing phase takes the Delete-winner branch: its failed transaction
+// then releases the sole Store connection to an Exec that should already have returned busy.
+func TestDeleteSameServiceBusyAfterMetadataLookup(t *testing.T) {
+	for _, outcome := range []string{"commit", "store-failure"} {
+		t.Run(outcome, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+			path := filepath.Join(t.TempDir(), "journal.db")
+			store := openStore(t, path)
+			db := deletionSQL(t, path)
+			r, backends := deleteRaceRegistry(t)
+			svc := session.NewService(store, r)
+			entered, release := make(chan struct{}), make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(release) })
+			t.Cleanup(unblock)
+			svc.SetAfterPinCheck(func() { close(entered); <-release })
+			// Exec and Delete use the exact same gRPC client, Service and Store.
+			client := serveSessions(t, svc)
+			uid := mustCreate(t, client)
+			if outcome == "store-failure" {
+				if _, err := db.Exec("CREATE TRIGGER fail_delete BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'intent failure'); END"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			executed := make(chan error, 1)
+			go func() { executed <- deleteRaceMutation(ctx, client, "Exec", uid, "override") }()
+			select {
+			case <-entered:
+			case err := <-executed:
+				t.Fatalf("Exec ended before post-lookup pin-check barrier: %v", err)
+			case <-ctx.Done():
+				t.Fatal("Exec never reached post-lookup barrier")
+			}
+			before := sessionDeleteRaw(t, db)
+			writer, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer writer.Close()
+			if _, err := writer.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _, _ = writer.ExecContext(context.Background(), "ROLLBACK") }()
+			// Only Exec exists at this point. Busy proves it owns the routing guard;
+			// otherwise Delete must acquire it before Exec is released to routing SQL.
+			err = r.WithSessionGuard(uid, func() error { return nil })
+			if errors.Is(err, placement.ErrSessionBusy) {
+				t.Log("Exec owns Registry guard at post-lookup routing barrier")
+				deleted := make(chan error, 1)
+				go func() { _, err := client.DeleteSession(ctx, &v1.DeleteSessionRequest{Uid: uid}); deleted <- err }()
+				select {
+				case err := <-deleted:
+					if status.Code(err) != codes.Aborted {
+						t.Errorf("Delete during guarded routing=%v, want Aborted", err)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("Delete queued behind the routing-phase holder")
+				}
+				assertDeleteNoEffects(t, backends)
+				if !reflect.DeepEqual(before, sessionDeleteRaw(t, db)) {
+					t.Error("losing Delete changed raw state")
+				}
+				if _, err := writer.ExecContext(ctx, "ROLLBACK"); err != nil {
+					t.Fatal(err)
+				}
+				if outcome == "store-failure" {
+					if _, err := db.Exec("DROP TRIGGER fail_delete"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				unblock()
+				if err := <-executed; err != nil {
+					t.Fatalf("busy Delete disrupted winning Exec: %v", err)
+				}
+				if backends["override"].effects()["Create"] != 1 {
+					t.Error("winning Exec did not run on its override")
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				deleted := make(chan error, 1)
+				go func() {
+					for {
+						_, err := client.DeleteSession(ctx, &v1.DeleteSessionRequest{Uid: uid})
+						if status.Code(err) != codes.Aborted {
+							deleted <- err
+							return
+						}
+						runtime.Gosched()
+					}
+				}()
+				for {
+					if err := r.WithSessionGuard(uid, func() error { return nil }); errors.Is(err, placement.ErrSessionBusy) {
+						break
+					} else if err != nil {
+						t.Fatal(err)
+					}
+					select {
+					case err := <-deleted:
+						t.Fatalf("Delete ended before writer barrier: %v", err)
+					case <-ctx.Done():
+						t.Fatal("Delete never acquired guard")
+					default:
+						runtime.Gosched()
+					}
+				}
+				t.Log("Delete owns Registry guard; BEGIN IMMEDIATE blocked by independent writer; release Exec to routing SQL")
+				unblock()
+				received := false
+				select {
+				case err := <-executed:
+					received = true
+					if status.Code(err) != codes.Aborted {
+						t.Errorf("Exec before writer release=%v, want Aborted", err)
+					}
+				case <-time.After(2 * time.Second):
+					t.Error("post-lookup routing SQL queued behind Delete's sole Store connection instead of prompt Aborted")
+				}
+				assertDeleteNoEffects(t, backends)
+				if !reflect.DeepEqual(before, sessionDeleteRaw(t, db)) {
+					t.Error("losing Exec changed raw state before writer release")
+				}
+				if _, err := writer.ExecContext(ctx, "ROLLBACK"); err != nil {
+					t.Fatal(err)
+				}
+				want := codes.OK
+				if outcome == "store-failure" {
+					want = codes.Internal
+				}
+				if err := <-deleted; status.Code(err) != want {
+					t.Errorf("Delete outcome=%v, want %v", err, want)
+				}
+				if !received {
+					if err := <-executed; status.Code(err) != codes.Aborted {
+						t.Errorf("queued Exec after writer release=%v, want original Aborted", err)
+					}
+				}
+				assertDeleteNoEffects(t, backends)
+				if outcome == "store-failure" {
+					if !reflect.DeepEqual(before, sessionDeleteRaw(t, db)) {
+						t.Error("failed Delete/delayed Exec changed raw state")
+					}
+					if _, err := db.Exec("DROP TRIGGER fail_delete"); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if err := r.WithSessionGuard(uid, func() error { return nil }); err != nil {
+				t.Fatalf("routing/Delete leaked guard: %v", err)
+			}
+			if err := store.Session(uid).Verify(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// The initial session update is sent after the SQL phase releases its guard but before
+// Placer.Exec acquires the runtime guard. Intercept that real gRPC boundary in tests only.
+type deleteBeforeRuntimeServer struct {
+	v1.SessionsServer
+	beforeRuntime func()
+}
+
+func (s deleteBeforeRuntimeServer) Exec(req *v1.ExecRequest, stream v1.Sessions_ExecServer) error {
+	return s.SessionsServer.Exec(req, deleteBeforeRuntimeStream{Sessions_ExecServer: stream, beforeRuntime: s.beforeRuntime})
+}
+
+type deleteBeforeRuntimeStream struct {
+	v1.Sessions_ExecServer
+	beforeRuntime func()
+}
+
+func (s deleteBeforeRuntimeStream) Send(update *v1.ExecUpdate) error {
+	if err := s.Sessions_ExecServer.Send(update); err != nil {
+		return err
+	}
+	if update.GetSession() != nil {
+		s.beforeRuntime()
+	}
+	return nil
+}
+
+// The guarded SQL phase is not a whole-RPC lease. If Delete wins the gap before the
+// runtime guard, Exec must still return busy without another SQL read or runtime effect.
+func TestDeleteSameServiceBusyAfterRoutingBeforeRuntime(t *testing.T) {
+	for _, outcome := range []string{"commit", "store-failure"} {
+		t.Run(outcome, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+			path := filepath.Join(t.TempDir(), "journal.db")
+			store := openStore(t, path)
+			db := deletionSQL(t, path)
+			r, backends := deleteRaceRegistry(t)
+			svc := session.NewService(store, r)
+			entered, release := make(chan struct{}), make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(release) })
+			t.Cleanup(unblock)
+			client := serveSessions(t, deleteBeforeRuntimeServer{SessionsServer: svc, beforeRuntime: func() { close(entered); <-release }})
+			uid := mustCreate(t, client)
+			if outcome == "store-failure" {
+				if _, err := db.Exec("CREATE TRIGGER fail_delete BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'intent failure'); END"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			executed := make(chan error, 1)
+			go func() { executed <- deleteRaceMutation(ctx, client, "Exec", uid, "override") }()
+			select {
+			case <-entered:
+			case err := <-executed:
+				t.Fatalf("Exec ended before runtime gap barrier: %v", err)
+			case <-ctx.Done():
+				t.Fatal("Exec never reached runtime gap")
+			}
+			before := sessionDeleteRaw(t, db)
+			writer, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer writer.Close()
+			if _, err := writer.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _, _ = writer.ExecContext(context.Background(), "ROLLBACK") }()
+			deleted := make(chan error, 1)
+			go func() {
+				for {
+					_, err := client.DeleteSession(ctx, &v1.DeleteSessionRequest{Uid: uid})
+					if status.Code(err) != codes.Aborted {
+						deleted <- err
+						return
+					}
+					runtime.Gosched()
+				}
+			}()
+			for {
+				if err := r.WithSessionGuard(uid, func() error { return nil }); errors.Is(err, placement.ErrSessionBusy) {
+					break
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case err := <-deleted:
+					t.Fatalf("Delete ended before writer barrier: %v", err)
+				case <-ctx.Done():
+					t.Fatal("Delete never acquired guard")
+				default:
+					runtime.Gosched()
+				}
+			}
+			t.Log("Delete owns Registry guard after SQL phase; release Exec to authoritative runtime guard")
+			unblock()
+			select {
+			case err := <-executed:
+				if status.Code(err) != codes.Aborted {
+					t.Errorf("Exec during ongoing Delete=%v, want Aborted", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Exec queued in gap after guarded routing")
+			}
+			assertDeleteNoEffects(t, backends)
+			if !reflect.DeepEqual(before, sessionDeleteRaw(t, db)) {
+				t.Error("busy Exec changed raw state")
+			}
+			if _, err := writer.ExecContext(ctx, "ROLLBACK"); err != nil {
+				t.Fatal(err)
+			}
+			want := codes.OK
+			if outcome == "store-failure" {
+				want = codes.Internal
+			}
+			if err := <-deleted; status.Code(err) != want {
+				t.Errorf("Delete outcome=%v, want %v", err, want)
+			}
+			assertDeleteNoEffects(t, backends)
+			if outcome == "store-failure" && !reflect.DeepEqual(before, sessionDeleteRaw(t, db)) {
+				t.Error("failed Delete changed raw state")
+			}
+			if err := r.WithSessionGuard(uid, func() error { return nil }); err != nil {
+				t.Fatalf("Delete/refusal leaked guard: %v", err)
+			}
+		})
+	}
+}
+
 // Removing Placer's authoritative preflight would Create after Service read ACTIVE metadata
-// but before it acquired the shared mutation guard. Use the existing test-only pin-check seam.
+// but before it acquired the shared runtime guard. Preserve this boundary independently of
+// the earlier pin-check hook, which now correctly runs inside the SQL guard.
 func TestDeletedStaleServiceLookupRefusesBeforeCompute(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -408,8 +696,7 @@ func TestDeletedStaleServiceLookupRefusesBeforeCompute(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	unblock := sync.OnceFunc(func() { close(release) })
 	t.Cleanup(unblock)
-	svc.SetAfterPinCheck(func() { close(entered); <-release })
-	client := serveSessions(t, svc)
+	client := serveSessions(t, deleteBeforeRuntimeServer{SessionsServer: svc, beforeRuntime: func() { close(entered); <-release }})
 	uid := mustCreate(t, client)
 	result := make(chan error, 1)
 	go func() { result <- deleteRaceMutation(ctx, client, "Exec", uid, "override") }()
