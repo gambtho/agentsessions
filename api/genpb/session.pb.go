@@ -14,6 +14,7 @@ package agentsessionsv1
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -146,6 +147,62 @@ func (x ComputeState) Number() protoreflect.EnumNumber {
 // Deprecated: Use ComputeState.Descriptor instead.
 func (ComputeState) EnumDescriptor() ([]byte, []int) {
 	return file_session_proto_rawDescGZIP(), []int{1}
+}
+
+// DeletionState is independent of the execution and compute axes. PENDING is a permanent
+// UID tombstone and durable deletion intent, not confirmation that resources were reclaimed.
+// Until ownership and cleanup are implemented (#88), deletion emits PENDING only: actors,
+// fork-child pins and snapshots remain retained, and no Runtime.Stop is attempted.
+type DeletionState int32
+
+const (
+	DeletionState_DELETION_STATE_UNSPECIFIED DeletionState = 0
+	DeletionState_DELETION_ACTIVE            DeletionState = 1
+	DeletionState_DELETION_PENDING           DeletionState = 2
+	DeletionState_DELETION_COMPLETE          DeletionState = 3 // future cleanup state; not emitted by intent-only deletion
+)
+
+// Enum value maps for DeletionState.
+var (
+	DeletionState_name = map[int32]string{
+		0: "DELETION_STATE_UNSPECIFIED",
+		1: "DELETION_ACTIVE",
+		2: "DELETION_PENDING",
+		3: "DELETION_COMPLETE",
+	}
+	DeletionState_value = map[string]int32{
+		"DELETION_STATE_UNSPECIFIED": 0,
+		"DELETION_ACTIVE":            1,
+		"DELETION_PENDING":           2,
+		"DELETION_COMPLETE":          3,
+	}
+)
+
+func (x DeletionState) Enum() *DeletionState {
+	p := new(DeletionState)
+	*p = x
+	return p
+}
+
+func (x DeletionState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (DeletionState) Descriptor() protoreflect.EnumDescriptor {
+	return file_session_proto_enumTypes[2].Descriptor()
+}
+
+func (DeletionState) Type() protoreflect.EnumType {
+	return &file_session_proto_enumTypes[2]
+}
+
+func (x DeletionState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use DeletionState.Descriptor instead.
+func (DeletionState) EnumDescriptor() ([]byte, []int) {
+	return file_session_proto_rawDescGZIP(), []int{2}
 }
 
 // SnapshotRef is the session-STATUS ref carried in ComputeRef below. Its shape mirrors the canonical
@@ -385,9 +442,15 @@ type Session struct {
 	Model        string                 `protobuf:"bytes,3,opt,name=model,proto3" json:"model,omitempty"`                                                                        // model-agnostic id
 	ExecState    ExecState              `protobuf:"varint,13,opt,name=exec_state,json=execState,proto3,enum=agentsessions.v1.ExecState" json:"exec_state,omitempty"`             // execution/turn axis
 	ComputeState ComputeState           `protobuf:"varint,14,opt,name=compute_state,json=computeState,proto3,enum=agentsessions.v1.ComputeState" json:"compute_state,omitempty"` // incarnation axis
-	LastSeq      int64                  `protobuf:"varint,5,opt,name=last_seq,json=lastSeq,proto3" json:"last_seq,omitempty"`                                                    // event-log cursor
-	ParentUid    string                 `protobuf:"bytes,6,opt,name=parent_uid,json=parentUid,proto3" json:"parent_uid,omitempty"`                                               // fork lineage
-	ForkSeq      int64                  `protobuf:"varint,7,opt,name=fork_seq,json=forkSeq,proto3" json:"fork_seq,omitempty"`
+	// Tag 15 is intentionally left available for pending_approval.
+	DeletionState DeletionState `protobuf:"varint,16,opt,name=deletion_state,json=deletionState,proto3,enum=agentsessions.v1.DeletionState" json:"deletion_state,omitempty"` // independent permanent-deletion axis
+	// Absent for ACTIVE; set once when the host commits the durable PENDING tombstone.
+	DeletionRequestedTime *timestamppb.Timestamp `protobuf:"bytes,17,opt,name=deletion_requested_time,json=deletionRequestedTime,proto3" json:"deletion_requested_time,omitempty"`
+	// Absent until cleanup is confirmed; always absent for intent-only PENDING deletion.
+	DeletionCompletedTime *timestamppb.Timestamp `protobuf:"bytes,18,opt,name=deletion_completed_time,json=deletionCompletedTime,proto3" json:"deletion_completed_time,omitempty"`
+	LastSeq               int64                  `protobuf:"varint,5,opt,name=last_seq,json=lastSeq,proto3" json:"last_seq,omitempty"`      // event-log cursor
+	ParentUid             string                 `protobuf:"bytes,6,opt,name=parent_uid,json=parentUid,proto3" json:"parent_uid,omitempty"` // fork lineage
+	ForkSeq               int64                  `protobuf:"varint,7,opt,name=fork_seq,json=forkSeq,proto3" json:"fork_seq,omitempty"`
 	// Recorded provenance, never enforced: it says on whose behalf a session was created, and the
 	// hash chain makes that record tamper-evident. Nothing in this implementation treats it as
 	// authorization. See docs/security.md.
@@ -463,6 +526,27 @@ func (x *Session) GetComputeState() ComputeState {
 		return x.ComputeState
 	}
 	return ComputeState_COMPUTE_STATE_UNSPECIFIED
+}
+
+func (x *Session) GetDeletionState() DeletionState {
+	if x != nil {
+		return x.DeletionState
+	}
+	return DeletionState_DELETION_STATE_UNSPECIFIED
+}
+
+func (x *Session) GetDeletionRequestedTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.DeletionRequestedTime
+	}
+	return nil
+}
+
+func (x *Session) GetDeletionCompletedTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.DeletionCompletedTime
+	}
+	return nil
 }
 
 func (x *Session) GetLastSeq() int64 {
@@ -609,8 +693,9 @@ func (x *GetSessionRequest) GetUid() string {
 	return ""
 }
 
-// ListSessions enumerates sessions from the durable store, so it returns sessions that have no
-// events and no live incarnation yet. Paging is keyset over (create_time DESC, uid ASC), which is
+// ListSessions enumerates ACTIVE sessions from the durable store, including sessions that have
+// no events and no live incarnation yet. Permanently tombstoned UIDs are hidden before pagination.
+// Paging is keyset over (create_time DESC, uid ASC), which is
 // stable when a session is created mid-pagination; an offset would skip or repeat rows.
 type ListSessionsRequest struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
@@ -1431,7 +1516,7 @@ var File_session_proto protoreflect.FileDescriptor
 
 const file_session_proto_rawDesc = "" +
 	"\n" +
-	"\rsession.proto\x12\x10agentsessions.v1\x1a\fcommon.proto\"v\n" +
+	"\rsession.proto\x12\x10agentsessions.v1\x1a\fcommon.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"v\n" +
 	"\vSnapshotRef\x12\x14\n" +
 	"\x05local\x18\x01 \x01(\tR\x05local\x12!\n" +
 	"\fexternal_uri\x18\x02 \x01(\tR\vexternalUri\x12\x16\n" +
@@ -1455,14 +1540,17 @@ const file_session_proto_rawDesc = "" +
 	"fenceToken\x1a=\n" +
 	"\x0fAttributesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x82\x06\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xf2\a\n" +
 	"\aSession\x12>\n" +
 	"\bmetadata\x18\x01 \x01(\v2\".agentsessions.v1.ResourceMetadataR\bmetadata\x12\x18\n" +
 	"\aharness\x18\x02 \x01(\tR\aharness\x12\x14\n" +
 	"\x05model\x18\x03 \x01(\tR\x05model\x12:\n" +
 	"\n" +
 	"exec_state\x18\r \x01(\x0e2\x1b.agentsessions.v1.ExecStateR\texecState\x12C\n" +
-	"\rcompute_state\x18\x0e \x01(\x0e2\x1e.agentsessions.v1.ComputeStateR\fcomputeState\x12\x19\n" +
+	"\rcompute_state\x18\x0e \x01(\x0e2\x1e.agentsessions.v1.ComputeStateR\fcomputeState\x12F\n" +
+	"\x0edeletion_state\x18\x10 \x01(\x0e2\x1f.agentsessions.v1.DeletionStateR\rdeletionState\x12R\n" +
+	"\x17deletion_requested_time\x18\x11 \x01(\v2\x1a.google.protobuf.TimestampR\x15deletionRequestedTime\x12R\n" +
+	"\x17deletion_completed_time\x18\x12 \x01(\v2\x1a.google.protobuf.TimestampR\x15deletionCompletedTime\x12\x19\n" +
 	"\blast_seq\x18\x05 \x01(\x03R\alastSeq\x12\x1d\n" +
 	"\n" +
 	"parent_uid\x18\x06 \x01(\tR\tparentUid\x12\x19\n" +
@@ -1554,7 +1642,12 @@ const file_session_proto_rawDesc = "" +
 	"\fCOMPUTE_LIVE\x10\x02\x12\x10\n" +
 	"\fCOMPUTE_WARM\x10\x03\x12\x10\n" +
 	"\fCOMPUTE_COLD\x10\x04\x12\x16\n" +
-	"\x12COMPUTE_TERMINATED\x10\x052\x8b\x06\n" +
+	"\x12COMPUTE_TERMINATED\x10\x05*q\n" +
+	"\rDeletionState\x12\x1e\n" +
+	"\x1aDELETION_STATE_UNSPECIFIED\x10\x00\x12\x13\n" +
+	"\x0fDELETION_ACTIVE\x10\x01\x12\x14\n" +
+	"\x10DELETION_PENDING\x10\x02\x12\x15\n" +
+	"\x11DELETION_COMPLETE\x10\x032\x8b\x06\n" +
 	"\bSessions\x12R\n" +
 	"\rCreateSession\x12&.agentsessions.v1.CreateSessionRequest\x1a\x19.agentsessions.v1.Session\x12L\n" +
 	"\n" +
@@ -1580,85 +1673,90 @@ func file_session_proto_rawDescGZIP() []byte {
 	return file_session_proto_rawDescData
 }
 
-var file_session_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_session_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_session_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
 var file_session_proto_goTypes = []any{
-	(ExecState)(0),               // 0: agentsessions.v1.ExecState
-	(ComputeState)(0),            // 1: agentsessions.v1.ComputeState
-	(*SnapshotRef)(nil),          // 2: agentsessions.v1.SnapshotRef
-	(*RuntimeCapabilities)(nil),  // 3: agentsessions.v1.RuntimeCapabilities
-	(*ComputeRef)(nil),           // 4: agentsessions.v1.ComputeRef
-	(*Session)(nil),              // 5: agentsessions.v1.Session
-	(*CreateSessionRequest)(nil), // 6: agentsessions.v1.CreateSessionRequest
-	(*GetSessionRequest)(nil),    // 7: agentsessions.v1.GetSessionRequest
-	(*ListSessionsRequest)(nil),  // 8: agentsessions.v1.ListSessionsRequest
-	(*ListSessionsResponse)(nil), // 9: agentsessions.v1.ListSessionsResponse
-	(*DeleteSessionRequest)(nil), // 10: agentsessions.v1.DeleteSessionRequest
-	(*ExecRequest)(nil),          // 11: agentsessions.v1.ExecRequest
-	(*ReplayRequest)(nil),        // 12: agentsessions.v1.ReplayRequest
-	(*SuspendRequest)(nil),       // 13: agentsessions.v1.SuspendRequest
-	(*ResumeRequest)(nil),        // 14: agentsessions.v1.ResumeRequest
-	(*ForkRequest)(nil),          // 15: agentsessions.v1.ForkRequest
-	(*ForkResponse)(nil),         // 16: agentsessions.v1.ForkResponse
-	(*CancelRequest)(nil),        // 17: agentsessions.v1.CancelRequest
-	(*ExecUpdate)(nil),           // 18: agentsessions.v1.ExecUpdate
-	(*Delta)(nil),                // 19: agentsessions.v1.Delta
-	nil,                          // 20: agentsessions.v1.ComputeRef.AttributesEntry
-	nil,                          // 21: agentsessions.v1.Session.LabelsEntry
-	nil,                          // 22: agentsessions.v1.Session.AnnotationsEntry
-	nil,                          // 23: agentsessions.v1.ForkRequest.LabelsEntry
-	(*ResourceMetadata)(nil),     // 24: agentsessions.v1.ResourceMetadata
-	(*IdentityRef)(nil),          // 25: agentsessions.v1.IdentityRef
-	(*Origin)(nil),               // 26: agentsessions.v1.Origin
-	(*Message)(nil),              // 27: agentsessions.v1.Message
-	(*LogRecord)(nil),            // 28: agentsessions.v1.LogRecord
+	(ExecState)(0),                // 0: agentsessions.v1.ExecState
+	(ComputeState)(0),             // 1: agentsessions.v1.ComputeState
+	(DeletionState)(0),            // 2: agentsessions.v1.DeletionState
+	(*SnapshotRef)(nil),           // 3: agentsessions.v1.SnapshotRef
+	(*RuntimeCapabilities)(nil),   // 4: agentsessions.v1.RuntimeCapabilities
+	(*ComputeRef)(nil),            // 5: agentsessions.v1.ComputeRef
+	(*Session)(nil),               // 6: agentsessions.v1.Session
+	(*CreateSessionRequest)(nil),  // 7: agentsessions.v1.CreateSessionRequest
+	(*GetSessionRequest)(nil),     // 8: agentsessions.v1.GetSessionRequest
+	(*ListSessionsRequest)(nil),   // 9: agentsessions.v1.ListSessionsRequest
+	(*ListSessionsResponse)(nil),  // 10: agentsessions.v1.ListSessionsResponse
+	(*DeleteSessionRequest)(nil),  // 11: agentsessions.v1.DeleteSessionRequest
+	(*ExecRequest)(nil),           // 12: agentsessions.v1.ExecRequest
+	(*ReplayRequest)(nil),         // 13: agentsessions.v1.ReplayRequest
+	(*SuspendRequest)(nil),        // 14: agentsessions.v1.SuspendRequest
+	(*ResumeRequest)(nil),         // 15: agentsessions.v1.ResumeRequest
+	(*ForkRequest)(nil),           // 16: agentsessions.v1.ForkRequest
+	(*ForkResponse)(nil),          // 17: agentsessions.v1.ForkResponse
+	(*CancelRequest)(nil),         // 18: agentsessions.v1.CancelRequest
+	(*ExecUpdate)(nil),            // 19: agentsessions.v1.ExecUpdate
+	(*Delta)(nil),                 // 20: agentsessions.v1.Delta
+	nil,                           // 21: agentsessions.v1.ComputeRef.AttributesEntry
+	nil,                           // 22: agentsessions.v1.Session.LabelsEntry
+	nil,                           // 23: agentsessions.v1.Session.AnnotationsEntry
+	nil,                           // 24: agentsessions.v1.ForkRequest.LabelsEntry
+	(*ResourceMetadata)(nil),      // 25: agentsessions.v1.ResourceMetadata
+	(*timestamppb.Timestamp)(nil), // 26: google.protobuf.Timestamp
+	(*IdentityRef)(nil),           // 27: agentsessions.v1.IdentityRef
+	(*Origin)(nil),                // 28: agentsessions.v1.Origin
+	(*Message)(nil),               // 29: agentsessions.v1.Message
+	(*LogRecord)(nil),             // 30: agentsessions.v1.LogRecord
 }
 var file_session_proto_depIdxs = []int32{
-	2,  // 0: agentsessions.v1.ComputeRef.snapshot:type_name -> agentsessions.v1.SnapshotRef
-	3,  // 1: agentsessions.v1.ComputeRef.capabilities:type_name -> agentsessions.v1.RuntimeCapabilities
-	20, // 2: agentsessions.v1.ComputeRef.attributes:type_name -> agentsessions.v1.ComputeRef.AttributesEntry
-	24, // 3: agentsessions.v1.Session.metadata:type_name -> agentsessions.v1.ResourceMetadata
+	3,  // 0: agentsessions.v1.ComputeRef.snapshot:type_name -> agentsessions.v1.SnapshotRef
+	4,  // 1: agentsessions.v1.ComputeRef.capabilities:type_name -> agentsessions.v1.RuntimeCapabilities
+	21, // 2: agentsessions.v1.ComputeRef.attributes:type_name -> agentsessions.v1.ComputeRef.AttributesEntry
+	25, // 3: agentsessions.v1.Session.metadata:type_name -> agentsessions.v1.ResourceMetadata
 	0,  // 4: agentsessions.v1.Session.exec_state:type_name -> agentsessions.v1.ExecState
 	1,  // 5: agentsessions.v1.Session.compute_state:type_name -> agentsessions.v1.ComputeState
-	25, // 6: agentsessions.v1.Session.identity:type_name -> agentsessions.v1.IdentityRef
-	4,  // 7: agentsessions.v1.Session.compute:type_name -> agentsessions.v1.ComputeRef
-	26, // 8: agentsessions.v1.Session.origin:type_name -> agentsessions.v1.Origin
-	21, // 9: agentsessions.v1.Session.labels:type_name -> agentsessions.v1.Session.LabelsEntry
-	22, // 10: agentsessions.v1.Session.annotations:type_name -> agentsessions.v1.Session.AnnotationsEntry
-	5,  // 11: agentsessions.v1.CreateSessionRequest.session:type_name -> agentsessions.v1.Session
-	5,  // 12: agentsessions.v1.ListSessionsResponse.sessions:type_name -> agentsessions.v1.Session
-	27, // 13: agentsessions.v1.ExecRequest.inputs:type_name -> agentsessions.v1.Message
-	25, // 14: agentsessions.v1.ForkRequest.identity:type_name -> agentsessions.v1.IdentityRef
-	23, // 15: agentsessions.v1.ForkRequest.labels:type_name -> agentsessions.v1.ForkRequest.LabelsEntry
-	5,  // 16: agentsessions.v1.ForkResponse.children:type_name -> agentsessions.v1.Session
-	28, // 17: agentsessions.v1.ExecUpdate.record:type_name -> agentsessions.v1.LogRecord
-	19, // 18: agentsessions.v1.ExecUpdate.delta:type_name -> agentsessions.v1.Delta
-	5,  // 19: agentsessions.v1.ExecUpdate.session:type_name -> agentsessions.v1.Session
-	6,  // 20: agentsessions.v1.Sessions.CreateSession:input_type -> agentsessions.v1.CreateSessionRequest
-	7,  // 21: agentsessions.v1.Sessions.GetSession:input_type -> agentsessions.v1.GetSessionRequest
-	8,  // 22: agentsessions.v1.Sessions.ListSessions:input_type -> agentsessions.v1.ListSessionsRequest
-	10, // 23: agentsessions.v1.Sessions.DeleteSession:input_type -> agentsessions.v1.DeleteSessionRequest
-	11, // 24: agentsessions.v1.Sessions.Exec:input_type -> agentsessions.v1.ExecRequest
-	12, // 25: agentsessions.v1.Sessions.Replay:input_type -> agentsessions.v1.ReplayRequest
-	17, // 26: agentsessions.v1.Sessions.Cancel:input_type -> agentsessions.v1.CancelRequest
-	13, // 27: agentsessions.v1.Sessions.Suspend:input_type -> agentsessions.v1.SuspendRequest
-	14, // 28: agentsessions.v1.Sessions.Resume:input_type -> agentsessions.v1.ResumeRequest
-	15, // 29: agentsessions.v1.Sessions.Fork:input_type -> agentsessions.v1.ForkRequest
-	5,  // 30: agentsessions.v1.Sessions.CreateSession:output_type -> agentsessions.v1.Session
-	5,  // 31: agentsessions.v1.Sessions.GetSession:output_type -> agentsessions.v1.Session
-	9,  // 32: agentsessions.v1.Sessions.ListSessions:output_type -> agentsessions.v1.ListSessionsResponse
-	5,  // 33: agentsessions.v1.Sessions.DeleteSession:output_type -> agentsessions.v1.Session
-	18, // 34: agentsessions.v1.Sessions.Exec:output_type -> agentsessions.v1.ExecUpdate
-	28, // 35: agentsessions.v1.Sessions.Replay:output_type -> agentsessions.v1.LogRecord
-	5,  // 36: agentsessions.v1.Sessions.Cancel:output_type -> agentsessions.v1.Session
-	5,  // 37: agentsessions.v1.Sessions.Suspend:output_type -> agentsessions.v1.Session
-	5,  // 38: agentsessions.v1.Sessions.Resume:output_type -> agentsessions.v1.Session
-	16, // 39: agentsessions.v1.Sessions.Fork:output_type -> agentsessions.v1.ForkResponse
-	30, // [30:40] is the sub-list for method output_type
-	20, // [20:30] is the sub-list for method input_type
-	20, // [20:20] is the sub-list for extension type_name
-	20, // [20:20] is the sub-list for extension extendee
-	0,  // [0:20] is the sub-list for field type_name
+	2,  // 6: agentsessions.v1.Session.deletion_state:type_name -> agentsessions.v1.DeletionState
+	26, // 7: agentsessions.v1.Session.deletion_requested_time:type_name -> google.protobuf.Timestamp
+	26, // 8: agentsessions.v1.Session.deletion_completed_time:type_name -> google.protobuf.Timestamp
+	27, // 9: agentsessions.v1.Session.identity:type_name -> agentsessions.v1.IdentityRef
+	5,  // 10: agentsessions.v1.Session.compute:type_name -> agentsessions.v1.ComputeRef
+	28, // 11: agentsessions.v1.Session.origin:type_name -> agentsessions.v1.Origin
+	22, // 12: agentsessions.v1.Session.labels:type_name -> agentsessions.v1.Session.LabelsEntry
+	23, // 13: agentsessions.v1.Session.annotations:type_name -> agentsessions.v1.Session.AnnotationsEntry
+	6,  // 14: agentsessions.v1.CreateSessionRequest.session:type_name -> agentsessions.v1.Session
+	6,  // 15: agentsessions.v1.ListSessionsResponse.sessions:type_name -> agentsessions.v1.Session
+	29, // 16: agentsessions.v1.ExecRequest.inputs:type_name -> agentsessions.v1.Message
+	27, // 17: agentsessions.v1.ForkRequest.identity:type_name -> agentsessions.v1.IdentityRef
+	24, // 18: agentsessions.v1.ForkRequest.labels:type_name -> agentsessions.v1.ForkRequest.LabelsEntry
+	6,  // 19: agentsessions.v1.ForkResponse.children:type_name -> agentsessions.v1.Session
+	30, // 20: agentsessions.v1.ExecUpdate.record:type_name -> agentsessions.v1.LogRecord
+	20, // 21: agentsessions.v1.ExecUpdate.delta:type_name -> agentsessions.v1.Delta
+	6,  // 22: agentsessions.v1.ExecUpdate.session:type_name -> agentsessions.v1.Session
+	7,  // 23: agentsessions.v1.Sessions.CreateSession:input_type -> agentsessions.v1.CreateSessionRequest
+	8,  // 24: agentsessions.v1.Sessions.GetSession:input_type -> agentsessions.v1.GetSessionRequest
+	9,  // 25: agentsessions.v1.Sessions.ListSessions:input_type -> agentsessions.v1.ListSessionsRequest
+	11, // 26: agentsessions.v1.Sessions.DeleteSession:input_type -> agentsessions.v1.DeleteSessionRequest
+	12, // 27: agentsessions.v1.Sessions.Exec:input_type -> agentsessions.v1.ExecRequest
+	13, // 28: agentsessions.v1.Sessions.Replay:input_type -> agentsessions.v1.ReplayRequest
+	18, // 29: agentsessions.v1.Sessions.Cancel:input_type -> agentsessions.v1.CancelRequest
+	14, // 30: agentsessions.v1.Sessions.Suspend:input_type -> agentsessions.v1.SuspendRequest
+	15, // 31: agentsessions.v1.Sessions.Resume:input_type -> agentsessions.v1.ResumeRequest
+	16, // 32: agentsessions.v1.Sessions.Fork:input_type -> agentsessions.v1.ForkRequest
+	6,  // 33: agentsessions.v1.Sessions.CreateSession:output_type -> agentsessions.v1.Session
+	6,  // 34: agentsessions.v1.Sessions.GetSession:output_type -> agentsessions.v1.Session
+	10, // 35: agentsessions.v1.Sessions.ListSessions:output_type -> agentsessions.v1.ListSessionsResponse
+	6,  // 36: agentsessions.v1.Sessions.DeleteSession:output_type -> agentsessions.v1.Session
+	19, // 37: agentsessions.v1.Sessions.Exec:output_type -> agentsessions.v1.ExecUpdate
+	30, // 38: agentsessions.v1.Sessions.Replay:output_type -> agentsessions.v1.LogRecord
+	6,  // 39: agentsessions.v1.Sessions.Cancel:output_type -> agentsessions.v1.Session
+	6,  // 40: agentsessions.v1.Sessions.Suspend:output_type -> agentsessions.v1.Session
+	6,  // 41: agentsessions.v1.Sessions.Resume:output_type -> agentsessions.v1.Session
+	17, // 42: agentsessions.v1.Sessions.Fork:output_type -> agentsessions.v1.ForkResponse
+	33, // [33:43] is the sub-list for method output_type
+	23, // [23:33] is the sub-list for method input_type
+	23, // [23:23] is the sub-list for extension type_name
+	23, // [23:23] is the sub-list for extension extendee
+	0,  // [0:23] is the sub-list for field type_name
 }
 
 func init() { file_session_proto_init() }
@@ -1678,7 +1776,7 @@ func file_session_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_session_proto_rawDesc), len(file_session_proto_rawDesc)),
-			NumEnums:      2,
+			NumEnums:      3,
 			NumMessages:   22,
 			NumExtensions: 0,
 			NumServices:   1,

@@ -57,6 +57,20 @@ provide.
 
 ### Compatibility
 
+- The `DeleteSession` contract defines permanent soft deletion: retain the UID, metadata and
+  hash-chained journal forever, hide it from `ListSessions`, and keep `GetSession` and raw
+  `Sessions.Replay` for audit. Deleted UIDs cannot be reused or mutated through `Exec`, historical
+  `Fork`, `Resume`, `Suspend`, or approval decisions when supported, including exact approval retries;
+  children remain independent. `OK` with `deletion_state=PENDING` acknowledges durable intent only.
+  Until ownership and cleanup land in #88, actors, fork-child pins and snapshots remain retained:
+  deletion does not call `Runtime.Stop`, report `COMPLETE`, or imply resource reclamation or data
+  erasure. The journal is audit evidence, not an authoritative cleanup-target inventory; #88 owns
+  that schema. Repeated PENDING deletion preserves all timestamps, the journal, fence and compute
+  projection. Local Delete/Fork overlap is `ABORTED` before mutation; serialization covers one
+  Registry/host only, not compute provisioning by an independent host before its first fence.
+  The new `LIFECYCLE_DELETE` enum-name hash cannot be verified by older binaries; existing records
+  and their canonical hashes are unchanged. The new deletion fields and timestamps are independent
+  of execution and compute state.
 - New `EXECUTION_START` records include the resolved registry harness name and optional advertised
   harness version (`HarnessDescriptor.version`). Interrupted `Sessions.Resume` uses the recorded
   registry entry, not the session default; an unserved recorded entry or known-version mismatch is
@@ -94,8 +108,8 @@ provide.
 - `Runtime.Snapshot(..., SnapshotExternal)` owns the cold transition: capture state, release dedicated
   compute where applicable, and retain any handle needed by `Restore`. Out-of-tree runtimes that only
   capture state must implement that transition themselves; the Placer no longer calls `Stop` afterward.
-  Suspended actors and fork-child snapshot pins are retained indefinitely: `DeleteSession` is
-  unimplemented and no session teardown calls `Stop`. Operators must reclaim them directly in Substrate.
+  Suspended actors and fork-child snapshot pins are retained indefinitely: intent-only
+  `DeleteSession` does not call `Stop` or reclaim them. Operators must reclaim them directly in Substrate.
   No signatures or wire formats change, and restoring a snapshot after destructive `Stop` is not
   guaranteed.
 
