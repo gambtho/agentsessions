@@ -57,6 +57,10 @@ provide.
 
 ### Compatibility
 
+- `agentctl exec --config-file <path>` reads opaque per-execution config from a file before
+  connecting to the server. Omitting the flag keeps the existing empty-config behavior; an unreadable
+  file fails without starting the execution. Config is journaled and visible in Replay, so it must
+  not hold credentials.
 - Go SDK callers can pass opaque per-execution config through `client.ExecOptions.Config`.
   Omitting it keeps the existing empty-config behavior. Config is durable journal content exposed
   by Replay; do not include credentials. No wire or journal schema change.

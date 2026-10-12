@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -68,6 +71,79 @@ func TestExecHarnessFlag(t *testing.T) {
 				t.Fatal("exec sent no request")
 			}
 		})
+	}
+}
+
+func TestExecConfigFile(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		file    bool
+		config  []byte
+		missing bool
+	}{
+		{name: "set", file: true, config: []byte{0, 255, ' ', '\n', '\t'}},
+		{name: "unset"},
+		{name: "empty", file: true, config: []byte{}},
+		{name: "missing file", file: true, missing: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			requests := make(chan *v1.ExecRequest, 1)
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv := grpc.NewServer()
+			v1.RegisterSessionsServer(srv, &execRecorder{requests: requests})
+			go func() { _ = srv.Serve(lis) }()
+			t.Cleanup(srv.Stop)
+
+			args := []string{"--server", lis.Addr().String(), "--input", "hello"}
+			path := filepath.Join(t.TempDir(), "config.bin")
+			if tt.file {
+				args = append(args, "--config-file", path)
+				if !tt.missing {
+					if err := os.WriteFile(path, tt.config, 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			err = cmdExec(args)
+			if tt.missing {
+				if !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), path) {
+					t.Fatalf("missing config file: got %v, want path-qualified ErrNotExist", err)
+				}
+				select {
+				case <-requests:
+					t.Fatal("missing config file sent an Exec request")
+				default:
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case req := <-requests:
+				if got := req.GetConfig(); !bytes.Equal(got, tt.config) {
+					t.Fatalf("config = %x, want %x", got, tt.config)
+				}
+			default:
+				t.Fatal("exec sent no request")
+			}
+		})
+	}
+}
+
+func TestExecMissingConfigFileLeavesNoJournal(t *testing.T) {
+	dir := t.TempDir()
+	journal := filepath.Join(dir, "journal.db")
+	path := filepath.Join(dir, "missing.bin")
+	err := cmdExec([]string{"--journal", journal, "--input", "hello", "--config-file", path})
+	if !errors.Is(err, os.ErrNotExist) || !strings.Contains(err.Error(), path) {
+		t.Fatalf("missing config file: got %v, want path-qualified ErrNotExist", err)
+	}
+	if _, err := os.Stat(journal); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("journal stat = %v, want ErrNotExist", err)
 	}
 }
 

@@ -249,11 +249,20 @@ func cmdGet(args []string) error {
 func cmdExec(args []string) error {
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
 	cfg := commonFlags(fs)
-	var sess, input, harness string
+	var sess, input, harness, configFile string
+	fs.StringVar(&configFile, "config-file", "", "path to opaque execution config; config is journaled and must not hold credentials")
 	fs.StringVar(&sess, "session", "", "session UID (created if empty)")
 	fs.StringVar(&input, "input", "", "user input for this turn")
 	fs.StringVar(&harness, "harness", "", "harness for a new session or override for this turn (default: the session's or host's)")
 	_ = fs.Parse(args)
+	var execConfig []byte
+	if configFile != "" {
+		var err error
+		execConfig, err = os.ReadFile(configFile)
+		if err != nil {
+			return fmt.Errorf("read config file %q: %w", configFile, err)
+		}
+	}
 	c, cleanup, err := dial(cfg)
 	if err != nil {
 		return err
@@ -266,6 +275,7 @@ func cmdExec(args []string) error {
 		Session: sess,
 		Inputs:  []string{input},
 		Harness: harness,
+		Config:  execConfig,
 		OnSession: func(s *v1.Session) {
 			if sess == "" {
 				fmt.Printf("session %s\n", s.GetMetadata().GetUid())

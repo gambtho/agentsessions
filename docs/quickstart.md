@@ -270,6 +270,11 @@ CHAT=$(agentctl create --server 127.0.0.1:8080 --harness chat)
 agentctl exec --server 127.0.0.1:8080 --session "$CHAT" --input "name three primes"
 ```
 
+Pass `--config-file <path>` to `agentctl exec` to send a file's bytes as opaque per-execution
+config. The file is read before connecting; an unreadable file fails without running a turn.
+Omitting the flag sends empty config. Config is journaled and visible in Replay, so it must not
+hold credentials. There is no inline config flag: the contents stay out of argv and shell history.
+
 The server logs which harnesses it registered at startup (`harnesses="[chat echo]"`).
 
 `--model-base-url` points at any endpoint that accepts the chat-completions request body: a
