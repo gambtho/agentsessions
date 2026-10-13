@@ -16,8 +16,8 @@ import (
 	"github.com/aramase/agentsessions/runtime/substrate"
 )
 
-func TestSessionDeletePendingOnGVisor(t *testing.T) {
-	f := newFixture(t, env("SUBSTRATE_ATESPACE", "e2e-delete-gvisor"))
+func TestSessionDeletePending(t *testing.T) {
+	f := newFixture(t, env("SUBSTRATE_ATESPACE", "e2e-delete-stateless"))
 	for _, cold := range []bool{false, true} {
 		name := "running"
 		if cold {
@@ -40,26 +40,25 @@ func TestSessionDeletePendingOnMicroVM(t *testing.T) {
 	}
 }
 
-// Retain the actual tag RPC response from the unmodified adapter. The pinned Control API has no
-// read-only GetTag RPC; GetActorSnapshot(tag) below proves the same pin still resolves, without
-// re-tagging or mutating scope just to observe metadata.
+// Retain the actual tag RPC response from the unmodified adapter. Read-only GetTag checks
+// that Delete and descendant activity preserve the exact tag-owned snapshot.
 type deleteControl struct {
 	grpc.ClientConnInterface
 	mu   sync.Mutex
-	tags map[string]*atepb.ActorSnapshotTag
+	tags map[string]*atepb.Tag
 }
 
 func (c *deleteControl) Invoke(ctx context.Context, method string, args, reply any, opts ...grpc.CallOption) error {
 	err := c.ClientConnInterface.Invoke(ctx, method, args, reply, opts...)
-	if err == nil && method == atepb.Control_TagActorSnapshot_FullMethodName {
-		tag := reply.(*atepb.ActorSnapshotTag)
+	if err == nil && method == atepb.Control_CreateTag_FullMethodName {
+		tag := reply.(*atepb.Tag)
 		c.mu.Lock()
 		c.tags[tag.GetMetadata().GetName()] = tag
 		c.mu.Unlock()
 	}
 	return err
 }
-func (c *deleteControl) tag(name string) *atepb.ActorSnapshotTag {
+func (c *deleteControl) tag(name string) *atepb.Tag {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.tags[name]
@@ -69,8 +68,13 @@ func runDeleteHierarchy(t *testing.T, f *fixture, template string, desc api.Desc
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Minute)
 	defer cancel()
-	observed := &deleteControl{ClientConnInterface: f.conn, tags: map[string]*atepb.ActorSnapshotTag{}}
-	backend := substrate.New(ateadapter.New(observed, ""), f.atespace, substrate.ObjectRef{Namespace: f.tmplNS, Name: template}, desc)
+	if template == echoTemplate {
+		f.ensureTemplate(t, echoTemplateSpec)
+	} else {
+		f.ensureTemplate(t, counterTemplateSpec)
+	}
+	observed := &deleteControl{ClientConnInterface: f.conn, tags: map[string]*atepb.Tag{}}
+	backend := substrate.New(ateadapter.New(observed), f.atespace, substrate.ObjectRef{Atespace: f.tmplAtespace, Name: template}, desc, substrate.WithRouter(f.router))
 	b := &deleteRuntime{Backend: backend}
 	a := newDeleteAPI(t, b)
 	ctl := atepb.NewControlClient(f.conn)
@@ -90,7 +94,7 @@ func runDeleteHierarchy(t *testing.T, f *fixture, template string, desc api.Desc
 				t.Errorf("owned cleanup GetActor %s: %v", owned[i], err)
 				continue
 			}
-			if actor.GetStatus() == atepb.Actor_STATUS_RUNNING {
+			if actor.GetStatus().GetState() == atepb.ActorState_ACTOR_STATE_RUNNING {
 				if _, err := ctl.SuspendActor(cleanupCtx, &atepb.SuspendActorRequest{Actor: ref}); err != nil {
 					t.Errorf("owned cleanup Suspend %s: %v", owned[i], err)
 					continue
@@ -100,7 +104,7 @@ func runDeleteHierarchy(t *testing.T, f *fixture, template string, desc api.Desc
 				t.Errorf("owned cleanup DeleteActor %s: %v", owned[i], err)
 			}
 			if desc.Capabilities.Resumability == api.ResumabilityRequiresMemorySnapshot && observed.tag("fork-"+owned[i]) != nil {
-				if _, err := ctl.DeleteActorSnapshotTag(cleanupCtx, &atepb.DeleteActorSnapshotTagRequest{Tag: &atepb.ObjectRef{Atespace: f.atespace, Name: "fork-" + owned[i]}}); err != nil {
+				if _, err := ctl.DeleteTag(cleanupCtx, &atepb.DeleteTagRequest{Tag: &atepb.ObjectRef{Atespace: f.atespace, Name: "fork-" + owned[i]}}); err != nil {
 					t.Errorf("owned cleanup pin %s: %v", owned[i], err)
 				}
 			}
@@ -139,21 +143,21 @@ func runDeleteHierarchy(t *testing.T, f *fixture, template string, desc api.Desc
 	deletionStatus(t, ctx, a, parent, cold)
 	deletionStatus(t, ctx, a, middle, cold)
 	actors := map[string]*atepb.Actor{}
-	pins := map[string]*atepb.ActorSnapshot{}
+	pins := map[string]*atepb.Tag{}
 	for _, uid := range owned {
 		actor, err := ctl.GetActor(ctx, &atepb.GetActorRequest{Actor: &atepb.ObjectRef{Atespace: f.atespace, Name: uid}})
 		if err != nil {
 			t.Fatalf("control actor %s: %v", uid, err)
 		}
-		if actor.GetMetadata().GetUid() == "" || actor.GetActorTemplateName() != template || actor.GetActorTemplateNamespace() != f.tmplNS {
+		if actor.GetMetadata().GetUid() == "" || actor.GetActorTemplate().GetName() != template || actor.GetActorTemplate().GetAtespace() != f.tmplAtespace {
 			t.Fatalf("actor identity/template %s: %v", uid, actor)
 		}
 		if uid == parent || uid == middle {
-			want := atepb.Actor_STATUS_RUNNING
+			want := atepb.ActorState_ACTOR_STATE_RUNNING
 			if cold {
-				want = atepb.Actor_STATUS_SUSPENDED
+				want = atepb.ActorState_ACTOR_STATE_SUSPENDED
 			}
-			if actor.GetStatus() != want || (!cold && (actor.GetAteomPodUid() == "" || actor.GetAteomPodIp() == "")) || (cold && (actor.GetLatestSnapshot().GetName() == "" || actor.GetAteomPodIp() != "")) {
+			if actor.GetStatus().GetState() != want || (!cold && (actor.GetStatus().GetWorkerAssignment().GetWorkerPodUid() == "" || len(actor.GetStatus().GetWorkerAssignment().GetWorkerPodIps()) == 0)) || (cold && (actor.GetStatus().GetExternalSnapshot().GetSnapshotUri() == "" || actor.GetStatus().GetWorkerAssignment() != nil)) {
 				t.Fatalf("control state %s: %v", uid, actor)
 			}
 		}
@@ -164,7 +168,7 @@ func runDeleteHierarchy(t *testing.T, f *fixture, template string, desc api.Desc
 	}
 	if template == counterTemplate {
 		for child, source := range map[string]string{middle: parent, sibling: parent, grandchild: middle} {
-			if pins[child].GetSourceActorUid() != actors[source].GetMetadata().GetUid() || pins[child].GetSourceActor().GetName() != source {
+			if pins[child].GetSourceActor().GetAtespace() != f.atespace || pins[child].GetSourceActor().GetName() != source {
 				t.Fatalf("pin %s does not retain actual source actor %s", child, source)
 			}
 		}
@@ -195,7 +199,7 @@ func runDeleteHierarchy(t *testing.T, f *fixture, template string, desc api.Desc
 				t.Fatalf("fixture park retained actor %s: %v", uid, err)
 			}
 			actor, err := ctl.GetActor(ctx, &atepb.GetActorRequest{Actor: ref})
-			if err != nil || actor.GetStatus() != atepb.Actor_STATUS_SUSPENDED || actor.GetMetadata().GetUid() != actors[uid].GetMetadata().GetUid() {
+			if err != nil || actor.GetStatus().GetState() != atepb.ActorState_ACTOR_STATE_SUSPENDED || actor.GetMetadata().GetUid() != actors[uid].GetMetadata().GetUid() {
 				t.Fatalf("fixture parking lost actor %s: %v %v", uid, actor, err)
 			}
 			actors[uid] = actor
@@ -239,7 +243,7 @@ func runDeleteHierarchy(t *testing.T, f *fixture, template string, desc api.Desc
 	}
 	if template == counterTemplate {
 		pins[ownFork] = readDeletePin(t, ctx, ctl, observed, f.atespace, ownFork)
-		if pins[ownFork].GetSourceActorUid() != actors[grandchild].GetMetadata().GetUid() {
+		if pins[ownFork].GetSourceActor().GetAtespace() != f.atespace || pins[ownFork].GetSourceActor().GetName() != grandchild {
 			t.Fatal("own fork pin lost grandchild source identity")
 		}
 		for uid, before := range pins {
@@ -258,24 +262,20 @@ func runDeleteHierarchy(t *testing.T, f *fixture, template string, desc api.Desc
 	t.Logf("retained parent/intermediate actors, %d clone pins, independent sibling/grandchild/own-fork; owned actors=%v", len(pins), owned)
 }
 
-func readDeletePin(t *testing.T, ctx context.Context, ctl atepb.ControlClient, observed *deleteControl, space, uid string) *atepb.ActorSnapshot {
+func readDeletePin(t *testing.T, ctx context.Context, ctl atepb.ControlClient, observed *deleteControl, space, uid string) *atepb.Tag {
 	t.Helper()
 	tag := observed.tag("fork-" + uid)
-	if tag == nil || tag.GetMetadata().GetAtespace() != space || tag.GetMetadata().GetUid() == "" || tag.GetSnapshot().GetName() == "" || tag.GetScope() != atepb.ActorSnapshotTagScope_ACTOR_SNAPSHOT_TAG_SCOPE_ATESPACE {
+	if tag == nil || tag.GetMetadata().GetAtespace() != space || tag.GetMetadata().GetUid() == "" || tag.GetStatus().GetSnapshot().GetSnapshotUri() == "" || tag.GetStatus().GetActorTemplateUid() == "" || tag.GetScope() != atepb.TagScope_TAG_SCOPE_ATESPACE {
 		t.Fatalf("actual clone tag metadata %s: %v", uid, tag)
 	}
-	byTag, err := ctl.GetActorSnapshot(ctx, &atepb.GetActorSnapshotRequest{Snapshot: &atepb.ActorSnapshotRef{Reference: &atepb.ActorSnapshotRef_Tag{Tag: &atepb.ObjectRef{Atespace: space, Name: "fork-" + uid}}}})
-	if err != nil {
-		t.Fatalf("retained pin lookup %s: %v", uid, err)
+	current, err := ctl.GetTag(ctx, &atepb.GetTagRequest{Tag: &atepb.ObjectRef{Atespace: space, Name: "fork-" + uid}})
+	if err != nil || !sameDeleteMessage(t, tag, current) {
+		t.Fatalf("pin no longer resolves exact tag-owned snapshot %s: %v %v", uid, current, err)
 	}
-	canonical, err := ctl.GetActorSnapshot(ctx, &atepb.GetActorSnapshotRequest{Snapshot: &atepb.ActorSnapshotRef{Reference: &atepb.ActorSnapshotRef_Snapshot{Snapshot: tag.GetSnapshot()}}})
-	if err != nil || !sameDeleteMessage(t, byTag, canonical) || byTag.GetSourceActorUid() == "" || byTag.GetSourceActorVersion() <= 0 {
-		t.Fatalf("pin no longer resolves exact source snapshot %s: %v %v", uid, byTag, err)
-	}
-	t.Logf("retained pin %s tagUID=%s snapshotUID=%s sourceActorUID=%s sourceVersion=%d", uid, tag.GetMetadata().GetUid(), byTag.GetMetadata().GetUid(), byTag.GetSourceActorUid(), byTag.GetSourceActorVersion())
-	return byTag
+	t.Logf("retained pin %s tagUID=%s snapshotURI=%s sourceActor=%s templateUID=%s", uid, tag.GetMetadata().GetUid(), tag.GetStatus().GetSnapshot().GetSnapshotUri(), tag.GetSourceActor().GetName(), tag.GetStatus().GetActorTemplateUid())
+	return current
 }
-func assertDeleteResources(t *testing.T, ctx context.Context, ctl atepb.ControlClient, observed *deleteControl, space string, actors map[string]*atepb.Actor, pins map[string]*atepb.ActorSnapshot) {
+func assertDeleteResources(t *testing.T, ctx context.Context, ctl atepb.ControlClient, observed *deleteControl, space string, actors map[string]*atepb.Actor, pins map[string]*atepb.Tag) {
 	t.Helper()
 	for uid, before := range actors {
 		after, err := ctl.GetActor(ctx, &atepb.GetActorRequest{Actor: &atepb.ObjectRef{Atespace: space, Name: uid}})

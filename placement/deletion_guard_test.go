@@ -58,8 +58,9 @@ func (l deletionForkFaultLog) Append(seq, fence int64, event api.Event) (eventlo
 	return l.Store.Append(seq, fence, event)
 }
 
-// Releasing the parent guard before rollback or leaking it on any fault would permit Delete
-// alongside Stop, or permanently strand the parent. Two Placers share the tested Registry.
+// Releasing shared deletion admission before rollback would permit Delete alongside Stop.
+// Parent operations remain available after the checkpoint releases, as required by stream fencing.
+// Two Placers share the tested Registry, and every return must drain all admission entries.
 func TestForkSharedGuardCoversRollbackAndDrainsEveryReturn(t *testing.T) {
 	for _, memory := range []bool{false, true} {
 		for _, phase := range []string{"none", "Describe", "Snapshot", "Fork-first", "Fork-later", "NewFence", "Append"} {
@@ -90,8 +91,11 @@ func TestForkSharedGuardCoversRollbackAndDrainsEveryReturn(t *testing.T) {
 					if err := r.WithSessionGuard("parent", func() error { called = true; return nil }); !errors.Is(err, ErrSessionBusy) || called {
 						t.Errorf("rollback did not retain parent Delete guard: %v callback=%v", err, called)
 					}
-					if _, err := other.trySessionLock("parent"); !errors.Is(err, ErrSessionBusy) {
-						t.Errorf("rollback did not exclude added Placer: %v", err)
+					release, err := other.trySessionLock("parent")
+					if err != nil {
+						t.Errorf("rollback refused added Placer parent operation: %v", err)
+					} else {
+						release()
 					}
 				}
 				children := []ForkChild{{UID: "one", Log: s.Session("one")}, {UID: "two", Log: s.Session("two")}}

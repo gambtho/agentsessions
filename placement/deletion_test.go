@@ -65,7 +65,7 @@ func newDeletionPlacer(t *testing.T, memory bool) (*Placer, *deletionBackend) {
 	p := New(b, func(ctx context.Context, r api.ModelRequest) (api.ModelResponse, error) {
 		b.count("model")
 		return echoagent.Model(ctx, r)
-	}, WithDialer(func(string) (api.Harness, func() error, error) {
+	}, WithDialer(func(api.Incarnation) (api.Harness, func() error, error) {
 		b.count("dial")
 		return echoagent.Harness{}, func() error { return nil }, nil
 	}))

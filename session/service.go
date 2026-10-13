@@ -296,7 +296,7 @@ func (s *Service) placerFor(uid, override string, read func() error) (placer *pl
 	// Otherwise Delete can take the sole Store connection between reads and make this
 	// call queue instead of refusing overlap. Runtime methods acquire their own guard
 	// after this phase and recheck writable status.
-	err = s.mutationRead(uid, func() error {
+	err = s.registry.WithSessionRead(uid, func() error {
 		var resolveErr error
 		placer, harness, resolveErr = s.resolvePlacer(uid, override)
 		if resolveErr != nil {
@@ -307,6 +307,9 @@ func (s *Service) placerFor(uid, override string, read func() error) (placer *pl
 		}
 		return nil
 	})
+	if errors.Is(err, placement.ErrSessionBusy) {
+		err = withStatusCause(codes.Aborted, err)
+	}
 	return placer, harness, err
 }
 
@@ -459,7 +462,7 @@ func harnessError(err error) error {
 // remain authoritative if Delete starts between phases. Audit response reads after a
 // successful operation do not use this admission step.
 func (s *Service) mutationRead(uid string, read func() error) error {
-	err := s.registry.WithSessionGuard(uid, read)
+	err := s.registry.WithSessionRead(uid, read)
 	if errors.Is(err, placement.ErrSessionBusy) {
 		return withStatusCause(codes.Aborted, err)
 	}
@@ -771,8 +774,9 @@ func (s *Service) Fork(ctx context.Context, req *v1.ForkRequest) (response *v1.F
 // forkError surfaces a refused fork as FailedPrecondition rather than Internal. A fork is refused
 // when the harness's capabilities cannot realize it — e.g. a REQUIRES_MEMORY_SNAPSHOT session forked
 // at a historical seq, which no memory snapshot can reproduce — which is a caller-visible
-// precondition, not a host fault. A concurrent writer that invalidated the fork point is Aborted, so
-// the caller knows a retry is meaningful.
+// precondition, not a host fault. A concurrent writer that invalidated the fork point, a parent that
+// no longer holds the snapshot the fork took (api.ErrSnapshotSuperseded), or another stateful fork
+// that is checkpointing the parent is Aborted, so the caller knows a retry is meaningful.
 func forkError(err error) error {
 	switch {
 	case errors.Is(err, eventlog.ErrDeleted):
@@ -785,7 +789,8 @@ func forkError(err error) error {
 		return status.Error(codes.Unavailable, err.Error())
 	case errors.Is(err, placement.ErrAdmissionInterrupted):
 		return status.Error(admissionInterruptedCode(err), err.Error())
-	case errors.Is(err, eventlog.ErrConflict), errors.Is(err, eventlog.ErrFenced):
+	case errors.Is(err, eventlog.ErrConflict), errors.Is(err, eventlog.ErrFenced), errors.Is(err, placement.ErrCheckpointing),
+		errors.Is(err, api.ErrSnapshotSuperseded):
 		return status.Error(codes.Aborted, err.Error())
 	default:
 		return status.Errorf(codes.Internal, "fork: %v", err)
@@ -808,7 +813,8 @@ func (s *Service) Suspend(ctx context.Context, req *v1.SuspendRequest) (session 
 		if errors.Is(err, eventlog.ErrDeleted) {
 			return nil, withStatusCause(codes.FailedPrecondition, err)
 		}
-		if errors.Is(err, placement.ErrSessionBusy) {
+		// A running turn or a stateful Fork refuses Suspend before touching compute or the journal.
+		if errors.Is(err, placement.ErrSessionBusy) || errors.Is(err, placement.ErrCheckpointing) {
 			return nil, status.Error(codes.Aborted, err.Error())
 		}
 		return nil, status.Errorf(codes.Internal, "suspend: %v", err)
@@ -890,6 +896,9 @@ func resumeError(err error) error {
 		return status.Errorf(codes.Unavailable, "resume: %v", err)
 	case errors.Is(err, placement.ErrAdmissionInterrupted):
 		return status.Errorf(admissionInterruptedCode(err), "resume: %v", err)
+	case errors.Is(err, placement.ErrCheckpointing):
+		// A stateful Fork of this session superseded this Resume's turn; retry once it completes.
+		return status.Errorf(codes.Aborted, "resume: %v", err)
 	default:
 		return status.Errorf(codes.Internal, "resume: %v", err)
 	}
@@ -917,7 +926,7 @@ func execError(err error) error {
 		return status.Error(codes.Unavailable, err.Error())
 	case errors.Is(err, placement.ErrAdmissionInterrupted):
 		return status.Error(admissionInterruptedCode(err), err.Error())
-	case errors.Is(err, eventlog.ErrConflict), errors.Is(err, eventlog.ErrFenced):
+	case errors.Is(err, eventlog.ErrConflict), errors.Is(err, eventlog.ErrFenced), errors.Is(err, placement.ErrCheckpointing):
 		return status.Error(codes.Aborted, err.Error())
 	default:
 		return status.Error(codes.Internal, err.Error())
