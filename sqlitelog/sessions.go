@@ -29,9 +29,8 @@ const (
 	MaxPageSize     = 500
 )
 
-// SessionMeta is mutable session metadata that the event log cannot reproduce: what
-// it runs and where it was forked from. It excludes verified caller ownership. Everything here is supplied at creation and is durable
-// from that moment, which is what makes a session with no events listable.
+// SessionMeta is mutable workload and provenance metadata, separate from verified caller
+// ownership. It is durable before the first event, making empty sessions listable.
 type SessionMeta struct {
 	UID       string
 	Project   string
@@ -220,7 +219,8 @@ func (s *Store) SessionInfo(uid string) (SessionInfo, error) {
 }
 
 // ListSessions enumerates one project's ACTIVE sessions, newest first. Tombstones are filtered
-// before keyset paging and LIMIT so hidden rows cannot consume page slots.
+// before keyset paging and LIMIT so hidden rows cannot consume page slots. A non-nil
+// Owner also filters before paging; nil preserves the project's full ACTIVE population.
 //
 // Paging is keyset, not offset: the cursor carries the last row's (created_at, uid) and the next
 // page resumes strictly after it. Sessions are created while a client pages through them, and an
