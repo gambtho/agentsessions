@@ -66,7 +66,10 @@ func (s *Store) CreateOwnedSession(m SessionMeta, owner api.CallerIdentity, regi
 	if err := s.putSession(tx, m); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlitelog: create owned session: %w", err)
+	}
+	return nil
 }
 
 func checkAuthorization(db queryRower) error {
