@@ -30,6 +30,9 @@ provide.
 - Go SDK `Client.DeleteSession(ctx, uid)` and `agentctl delete --session <uid>` request permanent
   soft deletion. Get/delete CLI report deletion state and requested/completed times; PENDING output
   explicitly says durable intent only, with compute and fork pins retained.
+- Go SDK callers can pass opaque per-execution config through `client.ExecOptions.Config`.
+  Omitting it keeps the existing empty-config behavior. Config is durable journal content exposed
+  by Replay; do not include credentials. No wire or journal schema change.
 - The chat harness accepts a per-execution `system_prompt` in its JSON config, prepended before
   conversation history and current inputs.
 - `agentsessionsd --harness name=address` registers a harness that is already running, over TCP
@@ -80,6 +83,18 @@ provide.
   audit anchor transactionally; existing rows become ACTIVE with absent times, without rewriting
   old events or hashes. Older binaries refuse the newer schema: back up before upgrading if rollback
   is needed. Cancel remains unimplemented.
+- An unsupported stored harness registration (unknown spec fields or enum values, or a local
+  placement/factory failure) no longer prevents other harnesses from starting. Its name stays
+  reserved, and Get/List/Retire retain its metadata, original digest and ACTIVE/RETIRED state.
+  `HarnessRegistration.unservable_reason` explains this host's inability to run it; an undecodable
+  spec is unset, not partially returned. Existing sessions on a registration isolated during this
+  host's startup load and new attempts to use it fail `FAILED_PRECONDITION` until this host restarts
+  on a compatible version. A registration added to a shared journal after this host started remains
+  visible but is unknown to this host's Sessions routing: Create and auto-create Exec selecting it
+  remain `INVALID_ARGUMENT` (a pending recorded Resume retains its `FAILED_PRECONDITION` recovery rule)
+  until this host restarts or loads it through `RegisterHarness` with the identical compatible spec.
+  For a RETIRED row, restart this host to serve its existing sessions without reactivating it:
+  `RegisterHarness` reactivates the row for every host sharing the journal.
 - New `EXECUTION_START` records include the resolved registry harness name and optional advertised
   harness version (`HarnessDescriptor.version`). Interrupted `Sessions.Resume` uses the recorded
   registry entry, not the session default; an unserved recorded entry or known-version mismatch is
