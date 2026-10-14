@@ -12,6 +12,8 @@
 //	agentctl suspend --session <uid>
 //	agentctl resume  --session <uid>
 //	agentctl delete  --session <uid>          # permanent intent only; compute/pins retained
+//	agentctl approve <uid>                  # commit approval, then Resume
+//	agentctl deny    <uid> --reason "no"    # commit denial, then Resume
 package main
 
 import (
@@ -51,6 +53,8 @@ func main() {
 		"fork":    cmdFork,
 		"suspend": cmdSuspend,
 		"resume":  cmdResume,
+		"approve": cmdApprove,
+		"deny":    cmdDeny,
 		"version": cmdVersion,
 	}
 	run, ok := cmds[os.Args[1]]
@@ -65,7 +69,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: agentctl <create|list|get|delete|exec|replay|fork|suspend|resume|version> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: agentctl <create|list|get|delete|exec|replay|fork|suspend|resume|approve|deny|version> [flags]")
 }
 
 type config struct {

@@ -62,6 +62,9 @@ func deleteRaceMutation(ctx context.Context, c v1.SessionsClient, op, uid, overr
 	case "Fork":
 		_, err := c.Fork(ctx, &v1.ForkRequest{Session: uid, Count: 2})
 		return err
+	case "Approve":
+		_, err := c.Approve(ctx, publicDecision(uid))
+		return err
 	default:
 		panic("unknown mutation")
 	}
@@ -321,16 +324,16 @@ func TestDeleteSameServiceBusyBeforeMetadataLookup(t *testing.T) {
 				op  string
 				err error
 			}
-			results := make(chan result, 4)
-			for _, op := range []string{"Exec", "Fork", "Suspend", "Resume"} {
+			results := make(chan result, 5)
+			for _, op := range []string{"Exec", "Fork", "Suspend", "Resume", "Approve"} {
 				go func() { results <- result{op, deleteRaceMutation(ctx, client, op, uid, "")} }()
 			}
-			// This deadline only bounds a failed test; success is receipt of all four
+			// This deadline only bounds a failed test; success is receipt of all five
 			// Aborted replies while the independent writer lock is still held.
 			wait, stopWait := context.WithTimeout(ctx, 2*time.Second)
 			defer stopWait()
 			received := 0
-			for received < 4 {
+			for received < 5 {
 				select {
 				case got := <-results:
 					received++
@@ -338,7 +341,7 @@ func TestDeleteSameServiceBusyBeforeMetadataLookup(t *testing.T) {
 						t.Errorf("%s before writer release=%v, want Aborted", got.op, got.err)
 					}
 				case <-wait.Done():
-					t.Errorf("only %d/4 mutations returned before writer release; same-Store metadata reads blocked before busy admission", received)
+					t.Errorf("only %d/5 mutations returned before writer release; same-Store metadata reads blocked before busy admission", received)
 					goto releaseWriter
 				}
 			}
@@ -362,7 +365,7 @@ func TestDeleteSameServiceBusyBeforeMetadataLookup(t *testing.T) {
 			if err := <-deleted; status.Code(err) != want {
 				t.Errorf("Delete outcome=%v, want %v", err, want)
 			}
-			for received < 4 {
+			for received < 5 {
 				select {
 				case got := <-results:
 					received++

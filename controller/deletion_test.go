@@ -81,7 +81,12 @@ func TestDeletedControllerEntryHasNoEffects(t *testing.T) {
 						if seq == 0 {
 							t.Fatalf("missing fixture kind %s", kind)
 						}
+						// Raw test-only truncation must keep the append-owned cursor at its cut.
+						// These histories are nongated; no approval reference survives the cut.
 						if _, err := db.Exec("DELETE FROM events WHERE session = ? AND seq > ?", "session", seq); err != nil {
+							t.Fatal(err)
+						}
+						if _, err := db.Exec("UPDATE sessions SET last_seq = ? WHERE session = ?", seq, "session"); err != nil {
 							t.Fatal(err)
 						}
 					}

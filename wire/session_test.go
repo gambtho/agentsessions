@@ -59,6 +59,7 @@ func TestSessionDeletionWireTags(t *testing.T) {
 		kind   protoreflect.Kind
 		typeID protoreflect.FullName
 	}{
+		{"pending_approval", 15, protoreflect.MessageKind, "agentsessions.v1.ApprovalRef"},
 		{"deletion_state", 16, protoreflect.EnumKind, "agentsessions.v1.DeletionState"},
 		{"deletion_requested_time", 17, protoreflect.MessageKind, "google.protobuf.Timestamp"},
 		{"deletion_completed_time", 18, protoreflect.MessageKind, "google.protobuf.Timestamp"},
@@ -76,9 +77,6 @@ func TestSessionDeletionWireTags(t *testing.T) {
 		if typeID != tc.typeID {
 			t.Errorf("Session field %s type = %s, want %s", tc.name, typeID, tc.typeID)
 		}
-	}
-	if field := desc.Fields().ByNumber(15); field != nil {
-		t.Fatalf("tag 15 must remain available for pending_approval, got %s", field.Name())
 	}
 	for _, tc := range []struct {
 		number protoreflect.EnumNumber

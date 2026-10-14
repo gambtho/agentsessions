@@ -50,16 +50,18 @@ func (s *Store) DeleteSession(ctx context.Context, uid string) (SessionInfo, err
 		return fail("before append", err)
 	}
 	now := time.Now()
-	record, err := appendRecord(ctx, tx, uid, info.LastSeq, fence+1, api.Event{
+	record, _, err := appendRecord(ctx, tx, uid, info.LastSeq, fence+1, api.Event{
 		Kind: api.EventLifecycle, Lifecycle: &api.Lifecycle{Kind: api.LifecycleDelete},
 		Timestamp: now, SchemaVersion: 1,
 	})
 	if err != nil {
 		return fail("append intent", err)
 	}
+	// Like the lifecycle branch of projectApproval, DELETE advances only the captured
+	// cursor, not execution evidence. Keep it in the same context-bound metadata write.
 	if _, err := tx.ExecContext(ctx, `UPDATE sessions SET deletion_state = ?, deletion_requested_at = ?,
-		deletion_seq = ?, fence = ?, updated_at = ? WHERE session = ?`,
-		string(api.DeletionPending), now.UnixNano(), record.Seq, record.Fence, now.UnixNano(), uid); err != nil {
+		deletion_seq = ?, last_seq = ?, fence = ?, updated_at = ? WHERE session = ?`,
+		string(api.DeletionPending), now.UnixNano(), record.Seq, record.Seq, record.Fence, now.UnixNano(), uid); err != nil {
 		return fail("update intent", err)
 	}
 	out, err := txSessionInfo(ctx, tx, uid)
@@ -73,7 +75,7 @@ func (s *Store) DeleteSession(ctx context.Context, uid string) (SessionInfo, err
 }
 
 func txSessionInfo(ctx context.Context, tx *sql.Tx, uid string) (SessionInfo, error) {
-	info, err := scanSession(tx.QueryRowContext(ctx, sessionSelect+` WHERE s.session = ? GROUP BY s.session`, uid))
+	info, err := scanSession(tx.QueryRowContext(ctx, sessionSelect+` WHERE s.session = ?`, uid))
 	if errors.Is(err, sql.ErrNoRows) {
 		return SessionInfo{}, fmt.Errorf("%w: %s", ErrSessionNotFound, uid)
 	}

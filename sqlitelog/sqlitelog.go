@@ -82,17 +82,19 @@ CREATE INDEX IF NOT EXISTS sessions_project_created
 
 // SchemaVersion is the schema shape this build writes, stamped into PRAGMA user_version so a
 // build can identify a database without inspecting its columns. Version 1 is what v0.1.0 through
-// v0.1.2 shipped. Version 2 adds the harness registry; version 3 adds permanent deletion intent.
-const SchemaVersion = 3
+// v0.1.2 shipped. Version 2 adds the harness registry; version 3 adds approval reporting;
+// version 4 adds permanent deletion intent.
+const SchemaVersion = 4
 
 // migrations[i] moves a database from version i+1 to i+2, inside the migration transaction. The
 // array length is tied to SchemaVersion, so bumping one without the other does not compile.
 var migrations = [SchemaVersion - 1]func(*sql.Tx) error{
 	migrateV1ToV2,
 	migrateV2ToV3,
+	migrateV3ToV4,
 }
 
-func migrateV2ToV3(tx *sql.Tx) error {
+func migrateV3ToV4(tx *sql.Tx) error {
 	_, err := tx.Exec(`ALTER TABLE sessions ADD COLUMN deletion_state TEXT NOT NULL DEFAULT 'ACTIVE';
 		ALTER TABLE sessions ADD COLUMN deletion_requested_at INTEGER NOT NULL DEFAULT 0;
 		ALTER TABLE sessions ADD COLUMN deletion_completed_at INTEGER NOT NULL DEFAULT 0;
@@ -453,7 +455,7 @@ func (l *Log) Append(expectedLastSeq, fence int64, ev api.Event) (eventlog.Recor
 		return eventlog.Record{}, eventlog.ErrFenced
 	}
 
-	record, err := appendRecord(context.Background(), tx, l.session, head, fence, ev)
+	record, pb, err := appendRecord(context.Background(), tx, l.session, head, fence, ev)
 	if err != nil {
 		// A PRIMARY KEY(session, seq) violation means another writer already committed this seq —
 		// it advanced the log out from under us. That is exactly a single-writer CAS conflict, so
@@ -467,6 +469,10 @@ func (l *Log) Append(expectedLastSeq, fence int64, ev api.Event) (eventlog.Recor
 	if err := touchSession(tx, l.session, l.store.defaultProject, ev); err != nil {
 		return eventlog.Record{}, err
 	}
+	// Report only the selected wire body and normalized enums that strict journal reads see.
+	if err := projectApproval(tx, l.session, record.Seq, wire.EventFromProto(pb)); err != nil {
+		return eventlog.Record{}, fmt.Errorf("sqlitelog: project approval seq %d: %w", record.Seq, err)
+	}
 	if err := tx.Commit(); err != nil {
 		return eventlog.Record{}, err
 	}
@@ -474,28 +480,30 @@ func (l *Log) Append(expectedLastSeq, fence int64, ev api.Event) (eventlog.Recor
 }
 
 // appendRecord shares canonical encoding with atomic deletion but does not publish metadata or
-// commit. Only the transaction owner may admit a write and decide its lifecycle projection.
-func appendRecord(ctx context.Context, tx *sql.Tx, session string, head, fence int64, ev api.Event) (eventlog.Record, error) {
+// commit. It returns the persisted proto so projection uses the same normalized body as reads.
+// Only the transaction owner may admit a write and decide its lifecycle projection.
+func appendRecord(ctx context.Context, tx *sql.Tx, session string, head, fence int64, ev api.Event) (eventlog.Record, *v1.Event, error) {
 	prev := ""
 	if head > 0 {
 		if err := tx.QueryRowContext(ctx, `SELECT hash FROM events WHERE session = ? AND seq = ?`, session, head).Scan(&prev); err != nil {
-			return eventlog.Record{}, err
+			return eventlog.Record{}, nil, err
 		}
 	}
 	seq := head + 1
 	hash, err := canon.HashRecord(prev, seq, ev)
 	if err != nil {
-		return eventlog.Record{}, fmt.Errorf("sqlitelog: canonicalize seq %d: %w", seq, err)
+		return eventlog.Record{}, nil, fmt.Errorf("sqlitelog: canonicalize seq %d: %w", seq, err)
 	}
-	blob, err := proto.Marshal(wire.EventToProto(ev))
+	pb := wire.EventToProto(ev)
+	blob, err := proto.Marshal(pb)
 	if err != nil {
-		return eventlog.Record{}, fmt.Errorf("sqlitelog: marshal seq %d: %w", seq, err)
+		return eventlog.Record{}, nil, fmt.Errorf("sqlitelog: marshal seq %d: %w", seq, err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO events(session, seq, prev_hash, hash, fence, event) VALUES(?,?,?,?,?,?)`,
 		session, seq, prev, hash, fence, blob); err != nil {
-		return eventlog.Record{}, err
+		return eventlog.Record{}, nil, err
 	}
-	return eventlog.Record{Seq: seq, PrevHash: prev, Hash: hash, Fence: fence, Event: ev}, nil
+	return eventlog.Record{Seq: seq, PrevHash: prev, Hash: hash, Fence: fence, Event: ev}, pb, nil
 }
 
 // touchSession keeps the session's metadata row in step with its log, inside Append's transaction.

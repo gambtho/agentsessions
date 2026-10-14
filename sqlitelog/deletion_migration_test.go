@@ -126,8 +126,8 @@ func TestDeletionMigrationAddsActiveRows(t *testing.T) {
 			}
 			setUserVersion(t, path, version)
 			s := mustOpen(t, path)
-			if got := readUserVersion(t, path); got != 3 {
-				t.Fatalf("stamp = %d, want 3", got)
+			if got := readUserVersion(t, path); got != 4 {
+				t.Fatalf("stamp = %d, want 4", got)
 			}
 			rows, err := db.Query(`SELECT session, fence, compute_state, created_at, updated_at,
 				deletion_state, deletion_requested_at, deletion_completed_at, deletion_seq FROM sessions ORDER BY session`)
@@ -171,7 +171,7 @@ func TestDeletionMigrationAddsActiveRows(t *testing.T) {
 			if got, want := schemaOf(t, path), schemaOf(t, fresh); !reflect.DeepEqual(got, want) {
 				t.Fatalf("legacy/fresh schema drift: %v != %v", got, want)
 			}
-			if got, want := queryValues(t, db, `PRAGMA table_info(sessions)`), queryValues(t, rawDB(t, fresh), `PRAGMA table_info(sessions)`); !reflect.DeepEqual(got, want) || len(got) != 19 {
+			if got, want := queryValues(t, db, `PRAGMA table_info(sessions)`), queryValues(t, rawDB(t, fresh), `PRAGMA table_info(sessions)`); !reflect.DeepEqual(got, want) || len(got) != 24 {
 				t.Fatalf("legacy/fresh columns drift: %v != %v", got, want)
 			}
 		})
@@ -207,8 +207,8 @@ func TestDeletionMigrationRetainsReleaseFixtureBytesAndRegistry(t *testing.T) {
 				reserved = queryValues(t, db, `SELECT * FROM reserved_harness_names ORDER BY name`)
 			}
 			s := mustOpen(t, path)
-			if got := readUserVersion(t, path); got != 3 {
-				t.Fatalf("migration stamp = %d, want 3", got)
+			if got := readUserVersion(t, path); got != 4 {
+				t.Fatalf("migration stamp = %d, want 4", got)
 			}
 			if !reflect.DeepEqual(queryValues(t, db, oldSessionQuery), metadata) || !reflect.DeepEqual(queryValues(t, db, oldEventQuery), events) {
 				t.Fatal("migration changed release metadata/fence/blob/hash bytes")
