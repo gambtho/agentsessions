@@ -27,6 +27,12 @@ provide.
 
 ### Added
 
+- Host-side caller ownership and `api.Authorizer` contracts, distinct from agent `IdentityRef`
+  provenance. `OwnerAuthorizer` supports owner checks only, denying creation, approval decisions,
+  audience minting and unknown actions. Trusted Go hosts can use `Store.CreateOwnedSession` for
+  insert-only owned creation with atomic harness admission; `SessionInfo.Owner` exposes the stored
+  pair and `ListOptions.Owner` filters it before pagination. These contracts do not authenticate
+  callers or enforce Sessions RPC access.
 - Go SDK `Client.DeleteSession(ctx, uid)` and `agentctl delete --session <uid>` request permanent
   soft deletion. Get/delete CLI report deletion state and requested/completed times; PENDING output
   explicitly says durable intent only, with compute and fork pins retained.
@@ -68,6 +74,12 @@ provide.
 
 ### Compatibility
 
+- SQLite schema v5 follows approval v3 and deletion v4, adding indexed exact caller issuer/subject
+  ownership and an off-mode journal authorization marker. Legacy and RPC-created sessions remain
+  unbound; ordinary metadata writes and copied history cannot assign or replace owners. No events
+  or hashes are rewritten, and no wire fields change. Older hosts refuse v5; this host also refuses
+  required, unknown or missing authorization markers at v5 because it cannot enforce caller access.
+  Back up before upgrading. Sessions RPCs remain unauthenticated and unenforced.
 - The `DeleteSession` contract defines permanent soft deletion: retain the UID, metadata and
   hash-chained journal forever, hide it from `ListSessions`, and keep `GetSession` and raw
   `Sessions.Replay` for audit. Deleted UIDs cannot be reused or mutated through `Exec`, historical
