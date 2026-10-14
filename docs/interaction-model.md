@@ -158,8 +158,8 @@ use `Suspend` to retry the recorded route's cold transition when needed.
 
 All Session replies use the same durable append-transaction projection, read atomically with
 metadata and `last_seq`; no query decodes journal events. An owned unanswered request in the latest
-first-seen execution exposes `pending_approval` and `EXEC_AWAITING`. Requests/decisions match
-execution ID, call ID and request sequence. A child's FORK excludes executions first seen before
+first-seen execution reports `EXEC_AWAITING`; it exposes `pending_approval` only while the session
+is ACTIVE. Requests/decisions match execution ID, call ID and request sequence. A child's FORK excludes executions first seen before
 that marker, including their later calls/requests; a new child execution can own a request.
 
 Malformed approval-bearing history withholds references even for a valid latest request, matching
@@ -178,7 +178,8 @@ session UID, execution ID, tool call ID, positive request sequence, and explicit
 `false` is denial, not an omitted choice. It commits only `APPROVAL_RESULT` and returns that record plus
 the current Session, without resolving a harness, describing compute, or running a tool. Identical
 retries of tuple, decision, reason and identity return the original record even after a receipt or
-later turn; changed choices/provenance and stale or inherited requests fail `FAILED_PRECONDITION`.
+later turn while the session remains ACTIVE; deleted sessions, changed choices/provenance and stale
+or inherited requests fail `FAILED_PRECONDITION`.
 Missing fields fail `INVALID_ARGUMENT`, unknown UIDs `NOT_FOUND`, and local overlap/CAS/fence conflict
 `ABORTED`.
 
