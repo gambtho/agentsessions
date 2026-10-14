@@ -41,6 +41,11 @@ message HarnessDescriptor {
   repeated string models = 2; // model-agnostic: supported/required model ids
   repeated ToolSpec tools = 3;
   Capabilities capabilities = 4;
+  // Stable, opaque implementation replay-compatibility version, owned by the harness author.
+  // Change it when deterministic execution or config interpretation changes. Hosts record it
+  // in ExecutionStart and compare known recorded versions exactly on replay/recovery.
+  // Empty is supported for older/unversioned harnesses and records an unknown version.
+  string version = 5;
 }
 
 message DescribeRequest {}
@@ -57,8 +62,8 @@ message IdentityContext {
 message Start {
   bytes config = 1;
   repeated Event history = 2;
-  // New input messages for this execution. Empty = resume/re-drive an interrupted
-  // execution from history with no new input.
+  // Invocation input messages. Controller replay and interrupted recovery restore the original
+  // messages from the journal; empty inputs describe an intentionally inputless invocation.
   repeated Message inputs = 3;
   IdentityContext identity = 4;
   int64 resume_from_seq = 5;
@@ -82,7 +87,7 @@ message ControllerFrame {
 }
 
 // ModelResult is a model completion served to the harness (live invocation or replay).
-// The Message carries text + opaque reasoning parts, recorded verbatim for continuity.
+// The Message carries text, opaque reasoning, and tool_call parts, recorded verbatim for continuity.
 message ModelResult {
   Message message = 1;
   Usage usage = 2;

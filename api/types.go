@@ -28,21 +28,35 @@ const (
 	EventLifecycle       EventKind = "LIFECYCLE"
 	EventEnd             EventKind = "END"
 	EventError           EventKind = "ERROR"
+	EventExecutionStart  EventKind = "EXECUTION_START"
 )
 
 // Message is a role-tagged sequence of content parts (A2A Message = role + Part[]).
 type Message struct {
-	Role  string // user | assistant (A2A calls this "agent") | tool
+	Role  string // system | user | assistant (A2A calls this "agent") | tool
 	Parts []Part
 }
 
-// Part is one unit of content: text, file (inline or URI), structured data, or an opaque
-// reasoning block. Aligned with A2A Part + MCP content. Exactly one field is set.
+// Part is one unit of content: text, file (inline or URI), structured data, an opaque
+// reasoning block, a model's tool call, or a tool's result. Aligned with A2A Part + MCP
+// content. Exactly one field is set.
+//
+// Fields added after the first four carry `json:",omitempty"`: the controller's model input
+// hash (I0) is computed over the JSON encoding of ModelRequest, so a new field that encoded as
+// null would change the hash of every request recorded before it existed.
 type Part struct {
 	Text      *TextPart
 	File      *FilePart
 	Data      map[string]any
 	Reasoning *ReasoningPart
+	// ToolCall is a model's request to call a tool, carried in an assistant message. Mediation
+	// and IdempotencyKey are unset on a model output. To execute the call, copy it, set them on
+	// the copy, and pass the copy to EventSink.ToolCall: the returned message can share this
+	// pointer with the recorded completion, so changing it in place alters a hashed event.
+	ToolCall *ToolCall `json:",omitempty"`
+	// ToolResult is a tool's result fed back to the model, carried in a message with role
+	// "tool". ToolResult.ID is the ID of the ToolCall it answers.
+	ToolResult *ToolResult `json:",omitempty"`
 }
 
 // TextPart is a text content block.
@@ -113,8 +127,22 @@ type Event struct {
 	Lifecycle      *Lifecycle
 	End            *HarnessEnd
 	Err            *Error
+	ExecutionStart *ExecutionStart
 
 	Actor IdentityRef // emitter principal -> provenance on every action
+}
+
+// ExecutionStart is host-owned invocation state, recorded before the harness runs. Config is
+// opaque and preserved verbatim; ResumeFromSeq is the harness's cursor, not the log's CAS cursor.
+// InputCount records the expected number of INPUT events; zero explicitly permits inputless turns.
+// A nil count cannot establish completeness and is rejected when reconstructing this invocation.
+// Executions without this event reconstruct with empty config and a zero cursor (legacy defaults).
+type ExecutionStart struct {
+	Config         []byte
+	ResumeFromSeq  int64
+	InputCount     *int64
+	Harness        string // resolved registry name; empty legacy values use the session harness
+	HarnessVersion string // advertised opaque version; empty is unknown and retains legacy behavior
 }
 
 // Lifecycle marks a compute/session transition in the log (§7). Baseline is a replay /
@@ -194,6 +222,10 @@ type ToolResult struct {
 	OutputDigest string // content digest of OutputURI target (hash-chain covers externalized bytes)
 	IsError      bool
 	Error        string
+	// Content is the model-facing result (MCP CallToolResult.content). A harness records on the
+	// TOOL_RESULT event the same ToolResult it feeds back as a tool_result part, so history rebuilt
+	// from the log can give the model what it saw live.
+	Content []Part `json:",omitempty"`
 }
 
 // ApprovalRequest asks a human or policy engine to allow a tool call.

@@ -784,10 +784,17 @@ type ExecRequest struct {
 	Inputs []*Message `protobuf:"bytes,2,rep,name=inputs,proto3" json:"inputs,omitempty"`
 	// Cursor handed to the harness as Start.resume_from_seq. The host does not interpret it; only a
 	// harness knows what resuming from a sequence means for its own state. To re-read committed
-	// records after a disconnect, use Replay, which is the read path for exactly that.
-	ResumeFromSeq int64  `protobuf:"varint,3,opt,name=resume_from_seq,json=resumeFromSeq,proto3" json:"resume_from_seq,omitempty"`
-	Harness       string `protobuf:"bytes,4,opt,name=harness,proto3" json:"harness,omitempty"` // empty = session default
-	Config        []byte `protobuf:"bytes,5,opt,name=config,proto3" json:"config,omitempty"`   // opaque per-execution config, passed through to Start.config
+	// records after a disconnect, use Replay, which is the read path for exactly that. Non-zero cursors
+	// are journaled in EXECUTION_START and restored during controller replay/interrupted resume.
+	ResumeFromSeq int64 `protobuf:"varint,3,opt,name=resume_from_seq,json=resumeFromSeq,proto3" json:"resume_from_seq,omitempty"`
+	// Empty = the session's harness. A different harness runs this turn only, unless either one is
+	// a registered harness (see HarnessRegistry): then the session is pinned and the call is
+	// FAILED_PRECONDITION.
+	Harness string `protobuf:"bytes,4,opt,name=harness,proto3" json:"harness,omitempty"`
+	// Opaque per-execution config, passed through to Start.config. Non-empty bytes are journaled
+	// verbatim in EXECUTION_START before the harness runs, and restored for controller replay/resume.
+	// Do not put credentials here: config is durable journal content exposed by Replay.
+	Config []byte `protobuf:"bytes,5,opt,name=config,proto3" json:"config,omitempty"`
 	// Single-writer CAS: the host commits this execution's first event only if the log head equals
 	// expected_last_seq. A mismatch is ABORTED, meaning another writer advanced the log.
 	//
@@ -986,9 +993,15 @@ func (x *SuspendRequest) GetSession() string {
 }
 
 type ResumeRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Session       string                 `protobuf:"bytes,1,opt,name=session,proto3" json:"session,omitempty"`
-	Boot          bool                   `protobuf:"varint,2,opt,name=boot,proto3" json:"boot,omitempty"` // true = cold-boot + replay instead of snapshot restore
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Session string                 `protobuf:"bytes,1,opt,name=session,proto3" json:"session,omitempty"`
+	// Ignored. The service never reads it; the Runtime backend decides how a resumed session comes
+	// back. On substrate that is the actor's own snapshot, else the template's golden snapshot, else a
+	// cold boot, and substrate has no per-resume boot flag to forward it to. The field stays so
+	// existing clients keep encoding; do not reuse its number.
+	//
+	// Deprecated: Marked as deprecated in session.proto.
+	Boot          bool `protobuf:"varint,2,opt,name=boot,proto3" json:"boot,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1030,6 +1043,7 @@ func (x *ResumeRequest) GetSession() string {
 	return ""
 }
 
+// Deprecated: Marked as deprecated in session.proto.
 func (x *ResumeRequest) GetBoot() bool {
 	if x != nil {
 		return x.Boot
@@ -1037,15 +1051,20 @@ func (x *ResumeRequest) GetBoot() bool {
 	return false
 }
 
+// Children inherit the parent's annotations and origin.
 type ForkRequest struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Session string                 `protobuf:"bytes,1,opt,name=session,proto3" json:"session,omitempty"`
 	// 0 = HEAD. A REQUIRES_MEMORY_SNAPSHOT harness forks by cloning a memory snapshot, which captures
 	// RAM as of now, so it accepts only HEAD; a historical seq is FAILED_PRECONDITION.
-	AtSeq    int64             `protobuf:"varint,2,opt,name=at_seq,json=atSeq,proto3" json:"at_seq,omitempty"`
-	Count    int32             `protobuf:"varint,3,opt,name=count,proto3" json:"count,omitempty"`      // fan-out N children; must be 1..128, else INVALID_ARGUMENT
-	Identity *IdentityRef      `protobuf:"bytes,4,opt,name=identity,proto3" json:"identity,omitempty"` // optional child principal
-	Labels   map[string]string `protobuf:"bytes,5,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	AtSeq int64 `protobuf:"varint,2,opt,name=at_seq,json=atSeq,proto3" json:"at_seq,omitempty"`
+	Count int32 `protobuf:"varint,3,opt,name=count,proto3" json:"count,omitempty"` // fan-out N children; must be 1..128, else INVALID_ARGUMENT
+	// Unsupported: per-child principals are not enforced. Any supplied identity, including an empty
+	// message, is INVALID_ARGUMENT before placement or mutation. Leave unset to fork.
+	Identity *IdentityRef `protobuf:"bytes,4,opt,name=identity,proto3" json:"identity,omitempty"`
+	// Applied to every child instead of the parent's labels; never merged or inherited. Unset or
+	// empty gives children an empty label map. The parent's annotations are inherited unchanged.
+	Labels map[string]string `protobuf:"bytes,5,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Display names for the children, in the order they are returned. Length must be 0 or exactly
 	// count, else INVALID_ARGUMENT.
 	//
@@ -1495,10 +1514,10 @@ const file_session_proto_rawDesc = "" +
 	"\bfrom_seq\x18\x02 \x01(\x03R\afromSeq\x12\x15\n" +
 	"\x06to_seq\x18\x03 \x01(\x03R\x05toSeq\"*\n" +
 	"\x0eSuspendRequest\x12\x18\n" +
-	"\asession\x18\x01 \x01(\tR\asession\"=\n" +
+	"\asession\x18\x01 \x01(\tR\asession\"A\n" +
 	"\rResumeRequest\x12\x18\n" +
-	"\asession\x18\x01 \x01(\tR\asession\x12\x12\n" +
-	"\x04boot\x18\x02 \x01(\bR\x04boot\"\xae\x02\n" +
+	"\asession\x18\x01 \x01(\tR\asession\x12\x16\n" +
+	"\x04boot\x18\x02 \x01(\bB\x02\x18\x01R\x04boot\"\xae\x02\n" +
 	"\vForkRequest\x12\x18\n" +
 	"\asession\x18\x01 \x01(\tR\asession\x12\x15\n" +
 	"\x06at_seq\x18\x02 \x01(\x03R\x05atSeq\x12\x14\n" +

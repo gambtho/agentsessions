@@ -44,7 +44,7 @@ func (s *Server) Describe(ctx context.Context, _ *v1.DescribeRequest) (*v1.Harne
 	if err != nil {
 		return nil, err
 	}
-	return descriptorToProto(d), nil
+	return DescriptorToProto(d), nil
 }
 
 // Connect drives one execution: it reads the Start frame, runs the harness with a streaming sink,
@@ -124,15 +124,21 @@ func (s *streamSink) awaitResult(ctx context.Context) (*v1.ControllerFrame, erro
 }
 
 func (s *streamSink) Model(ctx context.Context, req api.ModelRequest) (api.ModelResponse, error) {
+	choice, err := wire.ToolChoiceToProto(req.ToolChoice)
+	if err != nil {
+		return api.ModelResponse{}, fmt.Errorf("harnesswire: model call: %w", err)
+	}
 	id := newID()
 	ev := &v1.Event{
 		ExecutionId: s.executionID,
 		Kind:        v1.EventKind_EVENT_MODEL_CALL,
 		Body: &v1.Event_Model{Model: &v1.ModelCall{
-			Model:    req.Model,
-			Params:   req.Params,
-			Id:       id,
-			Messages: messagesToProto(req.Messages),
+			Model:      req.Model,
+			Params:     req.Params,
+			Id:         id,
+			Messages:   messagesToProto(req.Messages),
+			Tools:      wire.ToolDefinitionsToProto(req.Tools),
+			ToolChoice: choice,
 		}},
 	}
 	if err := s.stream.Send(ev); err != nil {
@@ -269,10 +275,16 @@ func (h *ClientHarness) Run(ctx context.Context, start *api.Start, sink api.Even
 		switch ev.GetKind() {
 		case v1.EventKind_EVENT_MODEL_CALL:
 			mc := ev.GetModel()
+			choice, err := wire.ToolChoiceFromProto(mc.GetToolChoice())
+			if err != nil {
+				return fmt.Errorf("harnesswire: model call %q: %w", mc.GetId(), err)
+			}
 			resp, err := sink.Model(ctx, api.ModelRequest{
-				Model:    mc.GetModel(),
-				Params:   mc.GetParams(),
-				Messages: messagesFromProto(mc.GetMessages()),
+				Model:      mc.GetModel(),
+				Params:     mc.GetParams(),
+				Messages:   messagesFromProto(mc.GetMessages()),
+				Tools:      wire.ToolDefinitionsFromProto(mc.GetTools()),
+				ToolChoice: choice,
 			})
 			if err != nil {
 				return err
@@ -395,20 +407,31 @@ func startFromProto(p *v1.Start) *api.Start {
 	return out
 }
 
-func descriptorToProto(d api.Descriptor) *v1.HarnessDescriptor {
-	return &v1.HarnessDescriptor{
+// DescriptorToProto renders a harness descriptor as the wire type Describe returns.
+func DescriptorToProto(d api.Descriptor) *v1.HarnessDescriptor {
+	out := &v1.HarnessDescriptor{
 		Id:           d.ID,
+		Version:      d.Version,
 		Models:       d.Models,
 		Capabilities: capabilitiesToProto(d.Capabilities),
 	}
+	for _, tool := range d.Tools {
+		out.Tools = append(out.Tools, wire.ToolSpecToProto(tool))
+	}
+	return out
 }
 
 func descriptorFromProto(p *v1.HarnessDescriptor) api.Descriptor {
-	return api.Descriptor{
+	out := api.Descriptor{
 		ID:           p.GetId(),
+		Version:      p.GetVersion(),
 		Models:       p.GetModels(),
 		Capabilities: capabilitiesFromProto(p.GetCapabilities()),
 	}
+	for _, tool := range p.GetTools() {
+		out.Tools = append(out.Tools, wire.ToolSpecFromProto(tool))
+	}
+	return out
 }
 
 func capabilitiesToProto(c api.Capabilities) *v1.Capabilities {
