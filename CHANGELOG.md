@@ -126,8 +126,10 @@ provide.
   unchanged; use Resume for general interrupted-turn recovery. Pending/repair Resume has no runtime
   IO and does not prove compute cold; actual live park success requires ACK, EOF, connection closure,
   external snapshot and a durable SUSPEND. A second gate does not append RESUME. Suspend of an
-  unreceipted approval uses its recorded route, not a fallback session default, with existing
+  owned unreceipted approval uses its recorded route, not a fallback session default, with existing
   registered pins/static collision checks; retired registrations still serve existing sessions.
+  Inherited approvals suspend through the child's stored-default harness so its own compute is
+  checkpointed; Resume still refuses unresolved inherited tool intents.
   Approval handoffs and recorded-route Suspend hold the Registry's shared checkpoint mark through
   snapshot and journal append, excluding stateful forks on other routes. A checkpoint-superseded
   approval turn reports `ABORTED` without starting a second approval snapshot.
