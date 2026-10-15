@@ -4,8 +4,11 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/aramase/agentsessions/api"
 	"github.com/aramase/agentsessions/canon"
+	"github.com/aramase/agentsessions/wire"
 )
 
 // goldenEvent is a fixed event whose canonical hash is published below as an interop golden
@@ -28,6 +31,86 @@ func goldenEvent() api.Event {
 // goldenHash is content_hash for goldenEvent() at prev_hash="" seq=1. Published interop vector:
 // an independent JCS-over-proto3-JSON implementation must reproduce this exact value.
 const goldenHash = "551bd146050c8d630b0c3b999a4445f3792a470db9bca443d8d4a67706283fcc"
+
+func TestExecutionStartCanonicalBytes(t *testing.T) {
+	event := api.Event{
+		ExecutionID: "exec-config", Kind: api.EventExecutionStart,
+		ExecutionStart: &api.ExecutionStart{Config: []byte{0, 255, ' ', '\n', '\t'}, ResumeFromSeq: 9007199254740993, InputCount: proto.Int64(2)},
+	}
+	got, err := canon.Record("", 1, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Opaque bytes use proto3-JSON base64; the int64 cursor must not lose precision via a JSON number.
+	want := `{"event":{"execution_id":"exec-config","execution_start":{"config":"AP8gCgk=","input_count":"2","resume_from_seq":"9007199254740993"},"kind":"EVENT_EXECUTION_START"},"prev_hash":"","seq":"1"}`
+	if string(got) != want {
+		t.Fatalf("canonical execution start = %s, want %s", got, want)
+	}
+	roundTrip, err := canon.Record("", 1, wire.EventFromProto(wire.EventToProto(event)))
+	if err != nil || string(roundTrip) != want {
+		t.Fatalf("wire canonical bytes = %s, %v", roundTrip, err)
+	}
+	original, err := canon.HashRecord("", 1, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantHash = "aa1f42a26b7a227836d32d31608ebb69c59f3b1c57eadd8537b6faf88a01c790"
+	if original != wantHash {
+		t.Fatalf("execution start hash = %s, want %s (also update hack/verify_chain.py)", original, wantHash)
+	}
+	for _, changed := range []api.ExecutionStart{
+		{Config: []byte{0, 255, ' ', '\n'}, ResumeFromSeq: 9007199254740993, InputCount: proto.Int64(2)},
+		{Config: []byte{0, 255, ' ', '\n', '\t'}, ResumeFromSeq: 9007199254740992, InputCount: proto.Int64(2)},
+		{Config: []byte{0, 255, ' ', '\n', '\t'}, ResumeFromSeq: 9007199254740993, InputCount: proto.Int64(1)},
+		{Config: []byte{0, 255, ' ', '\n', '\t'}, ResumeFromSeq: 9007199254740993},
+	} {
+		event.ExecutionStart = &changed
+		hash, err := canon.HashRecord("", 1, event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hash == original {
+			t.Fatal("execution config/cursor/input count is not bound into the hash")
+		}
+	}
+}
+
+func TestExecutionStartCanonicalInputCountPresence(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		count *int64
+		want  string
+	}{
+		{"absent", nil, `{"event":{"execution_start":{},"kind":"EVENT_EXECUTION_START"},"prev_hash":"","seq":"1"}`},
+		{"zero", proto.Int64(0), `{"event":{"execution_start":{"input_count":"0"},"kind":"EVENT_EXECUTION_START"},"prev_hash":"","seq":"1"}`},
+		{"large", proto.Int64(9007199254740993), `{"event":{"execution_start":{"input_count":"9007199254740993"},"kind":"EVENT_EXECUTION_START"},"prev_hash":"","seq":"1"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			event := api.Event{Kind: api.EventExecutionStart, ExecutionStart: &api.ExecutionStart{InputCount: tc.count}}
+			got, err := canon.Record("", 1, event)
+			if err != nil || string(got) != tc.want {
+				t.Fatalf("canonical count presence = %s, %v; want %s", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestDefaultExecutionStartGoldenVectors(t *testing.T) {
+	for _, tc := range []struct {
+		count int64
+		hash  string
+	}{
+		{0, "b09cbff45d5a30990c3b72be8b06af6bc509d5a29a849aab5fd42153ef10ec65"},
+		{2, "f06c25ee5b3673ee23b8f91883c7f1c6c5682d94986caf5bc067908a61b2ac4f"},
+	} {
+		event := api.Event{ExecutionID: "exec-default", Kind: api.EventExecutionStart,
+			ExecutionStart: &api.ExecutionStart{InputCount: proto.Int64(tc.count)}}
+		got, err := canon.HashRecord("", 1, event)
+		if err != nil || got != tc.hash {
+			t.Fatalf("default start count %d hash = %s, %v; want %s (also update hack/verify_chain.py)", tc.count, got, err, tc.hash)
+		}
+	}
+}
 
 func TestGoldenVector(t *testing.T) {
 	got, err := canon.HashRecord("", 1, goldenEvent())
@@ -81,5 +164,49 @@ func TestChainBinding(t *testing.T) {
 	}
 	if again != child {
 		t.Fatalf("child hash not stable: %s != %s", again, child)
+	}
+}
+
+// toolCallGoldenEvent is an OUTPUT whose assistant message carries a tool_call part with structured
+// arguments. Its hash is an interop vector shared with hack/verify_chain.py: a Struct's numbers, nested
+// objects and lists must canonicalize the same way in every implementation.
+func toolCallGoldenEvent() api.Event {
+	return api.Event{
+		ExecutionID:   "exec-tool",
+		SchemaVersion: 1,
+		Timestamp:     time.Unix(1_700_000_000, 0).UTC(),
+		Kind:          api.EventOutput,
+		Message: &api.Message{Role: "assistant", Parts: []api.Part{
+			{Text: &api.TextPart{Text: "checking"}},
+			{ToolCall: &api.ToolCall{ID: "call-1", Tool: "get_weather", Args: map[string]any{
+				"city": "Paris", "days": 2, "detail": true, "ratio": 1.5,
+				"units": map[string]any{"temp": "C"}, "tags": []any{"a", "b"},
+			}}},
+		}},
+		Actor: api.IdentityRef{Principal: "agent://a", Issuer: "entra", Subject: "sub-1"},
+	}
+}
+
+func TestToolCallPartGoldenVector(t *testing.T) {
+	got, err := canon.Record("", 1, toolCallGoldenEvent())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"event":{"actor":{"issuer":"entra","principal":"agent://a","subject":"sub-1"},"execution_id":"exec-tool","kind":"EVENT_OUTPUT","message":{"parts":[{"text":{"text":"checking"}},{"tool_call":{"args":{"city":"Paris","days":2,"detail":true,"ratio":1.5,"tags":["a","b"],"units":{"temp":"C"}},"id":"call-1","tool":"get_weather"}}],"role":"assistant"},"schema_version":1,"ts":"2023-11-14T22:13:20Z"},"prev_hash":"","seq":"1"}`
+	if string(got) != want {
+		t.Fatalf("canonical tool_call output = %s, want %s", got, want)
+	}
+	hash, err := canon.HashRecord("", 1, toolCallGoldenEvent())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantHash = "e8911826d1370b0b96f3d3a1efaf63bc20f3808cdc189d937b5155ac3f8d509c"
+	if hash != wantHash {
+		t.Fatalf("tool_call output hash = %s, want %s (also update hack/verify_chain.py)", hash, wantHash)
+	}
+	// The vector must survive the wire: a harness's tool_call part reaches the log through it.
+	again, err := canon.HashRecord("", 1, wire.EventFromProto(wire.EventToProto(toolCallGoldenEvent())))
+	if err != nil || again != hash {
+		t.Fatalf("hash after a wire round-trip = %s, %v; want %s", again, err, hash)
 	}
 }

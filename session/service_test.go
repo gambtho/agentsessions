@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/aramase/agentsessions/api"
 	v1 "github.com/aramase/agentsessions/api/genpb"
+	"github.com/aramase/agentsessions/controller"
 	"github.com/aramase/agentsessions/harness/echoagent"
 	"github.com/aramase/agentsessions/observability"
 	"github.com/aramase/agentsessions/placement"
@@ -40,28 +42,18 @@ func newClientWith(t *testing.T, backend placement.Backend) v1.SessionsClient {
 	if c, ok := backend.(io.Closer); ok {
 		t.Cleanup(func() { _ = c.Close() })
 	}
+	return newClientWithRegistry(t, echoRegistry(t, backend))
+}
+
+func newClientWithRegistry(t *testing.T, registry *placement.Registry) v1.SessionsClient {
+	t.Helper()
 	store, err := sqlitelog.Open(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
 
-	lis := bufconn.Listen(1 << 20)
-	srv := grpc.NewServer()
-	v1.RegisterSessionsServer(srv, session.NewService(store, echoRegistry(t, backend)))
-	go srv.Serve(lis)
-	t.Cleanup(srv.Stop)
-
-	conn, err := grpc.NewClient(
-		"passthrough:///bufnet",
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { conn.Close() })
-	return v1.NewSessionsClient(conn)
+	return serveRegistry(t, store, registry)
 }
 
 func TestRequestFlowLogsAreCorrelated(t *testing.T) {
@@ -109,6 +101,7 @@ func TestRequestFlowLogsAreCorrelated(t *testing.T) {
 	stream, err := client.Exec(context.Background(), &v1.ExecRequest{
 		Session: uid,
 		Inputs:  []*v1.Message{wire.MessageToProto(api.TextMessage("user", "do-not-log-this"))},
+		Config:  []byte("do-not-log-config"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -121,8 +114,8 @@ func TestRequestFlowLogsAreCorrelated(t *testing.T) {
 		}
 	}
 
-	if strings.Contains(output.String(), "do-not-log-this") {
-		t.Fatalf("logs contain input contents: %s", output.String())
+	if strings.Contains(output.String(), "do-not-log-this") || strings.Contains(output.String(), "do-not-log-config") {
+		t.Fatalf("logs contain input/config contents: %s", output.String())
 	}
 	required := map[string]bool{
 		"grpc/request":                     false,
@@ -167,8 +160,9 @@ func TestRequestFlowLogsAreCorrelated(t *testing.T) {
 	if len(requestIDs) != 1 {
 		t.Fatalf("request flow used %d request IDs, want 1: %v", len(requestIDs), requestIDs)
 	}
-	if infoRecords != 6 {
-		t.Fatalf("request flow emitted %d INFO records, want 6", infoRecords)
+	// Sessions.Exec, session.exec, Harness.Describe and Harness.Connect each log start/finish.
+	if infoRecords != 8 {
+		t.Fatalf("request flow emitted %d INFO records, want 8", infoRecords)
 	}
 
 	output.Reset()
@@ -371,7 +365,7 @@ func TestSessionsServiceEndToEnd(t *testing.T) {
 		t.Fatalf("turn 1 outputs=%v", outs)
 	}
 
-	// replay re-delivers the 4 committed records of turn 1.
+	// replay re-delivers the 5 committed records of turn 1, including EXECUTION_START.
 	rs, err := c.Replay(ctx, &v1.ReplayRequest{Session: sess})
 	if err != nil {
 		t.Fatal(err)
@@ -390,8 +384,8 @@ func TestSessionsServiceEndToEnd(t *testing.T) {
 			t.Fatalf("record seq=%d missing content_hash", r.GetSeq())
 		}
 	}
-	if n != 4 {
-		t.Fatalf("replay delivered %d records, want 4", n)
+	if n != 5 {
+		t.Fatalf("replay delivered %d records, want 5", n)
 	}
 
 	// fork at head → a child sharing the prefix.
@@ -621,8 +615,8 @@ func TestExecWithoutCASAppendsAtHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.GetLastSeq() != 12 { // 3 turns x (INPUT, MODEL_CALL, OUTPUT, END)
-		t.Fatalf("last_seq = %d after 3 turns, want 12", got.GetLastSeq())
+	if got.GetLastSeq() != 15 { // 3 turns x (EXECUTION_START, INPUT, MODEL_CALL, OUTPUT, END)
+		t.Fatalf("last_seq = %d after 3 turns, want 15", got.GetLastSeq())
 	}
 }
 
@@ -811,6 +805,168 @@ func TestExecHonoursDeadline(t *testing.T) {
 	}
 }
 
+// describeFails serves the real local backend but fails Describe the way a gRPC client does: with the
+// context's own status once the caller's deadline has run out, and with peerErr before that.
+type describeFails struct {
+	*local.Backend
+	peerErr error
+}
+
+func (b *describeFails) Describe(ctx context.Context) (api.Descriptor, error) {
+	if ctx.Err() != nil {
+		return api.Descriptor{}, status.FromContextError(ctx.Err()).Err()
+	}
+	return api.Descriptor{}, b.peerErr
+}
+
+// A harness that cannot be described is UNAVAILABLE, a retryable outage, only while the caller's
+// deadline is live. When the request's own deadline_unix has already passed, resending the same
+// request cannot succeed, so the public code must be DEADLINE_EXCEEDED. Either way nothing is
+// journaled.
+func TestExecAdmissionSeparatesCallerDeadlineFromOutage(t *testing.T) {
+	tests := []struct {
+		name     string
+		deadline int64
+		want     codes.Code
+	}{
+		{name: "request deadline already expired", deadline: time.Now().Add(-time.Minute).Unix(), want: codes.DeadlineExceeded},
+		{name: "peer deadline while the request is live", deadline: time.Now().Add(time.Hour).Unix(), want: codes.Unavailable},
+		{name: "peer deadline with no request deadline", want: codes.Unavailable},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inner := local.New(echoagent.Harness{})
+			c := newClientWith(t, &describeFails{Backend: inner, peerErr: status.Error(codes.DeadlineExceeded, "peer deadline")})
+			t.Cleanup(func() { _ = inner.Close() })
+			uid := mustCreate(t, c)
+			stream, err := c.Exec(context.Background(), &v1.ExecRequest{
+				Session:      uid,
+				Inputs:       []*v1.Message{wire.MessageToProto(api.TextMessage("user", "hi"))},
+				DeadlineUnix: tt.deadline,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := drainExec(stream); status.Code(err) != tt.want {
+				t.Fatalf("exec = %v, want %v", err, tt.want)
+			}
+			rs, err := c.Replay(context.Background(), &v1.ReplayRequest{Session: uid})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := rs.Recv(); !errors.Is(err, io.EOF) {
+				t.Fatalf("a refused admission journaled events (recv: %v)", err)
+			}
+		})
+	}
+}
+
+// Resume and Fork run the same admission check as Exec, so they map its failures the same way: the
+// caller's own deadline or cancellation is DEADLINE_EXCEEDED or CANCELLED, and a harness that cannot
+// be described while the caller is live is UNAVAILABLE. Nothing is journaled in any case. The
+// service is called directly because a gRPC client fails a cancelled call locally, before the server
+// ever sees it.
+func TestResumeAndForkAdmissionSeparatesCallerContextFromOutage(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Minute))
+	defer cancelExpired()
+	calls := map[string]func(ctx context.Context, svc *session.Service, uid string) error{
+		"resume": func(ctx context.Context, svc *session.Service, uid string) error {
+			_, err := svc.Resume(ctx, &v1.ResumeRequest{Session: uid})
+			return err
+		},
+		"fork": func(ctx context.Context, svc *session.Service, uid string) error {
+			_, err := svc.Fork(ctx, &v1.ForkRequest{Session: uid})
+			return err
+		},
+	}
+	ctxs := []struct {
+		name string
+		ctx  context.Context
+		want codes.Code
+	}{
+		{name: "caller cancelled", ctx: cancelled, want: codes.Canceled},
+		{name: "caller deadline expired", ctx: expired, want: codes.DeadlineExceeded},
+		{name: "harness unreachable while the caller is live", ctx: context.Background(), want: codes.Unavailable},
+	}
+	for _, method := range []string{"resume", "fork"} {
+		for _, tt := range ctxs {
+			t.Run(method+"/"+tt.name, func(t *testing.T) {
+				store, err := sqlitelog.Open(":memory:")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = store.Close() })
+				inner := local.New(echoagent.Harness{})
+				t.Cleanup(func() { _ = inner.Close() })
+				svc := session.NewService(store, echoRegistry(t, &describeFails{Backend: inner, peerErr: status.Error(codes.Unavailable, "connection refused")}))
+				sess, err := svc.CreateSession(context.Background(), &v1.CreateSessionRequest{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				uid := sess.GetMetadata().GetUid()
+
+				if err := calls[method](tt.ctx, svc, uid); status.Code(err) != tt.want {
+					t.Fatalf("%s = %v, want %v", method, err, tt.want)
+				}
+				if head, err := store.Session(uid).Head(); err != nil || head != 0 {
+					t.Fatalf("a refused admission journaled events: head %d, err %v", head, err)
+				}
+			})
+		}
+	}
+}
+
+// Describe checks map the caller's deadline to DEADLINE_EXCEEDED. A turn whose model call is
+// interrupted by deadline_unix journals an ERROR and keeps its existing INTERNAL code, even though
+// the model call's error wraps context.DeadlineExceeded. Mid-turn classification is unchanged.
+func TestExecMidTurnDeadlineKeepsItsCode(t *testing.T) {
+	blockingModel := func(ctx context.Context, _ api.ModelRequest) (api.ModelResponse, error) {
+		<-ctx.Done()
+		return api.ModelResponse{}, fmt.Errorf("model http: %w", ctx.Err())
+	}
+	backend := local.New(echoagent.Harness{})
+	t.Cleanup(func() { _ = backend.Close() })
+	registry, err := placement.NewRegistry("echo", map[string]*placement.Placer{
+		"echo": placement.New(backend, blockingModel),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newClientWithRegistry(t, registry)
+	uid := mustCreate(t, c)
+	stream, err := c.Exec(context.Background(), &v1.ExecRequest{
+		Session:      uid,
+		Inputs:       []*v1.Message{wire.MessageToProto(api.TextMessage("user", "hi"))},
+		DeadlineUnix: time.Now().Add(2 * time.Second).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := drainExec(stream); status.Code(err) != codes.Internal {
+		t.Fatalf("exec = %v, want %v", err, codes.Internal)
+	}
+	rs, err := c.Replay(context.Background(), &v1.ReplayRequest{Session: uid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var last *v1.LogRecord
+	for {
+		r, err := rs.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		last = r
+	}
+	if last.GetEvent().GetKind() != v1.EventKind_EVENT_ERROR {
+		t.Fatalf("the interrupted turn ended with %v, want an ERROR event", last.GetEvent().GetKind())
+	}
+}
+
 // configHarness records the Start it was handed, so a test can prove the per-execution values a
 // caller supplied actually reach the harness instead of stopping at the service.
 type configHarness struct{ got *api.Start }
@@ -825,28 +981,253 @@ func (h *configHarness) Run(ctx context.Context, s *api.Start, sink api.EventSin
 	return err
 }
 
-// config and resume_from_seq are opaque to the host and meaningful only to the harness, so the test
-// that they are honored is that they arrive there.
+// Opaque request values must reach both the real placed harness and the durable stream, unchanged.
 func TestExecPassesConfigAndCursorToHarness(t *testing.T) {
 	var got api.Start
 	c := newClientWith(t, local.New(&configHarness{got: &got}))
-
+	uid := mustCreate(t, c)
+	config := []byte{0, 255, ' ', '\n', '\t'}
 	stream, err := c.Exec(context.Background(), &v1.ExecRequest{
-		Session:       mustCreate(t, c),
+		Session:       uid,
 		Inputs:        []*v1.Message{wire.MessageToProto(api.TextMessage("user", "hi"))},
-		Config:        []byte(`{"temperature":0}`),
+		Config:        config,
 		ResumeFromSeq: 7,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := drainExec(stream); err != nil {
+	var first *v1.LogRecord
+	for {
+		update, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first == nil && update.GetRecord() != nil {
+			first = update.GetRecord()
+		}
+	}
+	if !bytes.Equal(got.Config, config) || got.ResumeFromSeq != 7 {
+		t.Fatalf("harness saw config %q cursor %d, want request's", got.Config, got.ResumeFromSeq)
+	}
+	if first == nil || first.GetSeq() != 1 || first.GetEvent().GetKind() != v1.EventKind_EVENT_EXECUTION_START {
+		t.Fatalf("first record = %v, want execution start", first)
+	}
+	body := first.GetEvent().GetExecutionStart()
+	if body == nil || !bytes.Equal(body.GetConfig(), config) || body.GetResumeFromSeq() != 7 {
+		t.Fatalf("recorded start = %v, want request's", body)
+	}
+	replayed, err := c.Replay(t.Context(), &v1.ReplayRequest{Session: uid, ToSeq: 1})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got.Config) != `{"temperature":0}` {
-		t.Fatalf("harness saw config %q, want the request's", got.Config)
+	record, err := replayed.Recv()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got.ResumeFromSeq != 7 {
-		t.Fatalf("harness saw resume_from_seq %d, want 7", got.ResumeFromSeq)
+	if !proto.Equal(record, first) {
+		t.Fatal("record changed between Exec and read-only Replay")
 	}
+	if _, err := replayed.Recv(); err != io.EOF {
+		t.Fatalf("expected Replay EOF, got %v", err)
+	}
+}
+
+// registryToolHarness exposes the actual result delivered over the local harnesswire bridge.
+type registryToolHarness struct{ key string }
+
+func (registryToolHarness) Describe(context.Context) (api.Descriptor, error) {
+	return api.Descriptor{ID: "echo", Capabilities: api.Capabilities{Resumability: api.ResumabilityStatelessReplay}}, nil
+}
+
+func (h registryToolHarness) Run(ctx context.Context, _ *api.Start, sink api.EventSink) error {
+	res, err := sink.ToolCall(ctx, api.ToolCall{
+		ID: "service-call", Tool: "charge", Args: map[string]any{"account": "a1"},
+		Mediation: api.MediationControllerMediated, IdempotencyKey: h.key,
+	})
+	if err != nil {
+		return err
+	}
+	return sink.Output(ctx, fmt.Sprintf("%s:%v", res.ID, res.Output["receipt"]))
+}
+
+// Dropping the placement option at registry construction must fail configured/error cases;
+// bypassing the key/default-denial guards must fail before an effect can be produced.
+func TestSessionsRegistryHostToolExec(t *testing.T) {
+	for _, tc := range []struct {
+		name, key, wantError string
+		configured, fail     bool
+		wantIntent           bool
+	}{
+		{name: "configured", key: "service-key", configured: true, wantIntent: true},
+		{name: "missing executor", key: "service-key", wantError: "no tool executor configured", wantIntent: true},
+		{name: "empty key", configured: true, wantError: controller.ErrMissingIdempotencyKey.Error()},
+		{name: "executor error", key: "service-key", configured: true, fail: true, wantError: "host refused charge", wantIntent: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openStore(t, ":memory:")
+			backend := local.New(registryToolHarness{key: tc.key})
+			t.Cleanup(func() { _ = backend.Close() })
+			var uid string
+			var opts []placement.Option
+			if tc.configured {
+				opts = append(opts, placement.WithToolExecutor(func(_ context.Context, scope controller.ToolCallContext, call api.ToolCall) (api.ToolResult, error) {
+					if scope.SessionUID != uid {
+						return api.ToolResult{}, fmt.Errorf("executor session = %q, want %q", scope.SessionUID, uid)
+					}
+					log := store.Session(scope.SessionUID)
+					recs, err := log.Read(1)
+					if err != nil {
+						return api.ToolResult{}, err
+					}
+					if len(recs) == 0 || recs[len(recs)-1].Event.Kind != api.EventToolCall || recs[len(recs)-1].Event.ToolCall == nil || recs[len(recs)-1].Event.ToolCall.IdempotencyKey != "service-key" {
+						return api.ToolResult{}, fmt.Errorf("host effect preceded durable intent: %+v", recs)
+					}
+					if err := log.Verify(); err != nil {
+						return api.ToolResult{}, err
+					}
+					if call.ID != "service-call" || call.Tool != "charge" || call.Args["account"] != "a1" || call.Mediation != api.MediationControllerMediated || call.IdempotencyKey != "service-key" {
+						return api.ToolResult{}, fmt.Errorf("unexpected host call: %+v", call)
+					}
+					if tc.fail {
+						return api.ToolResult{}, errors.New("host refused charge")
+					}
+					return api.ToolResult{ID: "host-id", Output: map[string]any{"receipt": "service-receipt"}}, nil
+				}))
+			}
+			client := serveRegistry(t, store, echoRegistry(t, backend, opts...))
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			uid = mustCreate(t, client)
+			stream, err := client.Exec(ctx, &v1.ExecRequest{Session: uid, Inputs: []*v1.Message{wire.MessageToProto(api.TextMessage("user", "charge"))}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var kinds []api.EventKind
+			var output string
+			var result *api.ToolResult
+			for {
+				update, recvErr := stream.Recv()
+				if recvErr != nil {
+					err = recvErr
+					break
+				}
+				if rec := update.GetRecord(); rec != nil {
+					ev := wire.EventFromProto(rec.GetEvent())
+					kinds = append(kinds, ev.Kind)
+					if ev.Kind == api.EventOutput {
+						output = ev.Message.Text()
+					}
+					if ev.Kind == api.EventToolResult {
+						result = ev.Result
+					}
+				}
+			}
+			if tc.wantError == "" {
+				if err != io.EOF || result == nil || result.ID != "service-call" || result.Output["receipt"] != "service-receipt" || output != "service-call:service-receipt" {
+					t.Fatalf("gRPC roundtrip: err=%v result=%+v output=%q", err, result, output)
+				}
+			} else if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), tc.wantError) || result != nil || output != "" {
+				t.Fatalf("gRPC failure: err=%v result=%+v output=%q, want %q", err, result, output, tc.wantError)
+			}
+			intent := false
+			for _, kind := range kinds {
+				intent = intent || kind == api.EventToolCall
+			}
+			if intent != tc.wantIntent {
+				t.Fatalf("intent=%v want %v, records=%v", intent, tc.wantIntent, kinds)
+			}
+		})
+	}
+}
+
+func TestSessionsRegistryHostToolResume(t *testing.T) {
+	for _, completedPrefix := range []bool{false, true} {
+		t.Run(fmt.Sprintf("completed-prefix=%v", completedPrefix), func(t *testing.T) {
+			store := openStore(t, ":memory:")
+			backend := local.New(registryToolHarness{key: "original-service-key"})
+			t.Cleanup(func() { _ = backend.Close() })
+			var uid string
+			var opts []placement.Option
+			if !completedPrefix {
+				opts = append(opts, placement.WithToolExecutor(func(_ context.Context, scope controller.ToolCallContext, call api.ToolCall) (api.ToolResult, error) {
+					if scope.SessionUID != uid {
+						return api.ToolResult{}, fmt.Errorf("resume executor session = %q, want %q", scope.SessionUID, uid)
+					}
+					if call.ID != "service-call" || call.IdempotencyKey != "original-service-key" || call.Tool != "charge" || call.Args["account"] != "a1" {
+						return api.ToolResult{}, fmt.Errorf("resume lost recorded intent: %+v", call)
+					}
+					return api.ToolResult{ID: "wrong-id", Output: map[string]any{"receipt": "original-receipt"}}, nil
+				}))
+			}
+			// No executor for the completed prefix: the recorded result must suffice.
+			client := serveRegistry(t, store, echoRegistry(t, backend, opts...))
+			uid = mustCreate(t, client)
+			log := store.Session(uid)
+			fence, err := log.NewFence()
+			if err != nil {
+				t.Fatal(err)
+			}
+			call := api.ToolCall{ID: "service-call", Tool: "charge", Args: map[string]any{"account": "a1"}, Mediation: api.MediationControllerMediated, IdempotencyKey: "original-service-key"}
+			events := []api.Event{
+				{Kind: api.EventExecutionStart, ExecutionStart: &api.ExecutionStart{InputCount: proto.Int64(1)}},
+				{Kind: api.EventInput, Message: api.TextMessage("user", "charge")},
+				{Kind: api.EventToolCall, ToolCall: &call},
+			}
+			if completedPrefix {
+				events = append(events, api.Event{Kind: api.EventToolResult, Result: &api.ToolResult{ID: "service-call", Output: map[string]any{"receipt": "original-receipt"}}})
+			}
+			for i, ev := range events {
+				ev.ExecutionID = "service-interrupted"
+				if _, err := log.Append(int64(i), fence, ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if _, err := client.Resume(ctx, &v1.ResumeRequest{Session: uid}); err != nil {
+				t.Fatalf("Sessions.Resume through registered placer: %v", err)
+			}
+			recs, err := log.Read(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(recs) != 7 || recs[3].Event.Kind != api.EventToolResult || recs[4].Event.Kind != api.EventOutput || recs[5].Event.Kind != api.EventEnd || recs[6].Event.Lifecycle == nil || recs[6].Event.Lifecycle.Kind != api.LifecycleResume {
+				t.Fatalf("resume did not complete the tool turn: %+v", recs)
+			}
+			var result *api.ToolResult
+			var output string
+			for _, rec := range recs {
+				switch rec.Event.Kind {
+				case api.EventToolResult:
+					result = rec.Event.Result
+				case api.EventOutput:
+					output = rec.Event.Message.Text()
+				}
+			}
+			if result == nil || result.ID != "service-call" || output != "service-call:original-receipt" {
+				t.Fatalf("resume lost tool correlation or receipt: result=%+v output=%q", result, output)
+			}
+			if err := log.Verify(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func serveRegistry(t *testing.T, store *sqlitelog.Store, registry *placement.Registry) v1.SessionsClient {
+	t.Helper()
+	lis := bufconn.Listen(1 << 20)
+	srv := grpc.NewServer()
+	v1.RegisterSessionsServer(srv, session.NewService(store, registry))
+	go srv.Serve(lis)
+	t.Cleanup(srv.Stop)
+	conn, err := grpc.NewClient("passthrough:///bufnet", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return v1.NewSessionsClient(conn)
 }

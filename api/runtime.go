@@ -1,6 +1,15 @@
 package api
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrSnapshotSuperseded reports that a fork's source snapshot is no longer the one the parent holds,
+// because the parent was resumed (and possibly checkpointed again) after the snapshot was taken. The
+// fork cannot clone it without pairing the children's journal prefix with different RAM; the
+// caller can retry the fork at the parent's new head.
+var ErrSnapshotSuperseded = errors.New("runtime: fork source snapshot was superseded")
 
 // Runtime is the compute/sandbox SPI. Pod, Kata Pod Sandboxing, Cloud Hypervisor,
 // Dragonball, Hyperlight, and agent-substrate all implement it. There is no gVisor
@@ -15,8 +24,11 @@ type Runtime interface {
 	Create(ctx context.Context, s *SessionSpec) (Incarnation, error)
 
 	// Snapshot captures the incarnation's state. SnapshotLocal (warm/pause) keeps it
-	// node-resident; SnapshotExternal (cold/suspend) writes to object storage. A backend
-	// without memory snapshot returns a filesystem-only SnapshotRef.
+	// node-resident. SnapshotExternal owns the cold transition: it captures required state,
+	// releases dedicated per-incarnation compute where applicable, and preserves the state
+	// and any backend handles Restore needs. A backend without memory snapshots may return
+	// a filesystem/journal handle; without dedicated per-session compute, its shared harness
+	// server may remain running.
 	Snapshot(ctx context.Context, in Incarnation, kind SnapshotKind) (SnapshotRef, error)
 
 	// Restore brings an incarnation back from a snapshot. Sub-second on memory-capable
@@ -28,9 +40,12 @@ type Runtime interface {
 	// the child continues from the parent's RAM; a filesystem-only backend returns a fresh incarnation
 	// and relies on the host replaying the child's copied log prefix. Implementations must not leak a
 	// partially-provisioned child: on any failure after the child exists, tear it down before returning.
+	// A backend that finds ref no longer held by the parent returns an error wrapping
+	// ErrSnapshotSuperseded.
 	Fork(ctx context.Context, ref SnapshotRef, opts ForkOpts) (Incarnation, error)
 
-	// Stop destroys the incarnation and frees the worker.
+	// Stop is destructive teardown: it destroys the incarnation and frees its dedicated compute.
+	// Callers must not assume a captured SnapshotRef remains restorable after Stop.
 	Stop(ctx context.Context, in Incarnation) error
 
 	// Status reports the incarnation's compute-lifecycle state.
@@ -44,7 +59,9 @@ type Runtime interface {
 type SnapshotKind string
 
 const (
-	SnapshotLocal    SnapshotKind = "LOCAL"
+	// SnapshotLocal keeps the captured state warm and node-resident.
+	SnapshotLocal SnapshotKind = "LOCAL"
+	// SnapshotExternal transitions to cold, releasing dedicated compute while retaining restore state.
 	SnapshotExternal SnapshotKind = "EXTERNAL"
 )
 
@@ -65,9 +82,14 @@ type SnapshotRef struct {
 type Incarnation struct {
 	ID         string
 	Worker     string // pod/worker id
-	Address    string // where the harness server listens
+	Address    string // where the harness server listens, or the ingress that routes to it
 	Runtime    string // "pod" | "kata" | "clh" | "substrate"
 	FenceToken int64  // monotonic; the log rejects appends from a superseded incarnation
+	// CallMetadata is request metadata the host must attach to every call it makes to the harness at
+	// Address. A backend whose harness sits behind a shared ingress uses it to name the target
+	// sandbox (substrate: ate-target-actor); a backend that hands out a direct address leaves it
+	// empty. It is routing, not authentication: nothing here proves the caller's identity.
+	CallMetadata map[string]string
 }
 
 // SessionSpec is what a Runtime needs to create an incarnation.

@@ -11,11 +11,13 @@ Source of truth: api/*.proto. Edit the proto comments, not this file.
 ## Table of Contents
 
 - [common.proto](#common-proto)
+    - [ApprovalRef](#agentsessions-v1-ApprovalRef)
     - [ApprovalRequest](#agentsessions-v1-ApprovalRequest)
     - [ApprovalResult](#agentsessions-v1-ApprovalResult)
     - [DataPart](#agentsessions-v1-DataPart)
     - [Error](#agentsessions-v1-Error)
     - [Event](#agentsessions-v1-Event)
+    - [ExecutionStart](#agentsessions-v1-ExecutionStart)
     - [FilePart](#agentsessions-v1-FilePart)
     - [HarnessEnd](#agentsessions-v1-HarnessEnd)
     - [IdentityRef](#agentsessions-v1-IdentityRef)
@@ -31,12 +33,16 @@ Source of truth: api/*.proto. Edit the proto comments, not this file.
     - [ResourceMetadata](#agentsessions-v1-ResourceMetadata)
     - [TextPart](#agentsessions-v1-TextPart)
     - [ToolCall](#agentsessions-v1-ToolCall)
+    - [ToolChoice](#agentsessions-v1-ToolChoice)
+    - [ToolDefinition](#agentsessions-v1-ToolDefinition)
     - [ToolResult](#agentsessions-v1-ToolResult)
     - [Usage](#agentsessions-v1-Usage)
   
     - [EventKind](#agentsessions-v1-EventKind)
     - [Lifecycle.Kind](#agentsessions-v1-Lifecycle-Kind)
     - [Mediation](#agentsessions-v1-Mediation)
+    - [ToolChoice.Mode](#agentsessions-v1-ToolChoice-Mode)
+    - [ToolResult.Code](#agentsessions-v1-ToolResult-Code)
   
 - [harness.proto](#harness-proto)
     - [Cancel](#agentsessions-v1-Cancel)
@@ -53,7 +59,27 @@ Source of truth: api/*.proto. Edit the proto comments, not this file.
   
     - [Harness](#agentsessions-v1-Harness)
   
+- [harness_registry.proto](#harness_registry-proto)
+    - [GetHarnessRequest](#agentsessions-v1-GetHarnessRequest)
+    - [HarnessRegistration](#agentsessions-v1-HarnessRegistration)
+    - [HarnessSpec](#agentsessions-v1-HarnessSpec)
+    - [ListHarnessesRequest](#agentsessions-v1-ListHarnessesRequest)
+    - [ListHarnessesResponse](#agentsessions-v1-ListHarnessesResponse)
+    - [RegisterHarnessRequest](#agentsessions-v1-RegisterHarnessRequest)
+    - [RegisterHarnessResponse](#agentsessions-v1-RegisterHarnessResponse)
+    - [RemotePlacement](#agentsessions-v1-RemotePlacement)
+    - [RetireHarnessRequest](#agentsessions-v1-RetireHarnessRequest)
+    - [SubstratePlacement](#agentsessions-v1-SubstratePlacement)
+  
+    - [HarnessSource](#agentsessions-v1-HarnessSource)
+    - [HarnessState](#agentsessions-v1-HarnessState)
+    - [RegisterOutcome](#agentsessions-v1-RegisterOutcome)
+  
+    - [HarnessRegistry](#agentsessions-v1-HarnessRegistry)
+  
 - [session.proto](#session-proto)
+    - [ApproveRequest](#agentsessions-v1-ApproveRequest)
+    - [ApproveResponse](#agentsessions-v1-ApproveResponse)
     - [CancelRequest](#agentsessions-v1-CancelRequest)
     - [ComputeRef](#agentsessions-v1-ComputeRef)
     - [ComputeRef.AttributesEntry](#agentsessions-v1-ComputeRef-AttributesEntry)
@@ -93,18 +119,42 @@ Source of truth: api/*.proto. Edit the proto comments, not this file.
 Shared wire types for the agentsessions Session and Harness services.
 
 The Event message is used by BOTH the session log (Sessions.Exec / Replay) and the
-harness stream (Harness.Connect) — the harness&#39;s events become the session log.
+harness stream (Harness.Connect) — durable harness events become the log alongside host-owned
+records. EVENT_PARKED is a transport-only acknowledgement and is never journaled.
 
 The content model (Part) is aligned with A2A `Part` &#43; MCP content for interop; the
 event/log model is native. Derived from the durable-log &amp; replay contract §7 (record
 schema) and §8 (interop). See agentsessions-replay-determinism-contract.md.
 
 
+<a name="agentsessions-v1-ApprovalRef"></a>
+
+### ApprovalRef
+ApprovalRef identifies an unresolved, host-owned APPROVAL_REQUEST within the enclosing
+session. All fields are required by the approval protocol and request_seq must be positive.
+A reference inherited through Fork cannot authorize a new effect in the child session.
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| execution_id | [string](#string) |  |  |
+| tool_call_id | [string](#string) |  |  |
+| request_seq | [int64](#int64) |  |  |
+
+
+
+
+
+
 <a name="agentsessions-v1-ApprovalRequest"></a>
 
 ### ApprovalRequest
-Approval is modeled as durable log entries: an unresolved request, later resolved by a
-decision — so compute can suspend while awaiting a human/policy decision (§7).
+Approval is durable journal state, not a mutable session flag or side table. For a
+REQUIRES_APPROVAL call the host commits TOOL_CALL then APPROVAL_REQUEST before parking;
+only the host may commit the request or its later APPROVAL_RESULT. The harness cannot mint
+requests or decisions by emitting these events. Identity on a decision&#39;s Event.actor is
+recorded provenance only, not authorization. This gate supports STATELESS_REPLAY only;
+it defines no policy hook, expiry, automatic decision, or Cancel behavior.
 
 
 | Field | Type | Label | Description |
@@ -120,14 +170,18 @@ decision — so compute can suspend while awaiting a human/policy decision (§7)
 <a name="agentsessions-v1-ApprovalResult"></a>
 
 ### ApprovalResult
-
+ApprovalResult resolves one request in the enclosing session and Event.execution_id.
+A committed decision allows recovery via Resume; Approve itself never invokes the executor.
+The host also sends this body in ControllerFrame.approval before the correlated tool receipt
+during decided recovery/replay. approved=false is a real denial, not an absent decision.
 
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | tool_call_id | [string](#string) |  |  |
-| approved | [bool](#bool) |  |  |
+| approved | [bool](#bool) |  | non-optional durable value; request-level decision presence is in ApproveRequest |
 | reason | [string](#string) |  |  |
+| request_seq | [int64](#int64) |  | Positive sequence of the resolved APPROVAL_REQUEST. Zero is retained for legacy decisions; it cannot identify a new durable approval request. |
 
 
 
@@ -168,7 +222,9 @@ DataPart is structured JSON (A2A data part; MCP structuredContent).
 <a name="agentsessions-v1-Event"></a>
 
 ### Event
-Event is the harness-emitted content unit. Ordering (seq) and integrity (prev_hash /
+Event is the shared journal/stream content unit; EXECUTION_START, APPROVAL_REQUEST and
+APPROVAL_RESULT are host-owned journal entries. PARKED is transport only, never journaled.
+Ordering (seq) and integrity (prev_hash /
 content_hash) are host-assigned and live on LogRecord — the harness, which does not know
 seq/prev, emits a hash-free Event, so there is no circular hashing. Streaming deltas are
 transport (see Delta in session.proto) and coalesce into the finalized event (§3).
@@ -190,7 +246,31 @@ transport (see Delta in session.proto) and coalesce into the finalized event (§
 | lifecycle | [Lifecycle](#agentsessions-v1-Lifecycle) |  |  |
 | end | [HarnessEnd](#agentsessions-v1-HarnessEnd) |  |  |
 | error | [Error](#agentsessions-v1-Error) |  |  |
+| execution_start | [ExecutionStart](#agentsessions-v1-ExecutionStart) |  |  |
+| parked | [ApprovalRef](#agentsessions-v1-ApprovalRef) |  | EVENT_PARKED echoes the park reference; Event.execution_id must match its execution_id. |
 | actor | [IdentityRef](#agentsessions-v1-IdentityRef) |  | emitter principal -&gt; provenance |
+
+
+
+
+
+
+<a name="agentsessions-v1-ExecutionStart"></a>
+
+### ExecutionStart
+ExecutionStart is host-owned invocation state, committed before inputs and harness execution.
+The host emits it for every new execution, including default-config and inputless turns.
+Logs without this event reconstruct with empty config and a zero cursor. Older discarded
+non-empty values cannot be recovered. Config is opaque: preserve bytes verbatim, never parse it.
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| config | [bytes](#bytes) |  |  |
+| resume_from_seq | [int64](#int64) |  | harness cursor, distinct from the append CAS cursor |
+| input_count | [int64](#int64) | optional | Expected number of INPUT events for this invocation, always set by new writers (including zero). Replay/resume reject a completed or selected invocation with a missing/negative count or a different committed INPUT count before running the harness. An incomplete trailing invocation is skipped by completed replay. Count-less experimental start markers fail closed; truly markerless legacy executions retain their existing reconstruction behavior. |
+| harness | [string](#string) |  | Host-resolved registry name used for this execution, not necessarily HarnessDescriptor.id. Interrupted Resume resolves this exact name; absent legacy names use the session harness. |
+| harness_version | [string](#string) |  | Advertised, opaque harness replay-compatibility version. Empty means unknown/unversioned. When nonempty, controller replay and interrupted resume require an exact served-version match (including rejection of an empty served version) before running the harness. Empty recorded versions retain existing behavior; this field is opt-in, not required. |
 
 
 
@@ -303,7 +383,7 @@ Message is a role-tagged sequence of content parts (A2A Message = role &#43; Par
 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
-| role | [string](#string) |  | user | assistant | tool |
+| role | [string](#string) |  | system, user, assistant, or tool |
 | parts | [Part](#agentsessions-v1-Part) | repeated |  |
 
 
@@ -316,8 +396,8 @@ Message is a role-tagged sequence of content parts (A2A Message = role &#43; Par
 ### ModelCall
 ModelCall is a model REQUEST emitted by the harness (EVENT_MODEL_CALL). The host records
 it with input_hash and answers via ControllerFrame.ModelResult (correlated by id). The
-completion (text &#43; reasoning parts) is recorded separately as an EVENT_OUTPUT message.
-Under STATELESS_REPLAY the harness never calls a provider directly.
+completion (text, reasoning, and tool_call parts) is recorded separately as an EVENT_OUTPUT
+message. Under STATELESS_REPLAY the harness never calls a provider directly.
 
 
 | Field | Type | Label | Description |
@@ -327,6 +407,8 @@ Under STATELESS_REPLAY the harness never calls a provider directly.
 | input_hash | [string](#string) |  | §7/§9.1: required for STATELESS_REPLAY so the I0 check can run |
 | id | [string](#string) |  | correlation id for the served ModelResult |
 | messages | [Message](#agentsessions-v1-Message) | repeated | messages is the request context the host needs to INVOKE the model on the live path. It is wire-only: the host records the call with input_hash alone (messages stripped), since the recorded form only needs the hash to re-check I0 on replay. |
+| tools | [ToolDefinition](#agentsessions-v1-ToolDefinition) | repeated | tools are the definitions offered to the model on this call. Wire-only like messages: the recorded form keeps input_hash, which covers them. |
+| tool_choice | [ToolChoice](#agentsessions-v1-ToolChoice) |  | tool_choice constrains whether and which tool the model calls. Wire-only like messages and covered by input_hash. Unset means the provider default. |
 
 
 
@@ -397,6 +479,8 @@ opaque reasoning block. Large payloads are externalized by URI, never inlined (�
 | file | [FilePart](#agentsessions-v1-FilePart) |  |  |
 | data | [DataPart](#agentsessions-v1-DataPart) |  |  |
 | reasoning | [ReasoningPart](#agentsessions-v1-ReasoningPart) |  |  |
+| tool_call | [ToolCall](#agentsessions-v1-ToolCall) |  | tool_call is a model&#39;s request to call a tool, carried in an assistant message. It reuses ToolCall so one id runs from the model output through EVENT_TOOL_CALL / EVENT_TOOL_RESULT to the next model input. On a model output, mediation and idempotency_key are unset; to execute the call, the harness sets them on a copy and never changes the recorded output&#39;s ToolCall. |
+| tool_result | [ToolResult](#agentsessions-v1-ToolResult) |  | tool_result is a tool&#39;s result fed back to the model, carried in a message with role &#34;tool&#34;. ToolResult.id is the id of the ToolCall it answers. |
 
 
 
@@ -484,10 +568,46 @@ ToolCall aligns with an MCP tool call (name &#43; structured args).
 
 
 
+<a name="agentsessions-v1-ToolChoice"></a>
+
+### ToolChoice
+ToolChoice constrains whether and which tool the model calls.
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| mode | [ToolChoice.Mode](#agentsessions-v1-ToolChoice-Mode) |  |  |
+| name | [string](#string) |  | name forces one specific tool. It is meaningful only with MODE_REQUIRED. |
+
+
+
+
+
+
+<a name="agentsessions-v1-ToolDefinition"></a>
+
+### ToolDefinition
+ToolDefinition is a tool offered to a model on one call. It aligns with an MCP Tool (name,
+description, inputSchema). It differs from the harness&#39;s ToolSpec, which declares a tool and its
+default mediation to the host; ToolDefinition is what the model sees.
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| name | [string](#string) |  |  |
+| description | [string](#string) |  |  |
+| input_schema | [google.protobuf.Struct](https://protobuf.dev/reference/protobuf/google.protobuf/#struct) |  | JSON Schema object describing the tool&#39;s arguments |
+
+
+
+
+
+
 <a name="agentsessions-v1-ToolResult"></a>
 
 ### ToolResult
-
+ToolResult is a durable execution receipt, also usable as model-facing history. A decision
+itself is a separate host-owned APPROVAL_RESULT; it is not embedded in this message.
 
 
 | Field | Type | Label | Description |
@@ -498,6 +618,10 @@ ToolCall aligns with an MCP tool call (name &#43; structured args).
 | output_digest | [string](#string) |  | content digest of output_uri target (chain covers externalized bytes) |
 | is_error | [bool](#bool) |  |  |
 | error | [string](#string) |  |  |
+| content | [Part](#agentsessions-v1-Part) | repeated | content is the model-facing result (MCP CallToolResult.content: text, file, structured data). A harness records on EVENT_TOOL_RESULT the same ToolResult it feeds back as a tool_result part, so history rebuilt from the journal can give the model what it saw live. |
+| code | [ToolResult.Code](#agentsessions-v1-ToolResult-Code) |  |  |
+| approval_request_seq | [int64](#int64) |  | For approval-gated calls, the positive journal sequences of the host-owned request and decision. Both are set on success, denial, or executor failure after approval. Other calls and legacy receipts leave both zero. The host checks these against the same session, execution_id and tool call id; a receipt cannot resolve a different request/decision. |
+| approval_decision_seq | [int64](#int64) |  |  |
 
 
 
@@ -543,6 +667,8 @@ ToolCall aligns with an MCP tool call (name &#43; structured args).
 | EVENT_LIFECYCLE | 9 |  |
 | EVENT_END | 10 |  |
 | EVENT_ERROR | 11 |  |
+| EVENT_EXECUTION_START | 12 | host-owned config/cursor/input count, before inputs and harness effects |
+| EVENT_PARKED | 13 | Harness acknowledgement of ControllerFrame.park with the exact ApprovalRef. Transport only: the host MUST NOT journal/hash-chain it or treat it as a terminal execution outcome. |
 
 
 
@@ -572,7 +698,34 @@ Mediation controls how a tool call is executed / who enforces record-before-effe
 | MEDIATION_UNSPECIFIED | 0 |  |
 | MEDIATION_IN_HARNESS_REPORTED | 1 | harness runs it, reports for audit (cooperative WAL) |
 | MEDIATION_CONTROLLER_MEDIATED | 2 | host/gateway executes (host-enforced WAL; trustless) |
-| MEDIATION_REQUIRES_APPROVAL | 3 | pause for human/policy approval |
+| MEDIATION_REQUIRES_APPROVAL | 3 | Host-owned durable approval gate for STATELESS_REPLAY only. The harness emits a tool call, then awaits a decision/receipt or park control frame; it never executes the effect itself. REQUIRES_MEMORY_SNAPSHOT is unsupported for this gate and fails closed before the effect. |
+
+
+
+<a name="agentsessions-v1-ToolChoice-Mode"></a>
+
+### ToolChoice.Mode
+
+
+| Name | Number | Description |
+| ---- | ------ | ----------- |
+| MODE_UNSPECIFIED | 0 | provider default |
+| MODE_AUTO | 1 | the model decides whether to call a tool |
+| MODE_NONE | 2 | the model must not call a tool |
+| MODE_REQUIRED | 3 | the model must call at least one tool |
+
+
+
+<a name="agentsessions-v1-ToolResult-Code"></a>
+
+### ToolResult.Code
+
+
+| Name | Number | Description |
+| ---- | ------ | ----------- |
+| CODE_UNSPECIFIED | 0 | Legacy/unspecified status. With is_error=false this is also a successful receipt. Old is_error=true receipts retain their legacy, unclassified failure shape. |
+| APPROVAL_DENIED | 1 | A denied approval: is_error=true and the executor MUST NOT have been invoked. |
+| EXECUTOR_ERROR | 2 | An attempted executor call failed: is_error=true; error describes the failure. This is a durable handled receipt, not an unrecorded effect or an approval denial. |
 
 
  
@@ -591,8 +744,13 @@ The Harness BYOH SPI: the contract between the host and an agent implementation.
 
 A Microsoft Agent Framework (MAF) agent, a GitHub Copilot agent, or a custom agent
 implements it via a thin adapter. The host drives one execution per Connect stream;
-the harness streams typed Events terminated by one EVENT_END. Beyond plain streaming, it
-adds tool-call / approval mediation, per-call usage, and capability declaration.
+the harness streams typed Events terminated by one EVENT_END, except a host-requested approval
+park, which ends with a correlated EVENT_PARKED acknowledgement and stream closure, not END.
+Beyond plain streaming, it adds tool-call / approval mediation, per-call usage, and capabilities.
+The approval/park protocol below supports STATELESS_REPLAY only. The reference bridge
+implements this exchange; public controller dispatch remains unavailable until host park
+handoff is supported. Unsupported peers and memory-snapshot harnesses must not execute
+REQUIRES_APPROVAL effects.
 
 
 <a name="agentsessions-v1-Cancel"></a>
@@ -632,7 +790,30 @@ adds tool-call / approval mediation, per-call usage, and capability declaration.
 <a name="agentsessions-v1-ControllerFrame"></a>
 
 ### ControllerFrame
-ControllerFrame is sent by the host to the harness during an execution.
+ControllerFrame is sent by the host to the harness during an execution. Tool/approval control
+frames MUST match the Start envelope&#39;s session and execution_id and the outstanding tool call
+id. The session is the effect namespace; a reused tool id in another session is unrelated.
+
+For a STATELESS_REPLAY REQUIRES_APPROVAL call, the host owns the durable request/decision.
+While unresolved, it sends park after committing the request. The harness checks the full
+session/execution/call/request tuple, stops this Run, sends one matching EVENT_PARKED, and
+closes its sending side WITHOUT EVENT_END. The host receives and validates that acknowledgement
+before closing the stream. Missing/mismatched acknowledgements fail the exchange; the durable
+unresolved request remains recoverable. The host never journals EVENT_PARKED. This is not
+Cancel and does not record a completed, failed, or canceled execution.
+
+On decided recovery or replay the host sends approval BEFORE tool, even if a receipt already
+exists. The harness must correlate approval.tool_call_id/request_seq with the waiting call and
+receipt.id/approval_request_seq; the receipt&#39;s approval_decision_seq must identify the committed
+decision in that session&#39;s journal, which the host validates. Denial requires APPROVAL_DENIED
+and is_error=true without an executor call. Approval permits a success (CODE_UNSPECIFIED with
+is_error=false) or EXECUTOR_ERROR with is_error=true. Conflicting decisions or receipt tuples
+fail closed rather than being served to a different call. The harness may not manufacture
+durable APPROVAL_REQUEST/APPROVAL_RESULT events. The gate is not supported for memory-snapshot
+harnesses; reject it before executing an effect rather than pretending a park is a snapshot.
+Supporting implementations serialize sink operations; callbacks must not re-enter that sink.
+A recorded-prefix identity/correlation mismatch must not authorize a later model/tool effect
+or mark recovery complete, even if the harness catches the error.
 
 
 | Field | Type | Label | Description |
@@ -641,9 +822,10 @@ ControllerFrame is sent by the host to the harness during an execution.
 | execution_id | [string](#string) |  |  |
 | start | [Start](#agentsessions-v1-Start) |  |  |
 | cancel | [Cancel](#agentsessions-v1-Cancel) |  |  |
-| approval | [ApprovalResult](#agentsessions-v1-ApprovalResult) |  | response to an EVENT_APPROVAL_REQUEST |
-| tool | [ToolResult](#agentsessions-v1-ToolResult) |  | result for a CONTROLLER_MEDIATED tool call |
+| approval | [ApprovalResult](#agentsessions-v1-ApprovalResult) |  | host-owned committed decision, before the correlated tool receipt |
+| tool | [ToolResult](#agentsessions-v1-ToolResult) |  | result for a CONTROLLER_MEDIATED or decided REQUIRES_APPROVAL call |
 | model | [ModelResult](#agentsessions-v1-ModelResult) |  | served completion for a mediated/replayed model call |
+| park | [ApprovalRef](#agentsessions-v1-ApprovalRef) |  | host-owned unresolved request; requires correlated EVENT_PARKED |
 
 
 
@@ -672,6 +854,7 @@ ControllerFrame is sent by the host to the harness during an execution.
 | models | [string](#string) | repeated | model-agnostic: supported/required model ids |
 | tools | [ToolSpec](#agentsessions-v1-ToolSpec) | repeated |  |
 | capabilities | [Capabilities](#agentsessions-v1-Capabilities) |  |  |
+| version | [string](#string) |  | Stable, opaque implementation replay-compatibility version, owned by the harness author. Change it when deterministic execution or config interpretation changes. Hosts record it in ExecutionStart and compare known recorded versions exactly on replay/recovery. Empty is supported for older/unversioned harnesses and records an unknown version. |
 
 
 
@@ -699,7 +882,7 @@ scoped, delegated tokens (Transaction Tokens) via the host for tool calls.
 
 ### ModelResult
 ModelResult is a model completion served to the harness (live invocation or replay).
-The Message carries text &#43; opaque reasoning parts, recorded verbatim for continuity.
+The Message carries text, opaque reasoning, and tool_call parts, recorded verbatim for continuity.
 
 
 | Field | Type | Label | Description |
@@ -724,7 +907,7 @@ addition); it is empty when the sandbox was memory-restored.
 | ----- | ---- | ----- | ----------- |
 | config | [bytes](#bytes) |  |  |
 | history | [Event](#agentsessions-v1-Event) | repeated |  |
-| inputs | [Message](#agentsessions-v1-Message) | repeated | New input messages for this execution. Empty = resume/re-drive an interrupted execution from history with no new input. |
+| inputs | [Message](#agentsessions-v1-Message) | repeated | Invocation input messages. Controller replay and interrupted recovery restore the original messages from the journal; empty inputs describe an intentionally inputless invocation. |
 | identity | [IdentityContext](#agentsessions-v1-IdentityContext) |  |  |
 | resume_from_seq | [int64](#int64) |  |  |
 
@@ -778,7 +961,263 @@ this against a runtime&#39;s RuntimeCapabilities.
 | Method Name | Request Type | Response Type | Description |
 | ----------- | ------------ | ------------- | ------------|
 | Describe | [DescribeRequest](#agentsessions-v1-DescribeRequest) | [HarnessDescriptor](#agentsessions-v1-HarnessDescriptor) | Describe returns the static contract; used to match the harness to a runtime. |
-| Connect | [ControllerFrame](#agentsessions-v1-ControllerFrame) stream | [Event](#agentsessions-v1-Event) stream | Connect drives ONE execution. The host sends Start (and optional control frames); the harness streams Events terminated by exactly one EVENT_END. |
+| Connect | [ControllerFrame](#agentsessions-v1-ControllerFrame) stream | [Event](#agentsessions-v1-Event) stream | Connect drives ONE execution. The host sends Start (and optional control frames). Normally the harness streams Events terminated by exactly one EVENT_END. An unresolved approval instead follows park -&gt; correlated EVENT_PARKED -&gt; stream closure, with no EVENT_END. Durable requests/decisions belong to the host; this protocol applies to STATELESS_REPLAY only. The reference bridge supports this exchange. Public host approval dispatch remains unavailable; transport ACK and closure alone do not establish a successful host pause. |
+
+ 
+
+
+
+<a name="harness_registry-proto"></a>
+<p align="right"><a href="#top">Top</a></p>
+
+## harness_registry.proto
+The HarnessRegistry admin API: register, inspect and retire harnesses on a running host.
+
+A registration is immutable. Its spec is content-addressed by spec_digest, so registering the
+same spec under the same name again changes nothing, and a different spec under a taken name is
+refused. Retiring a harness refuses new sessions on it while every existing session keeps
+running, resuming and forking. Registering the identical spec again reactivates it.
+
+This service decides what the host dials and pays model calls for, so it is an operator
+surface, not a client one. agentsessionsd serves it only on a separate optional literal-loopback
+listener (-registry-addr); Sessions never serves this API. Both listeners are plaintext and
+unauthenticated. Every local or same-pod process that can reach the operator port can administer
+registrations. See docs/security.md.
+
+
+<a name="agentsessions-v1-GetHarnessRequest"></a>
+
+### GetHarnessRequest
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| name | [string](#string) |  |  |
+| observe | [bool](#bool) |  | Also ask the harness to Describe itself, bounded by a host timeout. The result is in observed or observe_error; a failed Describe does not fail the call. |
+
+
+
+
+
+
+<a name="agentsessions-v1-HarnessRegistration"></a>
+
+### HarnessRegistration
+HarnessRegistration is one entry in the host&#39;s harness registry.
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| metadata | [ResourceMetadata](#agentsessions-v1-ResourceMetadata) |  | metadata.name is the key that Session.harness and ExecRequest.harness refer to. metadata.uid is server-assigned and stays the same across UNCHANGED and REACTIVATED. metadata.project is unused: a registration is host-scoped. |
+| spec | [HarnessSpec](#agentsessions-v1-HarnessSpec) |  | Unset for a STATIC harness, or for a stored registration whose spec this host cannot decode or validate. No partial spec is returned in the latter case; see unservable_reason. |
+| spec_digest | [string](#string) |  | &#34;sha256:&#34; followed by the lowercase hex SHA-256 of the RFC 8785 (JCS) form of the originally stored spec&#39;s proto3-JSON mapping, with proto field names, enum names, and unpopulated fields omitted. This is the same canonical form the journal hashes. Empty for a STATIC harness. Preserved when spec is unset for an undecodable registration: this host cannot recompute the original digest without understanding the complete spec. |
+| state | [HarnessState](#agentsessions-v1-HarnessState) |  |  |
+| source | [HarnessSource](#agentsessions-v1-HarnessSource) |  |  |
+| retire_time | [google.protobuf.Timestamp](https://protobuf.dev/reference/protobuf/google.protobuf/#timestamp) |  | Set while RETIRED: when the harness was first retired. |
+| retire_reason | [string](#string) |  | Set while RETIRED: the reason given when the harness was first retired. |
+| observed | [HarnessDescriptor](#agentsessions-v1-HarnessDescriptor) |  | Set only when GetHarnessRequest.observe is true and Describe succeeded: what the harness reported just now. Never stored. |
+| observe_error | [string](#string) |  | Set only when GetHarnessRequest.observe is true: why this host cannot serve the harness (isolated or not loaded), or why Describe failed. Never stored. |
+| unservable_reason | [string](#string) |  | Nonempty if this host cannot serve a stored registration. The row remains visible and its name reserved in the journal, ACTIVE or RETIRED. A registration isolated during this host&#39;s startup load remains known locally; Sessions operations needing it fail FAILED_PRECONDITION. A row added by another host after startup is visible here but unknown to this host&#39;s Sessions routing until restart or a local RegisterHarness with the identical compatible spec; selecting it for Create or auto-create Exec fails INVALID_ARGUMENT until loaded. For a RETIRED row, restart this host to serve its existing sessions without reactivating it: RegisterHarness reactivates the row for every host sharing the journal. A pending recorded Resume can still fail FAILED_PRECONDITION under the existing recovery rule. Strict decoding refuses unsupported stored fields and enum values, rather than accepting a partial spec. This is a host-local status, never stored: another compatible host may serve the same row. Do not match on this human-readable explanation. |
+
+
+
+
+
+
+<a name="agentsessions-v1-HarnessSpec"></a>
+
+### HarnessSpec
+HarnessSpec is everything that decides what a session on this harness runs. It is the only
+input to spec_digest, so nothing descriptive (labels, operation ids, timestamps) belongs here.
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| remote | [RemotePlacement](#agentsessions-v1-RemotePlacement) |  |  |
+| substrate | [SubstratePlacement](#agentsessions-v1-SubstratePlacement) |  |  |
+| capabilities | [Capabilities](#agentsessions-v1-Capabilities) |  | The contract the harness declares. resumability is required. Placement still gates every turn on the capabilities the harness reports through Describe. |
+| descriptor_id | [string](#string) |  | Expected HarnessDescriptor.id. When set, Exec, Resume and Fork are refused with FAILED_PRECONDITION, before anything is journaled, if the harness&#39;s Describe reports a different id. It is checked on every call, not at registration. Empty means not checked. The id is what the harness reports about itself, so this catches an address that reaches the wrong harness; it is not authentication. |
+
+
+
+
+
+
+<a name="agentsessions-v1-ListHarnessesRequest"></a>
+
+### ListHarnessesRequest
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| page_size | [int32](#int32) |  | Maximum entries per page. 0 means 50; values above 500 are clamped to 500. Negative is INVALID_ARGUMENT. |
+| page_token | [string](#string) |  | Opaque cursor from a prior ListHarnessesResponse.next_page_token. Empty means the first page. |
+| include_retired | [bool](#bool) |  | Include RETIRED entries. STATIC entries are always included. |
+
+
+
+
+
+
+<a name="agentsessions-v1-ListHarnessesResponse"></a>
+
+### ListHarnessesResponse
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| harnesses | [HarnessRegistration](#agentsessions-v1-HarnessRegistration) | repeated | In name order, STATIC and REGISTERED entries together. |
+| next_page_token | [string](#string) |  | Empty on the last page. |
+
+
+
+
+
+
+<a name="agentsessions-v1-RegisterHarnessRequest"></a>
+
+### RegisterHarnessRequest
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| name | [string](#string) |  | An RFC 1123 DNS label: lowercase alphanumerics and &#39;-&#39;, starting and ending alphanumeric, at most 63 characters. |
+| spec | [HarnessSpec](#agentsessions-v1-HarnessSpec) |  |  |
+
+
+
+
+
+
+<a name="agentsessions-v1-RegisterHarnessResponse"></a>
+
+### RegisterHarnessResponse
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| harness | [HarnessRegistration](#agentsessions-v1-HarnessRegistration) |  |  |
+| outcome | [RegisterOutcome](#agentsessions-v1-RegisterOutcome) |  |  |
+
+
+
+
+
+
+<a name="agentsessions-v1-RemotePlacement"></a>
+
+### RemotePlacement
+RemotePlacement is a harness already running at address, dialed over the Harness service.
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| address | [string](#string) |  | unix:///path/to.sock or host:port. |
+
+
+
+
+
+
+<a name="agentsessions-v1-RetireHarnessRequest"></a>
+
+### RetireHarnessRequest
+
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| name | [string](#string) |  |  |
+| reason | [string](#string) |  | Recorded on the first retire only. |
+
+
+
+
+
+
+<a name="agentsessions-v1-SubstratePlacement"></a>
+
+### SubstratePlacement
+SubstratePlacement runs each session in its own actor created from an ActorTemplate. A host
+serves it only if it was built with a substrate placement backend; otherwise RegisterHarness
+returns FAILED_PRECONDITION.
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| atespace | [string](#string) |  |  |
+| template | [string](#string) |  | ActorTemplate name. |
+
+
+
+
+
+ 
+
+
+<a name="agentsessions-v1-HarnessSource"></a>
+
+### HarnessSource
+
+
+| Name | Number | Description |
+| ---- | ------ | ----------- |
+| HARNESS_SOURCE_UNSPECIFIED | 0 |  |
+| HARNESS_SOURCE_STATIC | 1 | Built into the host or configured when it started. Never stored, always ACTIVE, and read-only through this API: its name cannot be registered or retired. |
+| HARNESS_SOURCE_REGISTERED | 2 | Created through RegisterHarness and stored in the host&#39;s journal database. |
+
+
+
+<a name="agentsessions-v1-HarnessState"></a>
+
+### HarnessState
+
+
+| Name | Number | Description |
+| ---- | ------ | ----------- |
+| HARNESS_STATE_UNSPECIFIED | 0 |  |
+| HARNESS_STATE_ACTIVE | 1 | New sessions may select it. |
+| HARNESS_STATE_RETIRED | 2 | New sessions are refused with FAILED_PRECONDITION. Existing sessions keep Exec, Resume, Suspend and Fork; fork children inherit the harness and are not new selections. |
+
+
+
+<a name="agentsessions-v1-RegisterOutcome"></a>
+
+### RegisterOutcome
+
+
+| Name | Number | Description |
+| ---- | ------ | ----------- |
+| REGISTER_OUTCOME_UNSPECIFIED | 0 |  |
+| REGISTER_OUTCOME_CREATED | 1 | The name was free; the registration is new and ACTIVE. |
+| REGISTER_OUTCOME_UNCHANGED | 2 | The name already held this spec and was ACTIVE. Stored registration unchanged; a host that had not loaded a row added since startup may now serve it locally. |
+| REGISTER_OUTCOME_REACTIVATED | 3 | The name already held this spec and was RETIRED. It is ACTIVE again for every host sharing the journal. To load a RETIRED row for existing sessions without reactivating it, restart the host. |
+
+
+ 
+
+ 
+
+
+<a name="agentsessions-v1-HarnessRegistry"></a>
+
+### HarnessRegistry
+HarnessRegistry manages the harnesses a host can place sessions on. It is an admin API: a caller
+that can register a harness decides where the host sends session history and whose model calls it
+pays for. Keep it off the Sessions listener and control access to it.
+See docs/security.md#operator-access for operator setup and CLI usage.
+
+| Method Name | Request Type | Response Type | Description |
+| ----------- | ------------ | ------------- | ------------|
+| RegisterHarness | [RegisterHarnessRequest](#agentsessions-v1-RegisterHarnessRequest) | [RegisterHarnessResponse](#agentsessions-v1-RegisterHarnessResponse) | Returns CREATED, UNCHANGED or REACTIVATED. ALREADY_EXISTS when the name holds a different spec, or is taken by or reserved for a STATIC harness. FAILED_PRECONDITION when the host cannot serve a new placement. An identical repeat of a registration isolated during startup returns UNCHANGED or REACTIVATED with unservable_reason set; it does not claim this host serves it. An identical compatible repeat of a row added since startup can load it locally without restart. Repeating a RETIRED registration reactivates it for every host sharing the journal; restart the host instead to serve only its existing sessions without reactivation. |
+| GetHarness | [GetHarnessRequest](#agentsessions-v1-GetHarnessRequest) | [HarnessRegistration](#agentsessions-v1-HarnessRegistration) | NOT_FOUND for a name that is neither STATIC nor registered. |
+| ListHarnesses | [ListHarnessesRequest](#agentsessions-v1-ListHarnessesRequest) | [ListHarnessesResponse](#agentsessions-v1-ListHarnessesResponse) |  |
+| RetireHarness | [RetireHarnessRequest](#agentsessions-v1-RetireHarnessRequest) | [HarnessRegistration](#agentsessions-v1-HarnessRegistration) | Idempotent: retiring a RETIRED harness returns it unchanged. FAILED_PRECONDITION for a STATIC harness; NOT_FOUND for an unknown name. |
 
  
 
@@ -792,6 +1231,49 @@ The Sessions control-plane API (client-facing) and the Runtime compute types.
 
 A Session is a durable conversation (event log) plus zero-or-one live incarnation.
 Each Exec is one execution/turn. Fork branches the log at a sequence.
+
+
+<a name="agentsessions-v1-ApproveRequest"></a>
+
+### ApproveRequest
+Approve supplies an explicit decision for one unresolved request in a stateless execution.
+All tuple fields are required and request_seq must be positive. A decision resolves only a
+request owned by this session, not an inherited parent request. Identity is recorded on the
+decision&#39;s Event.actor as provenance, never checked as authorization. No policy hook, expiry,
+automatic decision, or Cancel semantics are implied by this API.
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| session | [string](#string) |  |  |
+| execution_id | [string](#string) |  |  |
+| tool_call_id | [string](#string) |  |  |
+| request_seq | [int64](#int64) |  |  |
+| approved | [bool](#bool) | optional | Required presence: false means deny; absent is INVALID_ARGUMENT. Unlike this request, the journal&#39;s ApprovalResult.approved remains a non-optional bool for compatibility. |
+| reason | [string](#string) |  |  |
+| identity | [IdentityRef](#agentsessions-v1-IdentityRef) |  |  |
+
+
+
+
+
+
+<a name="agentsessions-v1-ApproveResponse"></a>
+
+### ApproveResponse
+A successful Approve commits the decision only, never resumes compute or executes a tool.
+The caller invokes Resume separately. decision is the committed APPROVAL_RESULT LogRecord;
+an exact retry returns that same record, not a new decision or receipt.
+
+
+| Field | Type | Label | Description |
+| ----- | ---- | ----- | ----------- |
+| session | [Session](#agentsessions-v1-Session) |  |  |
+| decision | [LogRecord](#agentsessions-v1-LogRecord) |  |  |
+
+
+
+
 
 
 <a name="agentsessions-v1-CancelRequest"></a>
@@ -906,9 +1388,9 @@ reasoning) part. No seq; never hash-chained (§8, A2A TaskArtifactUpdateEvent).
 | ----- | ---- | ----- | ----------- |
 | session | [string](#string) |  | The session to run against. Empty creates one first, using the server defaults and the harness below, and returns it as the stream&#39;s first frame. A caller that wants to set a project, name, or model still calls CreateSession; this exists so the common case is one call rather than three (create, read the cursor, exec). |
 | inputs | [Message](#agentsessions-v1-Message) | repeated | Input messages for this turn. Empty = resume/re-drive the last non-terminal execution with no new input (recovery after a crash/interruption). |
-| resume_from_seq | [int64](#int64) |  | Cursor handed to the harness as Start.resume_from_seq. The host does not interpret it; only a harness knows what resuming from a sequence means for its own state. To re-read committed records after a disconnect, use Replay, which is the read path for exactly that. |
-| harness | [string](#string) |  | empty = session default |
-| config | [bytes](#bytes) |  | opaque per-execution config, passed through to Start.config |
+| resume_from_seq | [int64](#int64) |  | Cursor handed to the harness as Start.resume_from_seq. The host does not interpret it; only a harness knows what resuming from a sequence means for its own state. To re-read committed records after a disconnect, use Replay, which is the read path for exactly that. Non-zero cursors are journaled in EXECUTION_START and restored during controller replay/interrupted resume. |
+| harness | [string](#string) |  | Empty = the session&#39;s harness. A different harness runs this turn only, unless either one is a registered harness (see HarnessRegistry): then the session is pinned and the call is FAILED_PRECONDITION. |
+| config | [bytes](#bytes) |  | Opaque per-execution config, passed through to Start.config. Non-empty bytes are journaled verbatim in EXECUTION_START before the harness runs, and restored for controller replay/resume. Do not put credentials here: config is durable journal content exposed by Replay. |
 | expected_last_seq | [int64](#int64) | optional | Single-writer CAS: the host commits this execution&#39;s first event only if the log head equals expected_last_seq. A mismatch is ABORTED, meaning another writer advanced the log. It is optional because the guarantee should be opt-in rather than the price of a simple call. Unset means &#34;append at whatever the head is now&#34;, which is what a caller with a single writer wants. Set means the strict check, and 0 is a real value there: it asserts the session has no events yet. That distinction is why this carries explicit presence instead of treating 0 as &#34;unset&#34; -- a caller could not otherwise say &#34;this must be the first turn&#34;. |
 | deadline_unix | [int64](#int64) |  | optional execution deadline (unix seconds); host cancels past it |
 
@@ -938,7 +1420,7 @@ ephemeral streaming Delta (transport only — not logged, not hash-chained).
 <a name="agentsessions-v1-ForkRequest"></a>
 
 ### ForkRequest
-
+Children inherit the parent&#39;s annotations and origin.
 
 
 | Field | Type | Label | Description |
@@ -946,8 +1428,8 @@ ephemeral streaming Delta (transport only — not logged, not hash-chained).
 | session | [string](#string) |  |  |
 | at_seq | [int64](#int64) |  | 0 = HEAD. A REQUIRES_MEMORY_SNAPSHOT harness forks by cloning a memory snapshot, which captures RAM as of now, so it accepts only HEAD; a historical seq is FAILED_PRECONDITION. |
 | count | [int32](#int32) |  | fan-out N children; must be 1..128, else INVALID_ARGUMENT |
-| identity | [IdentityRef](#agentsessions-v1-IdentityRef) |  | optional child principal |
-| labels | [ForkRequest.LabelsEntry](#agentsessions-v1-ForkRequest-LabelsEntry) | repeated |  |
+| identity | [IdentityRef](#agentsessions-v1-IdentityRef) |  | Unsupported: per-child principals are not enforced. Any supplied identity, including an empty message, is INVALID_ARGUMENT before placement or mutation. Leave unset to fork. |
+| labels | [ForkRequest.LabelsEntry](#agentsessions-v1-ForkRequest-LabelsEntry) | repeated | Applied to every child instead of the parent&#39;s labels; never merged or inherited. Unset or empty gives children an empty label map. The parent&#39;s annotations are inherited unchanged. |
 | child_names | [string](#string) | repeated | Display names for the children, in the order they are returned. Length must be 0 or exactly count, else INVALID_ARGUMENT. Left unset, a child&#39;s name is empty rather than a copy of the parent&#39;s. A fork inherits the parent&#39;s workload (project, harness, model) because that is what defines the run, but a name is a caller-supplied label the server has no basis to invent. Copying it makes a listing report N&#43;1 rows that claim to be the same session, and synthesizing one (&#34;&lt;parent&gt; fork 2&#34;) would put a presentation convention in the wire contract and be wrong the moment the same parent is forked by two separate calls. Lineage is already on the child as parent_uid and fork_seq, so a caller that wants a derived label can render one without the server denormalizing it into a string. |
 
 
@@ -1062,7 +1544,7 @@ stable when a session is created mid-pagination; an offset would skip or repeat 
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | session | [string](#string) |  |  |
-| boot | [bool](#bool) |  | true = cold-boot &#43; replay instead of snapshot restore |
+| boot | [bool](#bool) |  | **Deprecated.** Ignored. The service never reads it; the Runtime backend decides how a resumed session comes back. On substrate that is the actor&#39;s own snapshot, else the template&#39;s golden snapshot, else a cold boot, and substrate has no per-resume boot flag to forward it to. The field stays so existing clients keep encoding; do not reuse its number. |
 
 
 
@@ -1100,6 +1582,7 @@ stable when a session is created mid-pagination; an offset would skip or repeat 
 | model | [string](#string) |  | model-agnostic id |
 | exec_state | [ExecState](#agentsessions-v1-ExecState) |  | execution/turn axis |
 | compute_state | [ComputeState](#agentsessions-v1-ComputeState) |  | incarnation axis |
+| pending_approval | [ApprovalRef](#agentsessions-v1-ApprovalRef) |  | Set by hosts supporting approval reporting for a valid unanswered host-owned APPROVAL_REQUEST in the latest first-seen execution at last_seq. Requests/decisions match execution_id, tool_call_id and request_seq. Calls whose TOOL_CALL precedes the child&#39;s latest FORK are excluded. Unset when no request is reportable, approval-bearing evidence is invalid, the projection lags last_seq, or the host does not support reporting. The reference Sessions service leaves it unset. |
 | last_seq | [int64](#int64) |  | event-log cursor |
 | parent_uid | [string](#string) |  | fork lineage |
 | fork_seq | [int64](#int64) |  |  |
@@ -1242,6 +1725,7 @@ flattened lifecycle enum, because collapsing them loses which axis actually move
 | DeleteSession | [DeleteSessionRequest](#agentsessions-v1-DeleteSessionRequest) | [Session](#agentsessions-v1-Session) | Not implemented: the server returns UNIMPLEMENTED. Declared so the delete path can land without a breaking change to the service. |
 | Exec | [ExecRequest](#agentsessions-v1-ExecRequest) | [ExecUpdate](#agentsessions-v1-ExecUpdate) stream | Exec runs one execution/turn. The live stream carries committed LogRecords plus ephemeral Deltas; Replay re-delivers committed records only (read-only). |
 | Replay | [ReplayRequest](#agentsessions-v1-ReplayRequest) | [LogRecord](#agentsessions-v1-LogRecord) stream |  |
+| Approve | [ApproveRequest](#agentsessions-v1-ApproveRequest) | [ApproveResponse](#agentsessions-v1-ApproveResponse) | Not implemented: the reference server returns UNIMPLEMENTED. Supporting hosts commit durable decisions only, never implicitly Resume or execute a tool; exact retries return the existing decision. Identity is provenance, not authorization. |
 | Cancel | [CancelRequest](#agentsessions-v1-CancelRequest) | [Session](#agentsessions-v1-Session) | In-flight control: cancel the running execution. Not implemented: the server returns UNIMPLEMENTED. |
 | Suspend | [SuspendRequest](#agentsessions-v1-SuspendRequest) | [Session](#agentsessions-v1-Session) | Compute-layer durability. There is no warm Pause: no Runtime backend implements a node-local warm checkpoint, so a session goes straight from live to a cold snapshot. cold, free worker |
 | Resume | [ResumeRequest](#agentsessions-v1-ResumeRequest) | [Session](#agentsessions-v1-Session) |  |
