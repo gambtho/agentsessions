@@ -11,8 +11,9 @@ import (
 // liveSink is the host-mediated EventSink for a live turn: it invokes each nondeterministic op and
 // records it to the log, so the identical events can be served on a later replay.
 type liveSink struct {
-	c           *Controller
-	executionID string
+	c              *Controller
+	executionID    string
+	legacyRecovery bool
 }
 
 var _ api.EventSink = (*liveSink)(nil)
@@ -24,26 +25,34 @@ var _ api.EventSink = (*liveSink)(nil)
 // Footgun: the completion is ALREADY recorded as the output here. A harness that also calls
 // Output() with the same content double-records it; use Output() only for additional/streamed text.
 func (s *liveSink) Model(ctx context.Context, req api.ModelRequest) (api.ModelResponse, error) {
-	if _, err := s.c.appendSeq(s.executionID, api.Event{
+	if _, err := s.append(api.Event{
 		Kind:      api.EventModelCall,
 		ModelCall: &api.ModelCall{Model: req.Model, InputHash: hashModelInput(req), ID: newID()},
 	}); err != nil {
 		return api.ModelResponse{}, err
 	}
+	return s.completeModel(ctx, req)
+}
+
+// completeModel invokes the model for a MODEL_CALL that is already recorded and appends the
+// completion as the OUTPUT that answers it: OUTPUT carries no call ID, so its position directly
+// after the MODEL_CALL in the execution's effect stream is the correlation. It is reused verbatim
+// when Resume re-drives a call cut before its completion was recorded.
+func (s *liveSink) completeModel(ctx context.Context, req api.ModelRequest) (api.ModelResponse, error) {
 	resp, err := s.c.invokeModel(ctx, s.executionID, req)
 	if err != nil {
 		return api.ModelResponse{}, err
 	}
 	s.c.liveModelCalls++
 	msg := resp.Message
-	if _, err := s.c.appendSeq(s.executionID, api.Event{Kind: api.EventOutput, Message: &msg}); err != nil {
+	if _, err := s.append(api.Event{Kind: api.EventOutput, Message: &msg}); err != nil {
 		return api.ModelResponse{}, err
 	}
 	return resp, nil
 }
 
 func (s *liveSink) Output(_ context.Context, delta string) error {
-	_, err := s.c.appendSeq(s.executionID, api.Event{Kind: api.EventOutput, Message: api.TextMessage("assistant", delta)})
+	_, err := s.append(api.Event{Kind: api.EventOutput, Message: api.TextMessage("assistant", delta)})
 	return err
 }
 
@@ -56,23 +65,32 @@ func (s *liveSink) ToolCall(ctx context.Context, tc api.ToolCall) (api.ToolResul
 	//     yet implemented, so fail closed rather than execute unapproved.
 	//   - anything else (UNSPECIFIED, or IN_HARNESS_REPORTED which must use Report): reject, so an
 	//     unmediated keyless call cannot slip through and execute/re-drive without dedup (I3 bypass).
-	switch call.Mediation {
-	case api.MediationControllerMediated:
-		// handled below
-	case api.MediationRequiresApproval:
-		return api.ToolResult{}, errors.New("controller: REQUIRES_APPROVAL mediation is not yet implemented")
-	default:
-		return api.ToolResult{}, fmt.Errorf("%w (got %q)", ErrUnmediatedToolCall, call.Mediation)
+	if err := toolMediationError(call.Mediation); err != nil {
+		return api.ToolResult{}, err
 	}
 	// Every host-executed tool MUST carry an idempotency key: the crash-recovery re-drive (§3/I3)
-	// dedups on it. Reject before recording, so a keyless call leaves no unrecoverable intent.
+	// dedups on session UID plus key. Reject before recording, so a keyless call leaves no
+	// unrecoverable intent.
 	if call.IdempotencyKey == "" {
 		return api.ToolResult{}, ErrMissingIdempotencyKey
 	}
-	if _, err := s.c.appendSeq(s.executionID, api.Event{Kind: api.EventToolCall, ToolCall: &call}); err != nil {
+	if _, err := s.append(api.Event{Kind: api.EventToolCall, ToolCall: &call}); err != nil {
 		return api.ToolResult{}, err
 	}
 	return s.execTool(ctx, call)
+}
+
+// toolMediationError is the live pre-intent rejection. Replay may reproduce it when no TOOL_CALL
+// is next or the next call has a different ID; same-ID evidence must still pass the identity check.
+func toolMediationError(mediation api.Mediation) error {
+	switch mediation {
+	case api.MediationControllerMediated:
+		return nil
+	case api.MediationRequiresApproval:
+		return errors.New("controller: REQUIRES_APPROVAL mediation is not yet implemented")
+	default:
+		return fmt.Errorf("%w (got %q)", ErrUnmediatedToolCall, mediation)
+	}
 }
 
 // execTool runs a controller-mediated tool and write-ahead records its TOOL_RESULT. The TOOL_CALL
@@ -85,14 +103,14 @@ func (s *liveSink) execTool(ctx context.Context, call api.ToolCall) (api.ToolRes
 		// (in-harness-reported tools use Report instead).
 		return api.ToolResult{}, errors.New("controller: no tool executor configured")
 	}
-	res, err := s.c.tool(ctx, call)
+	res, err := s.c.tool(ctx, ToolCallContext{SessionUID: s.c.sessionUID}, call)
 	if err != nil {
 		return api.ToolResult{}, err
 	}
 	s.c.liveToolCalls++
 	result := res
 	result.ID = call.ID // the host owns tool-result correlation: the result references its call's ID
-	if _, err := s.c.appendSeq(s.executionID, api.Event{Kind: api.EventToolResult, Result: &result}); err != nil {
+	if _, err := s.append(api.Event{Kind: api.EventToolResult, Result: &result}); err != nil {
 		return api.ToolResult{}, err
 	}
 	return result, nil
@@ -100,13 +118,13 @@ func (s *liveSink) execTool(ctx context.Context, call api.ToolCall) (api.ToolRes
 
 func (s *liveSink) Report(_ context.Context, tr api.ToolResult) error {
 	res := tr
-	_, err := s.c.appendSeq(s.executionID, api.Event{Kind: api.EventToolResult, Result: &res})
+	_, err := s.append(api.Event{Kind: api.EventToolResult, Result: &res})
 	return err
 }
 
 func (s *liveSink) Usage(_ context.Context, u api.Usage) error {
 	usage := u
-	_, err := s.c.appendSeq(s.executionID, api.Event{Kind: api.EventUsage, Usage: &usage})
+	_, err := s.append(api.Event{Kind: api.EventUsage, Usage: &usage})
 	return err
 }
 
@@ -117,6 +135,8 @@ type replaySink struct {
 	stream  []api.Event
 	i       int
 	outputs []string
+	legacy  bool
+	failure error // Tool evidence rejection remains fatal even if the harness handles the error.
 }
 
 var _ api.EventSink = (*replaySink)(nil)
@@ -131,6 +151,9 @@ func (s *replaySink) nextOf(kind api.EventKind) (api.Event, bool) {
 }
 
 func (s *replaySink) Model(_ context.Context, req api.ModelRequest) (api.ModelResponse, error) {
+	if s.failure != nil {
+		return api.ModelResponse{}, s.failure
+	}
 	mc, ok := s.nextOf(api.EventModelCall)
 	if !ok {
 		return api.ModelResponse{}, errors.New("replay: expected a recorded model call, found none")
@@ -151,6 +174,9 @@ func (s *replaySink) Model(_ context.Context, req api.ModelRequest) (api.ModelRe
 }
 
 func (s *replaySink) Output(_ context.Context, delta string) error {
+	if s.failure != nil {
+		return s.failure
+	}
 	ev, ok := s.nextOf(api.EventOutput)
 	if !ok {
 		return errors.New("replay: unexpected output (no matching recorded event)")
@@ -169,21 +195,53 @@ func (s *replaySink) Output(_ context.Context, delta string) error {
 	return nil
 }
 
-func (s *replaySink) ToolCall(context.Context, api.ToolCall) (api.ToolResult, error) {
-	if _, ok := s.nextOf(api.EventToolCall); !ok {
-		return api.ToolResult{}, errors.New("replay: expected a recorded tool call, found none")
+func (s *replaySink) ToolCall(_ context.Context, tc api.ToolCall) (api.ToolResult, error) {
+	if s.failure != nil {
+		return api.ToolResult{}, s.failure
+	}
+	// Live rejects keyless calls before recording intent. Do not consume a later valid call
+	// while reproducing that handleable rejection.
+	if tc.Mediation == api.MediationControllerMediated && tc.IdempotencyKey == "" {
+		return api.ToolResult{}, ErrMissingIdempotencyKey
+	}
+	// A rejected pre-intent call must not consume a distinct fallback's recorded intent.
+	if s.i < len(s.stream) {
+		next := s.stream[s.i]
+		if next.Kind == api.EventToolCall && next.ToolCall != nil && next.ToolCall.ID != tc.ID {
+			if err := toolMediationError(tc.Mediation); err != nil {
+				return api.ToolResult{}, err
+			}
+		}
+	}
+	call, ok := s.nextOf(api.EventToolCall)
+	if !ok {
+		if err := toolMediationError(tc.Mediation); err != nil {
+			return api.ToolResult{}, err
+		}
+		s.failure = fmt.Errorf("%w: replay expected a recorded tool call, found none", ErrReplayDiverged)
+		return api.ToolResult{}, s.failure
+	}
+	if err := matchToolCall(tc, call.ToolCall); err != nil {
+		s.failure = err
+		return api.ToolResult{}, err
 	}
 	tr, ok := s.nextOf(api.EventToolResult)
 	if !ok {
-		return api.ToolResult{}, errors.New("replay: expected a recorded tool result, found none")
+		// Older writers leave no result when the harness handles an executor error. There is
+		// no diagnostic payload to recover, and the next effect belongs to the continuation.
+		return api.ToolResult{}, errors.New("controller: recorded tool call has no result")
 	}
-	if tr.Result == nil {
-		return api.ToolResult{}, nil
+	result, err := recordedToolResult(call.ToolCall, tr.Result)
+	if err != nil {
+		s.failure = err
 	}
-	return *tr.Result, nil
+	return result, err
 }
 
 func (s *replaySink) Report(context.Context, api.ToolResult) error {
+	if s.failure != nil {
+		return s.failure
+	}
 	if _, ok := s.nextOf(api.EventToolResult); !ok {
 		return errors.New("replay: unexpected report (no matching recorded event)")
 	}
@@ -191,6 +249,12 @@ func (s *replaySink) Report(context.Context, api.ToolResult) error {
 }
 
 func (s *replaySink) Usage(_ context.Context, usage api.Usage) error {
+	if s.failure != nil {
+		return s.failure
+	}
+	if s.legacy {
+		return nil // auxiliary accounting was excluded from v0.1.2's effect stream
+	}
 	ev, ok := s.nextOf(api.EventUsage)
 	if !ok {
 		return errors.New("replay: unexpected usage (no matching recorded event)")

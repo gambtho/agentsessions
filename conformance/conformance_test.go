@@ -157,8 +157,8 @@ func TestCrashMidTurnRedriveAtMostOnce(t *testing.T) {
 	recorded, _ := c1.Outputs()
 	s.Close()
 
-	// Simulate a crash that lost only the END record (INPUT, MODEL_CALL, OUTPUT are durable).
-	truncateFrom(t, path, "s", 4)
+	// Simulate a crash that lost only END (EXECUTION_START, INPUT, MODEL_CALL, OUTPUT are durable).
+	truncateFrom(t, path, "s", 5)
 
 	s2, err := sqlitelog.Open(path)
 	if err != nil {
@@ -246,8 +246,8 @@ func TestCrashAfterUsageDoesNotDuplicateAccounting(t *testing.T) {
 	}
 	s.Close()
 
-	// INPUT, MODEL_CALL, OUTPUT, and USAGE are durable; only END was lost.
-	truncateFrom(t, path, "s", 5)
+	// EXECUTION_START, INPUT, MODEL_CALL, OUTPUT, and USAGE are durable; only END was lost.
+	truncateFrom(t, path, "s", 6)
 
 	s2, err := sqlitelog.Open(path)
 	if err != nil {
@@ -391,26 +391,29 @@ func TestIntegrityGoldenVectorCrossImpl(t *testing.T) {
 	}
 }
 
+type toolKey struct{ sessionUID, key string }
+
 // idempotentTool models an external side-effecting tool with tool-side dedup: it counts real
-// effects per idempotency key and returns the cached result for a repeated key. Its state stands in
-// for the tool's OWN durable dedup (e.g. a payment API keyed on the idempotency key), so — like the
+// effects per session and idempotency key and returns the cached result for a repeated pair. Its
+// state stands in for the tool's OWN durable dedup keyed on that pair, so — like the
 // external effect — it survives the simulated controller crash.
 type idempotentTool struct {
-	effects map[string]int
-	results map[string]api.ToolResult
+	effects map[toolKey]int
+	results map[toolKey]api.ToolResult
 }
 
 func newIdempotentTool() *idempotentTool {
-	return &idempotentTool{effects: map[string]int{}, results: map[string]api.ToolResult{}}
+	return &idempotentTool{effects: map[toolKey]int{}, results: map[toolKey]api.ToolResult{}}
 }
 
-func (t *idempotentTool) exec(_ context.Context, tc api.ToolCall) (api.ToolResult, error) {
-	if r, ok := t.results[tc.IdempotencyKey]; ok {
+func (t *idempotentTool) exec(_ context.Context, scope controller.ToolCallContext, tc api.ToolCall) (api.ToolResult, error) {
+	key := toolKey{scope.SessionUID, tc.IdempotencyKey}
+	if r, ok := t.results[key]; ok {
 		return r, nil // deduped: the effect already ran under this key
 	}
-	t.effects[tc.IdempotencyKey]++
+	t.effects[key]++
 	r := api.ToolResult{ID: tc.ID, Output: map[string]any{"ran": true}}
-	t.results[tc.IdempotencyKey] = r
+	t.results[key] = r
 	return r, nil
 }
 
@@ -439,22 +442,23 @@ func (h toolHarness) Run(ctx context.Context, _ *api.Start, sink api.EventSink) 
 func TestCrashMidToolCallAtMostOnce(t *testing.T) {
 	s, path := openFile(t)
 	tool := newIdempotentTool()
-	c1, err := controller.New(s.Session("s"), (&countModel{}).call, controller.WithToolExecutor(tool.exec))
+	c1, err := controller.New(s.Session("s"), (&countModel{}).call, controller.WithSessionUID("s"), controller.WithToolExecutor(tool.exec))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := c1.Exec(context.Background(), toolHarness{key: "k1"}, []api.Message{*api.TextMessage("user", "go")}, 0); err != nil {
 		t.Fatal(err)
 	}
-	// Journal now: INPUT(1) TOOL_CALL(2) TOOL_RESULT(3) END(4); the effect ran exactly once.
-	if tool.effects["k1"] != 1 {
-		t.Fatalf("live: effect ran %d times, want 1", tool.effects["k1"])
+	// Journal now: EXECUTION_START(1) INPUT(2) TOOL_CALL(3) TOOL_RESULT(4) END(5).
+	// The effect ran exactly once.
+	if tool.effects[toolKey{"s", "k1"}] != 1 {
+		t.Fatalf("live: effect ran %d times, want 1", tool.effects[toolKey{"s", "k1"}])
 	}
 	s.Close()
 
-	// Crash lost the TOOL_RESULT and END: the intent (TOOL_CALL, seq 2) is durable, the result is
+	// Crash lost the TOOL_RESULT and END: the intent (TOOL_CALL, seq 3) is durable, the result is
 	// not — the exact window §3 protects against.
-	truncateFrom(t, path, "s", 3)
+	truncateFrom(t, path, "s", 4)
 
 	s2, err := sqlitelog.Open(path)
 	if err != nil {
@@ -464,7 +468,7 @@ func TestCrashMidToolCallAtMostOnce(t *testing.T) {
 	log := s2.Session("s")
 	// Same tool instance: its dedup state is the external tool's, which the controller crash does
 	// not erase.
-	c2, err := controller.New(log, (&countModel{}).call, controller.WithToolExecutor(tool.exec))
+	c2, err := controller.New(log, (&countModel{}).call, controller.WithSessionUID("s"), controller.WithToolExecutor(tool.exec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,8 +481,8 @@ func TestCrashMidToolCallAtMostOnce(t *testing.T) {
 	}
 	// The executor is CALLED again on re-drive, but the same key dedups it — the external effect
 	// fired exactly once across the crash (at-most-once / I3).
-	if tool.effects["k1"] != 1 {
-		t.Fatalf("resume re-ran the side effect: %d times, want 1 (I3 violated)", tool.effects["k1"])
+	if tool.effects[toolKey{"s", "k1"}] != 1 {
+		t.Fatalf("resume re-ran the side effect: %d times, want 1 (I3 violated)", tool.effects[toolKey{"s", "k1"}])
 	}
 	recs, _ := log.Read(1)
 	if recs[len(recs)-1].Event.Kind != api.EventEnd {
@@ -505,7 +509,7 @@ func TestControllerMediatedToolRequiresKey(t *testing.T) {
 	s, _ := openFile(t)
 	defer s.Close()
 	log := s.Session("s")
-	c, err := controller.New(log, (&countModel{}).call, controller.WithToolExecutor(newIdempotentTool().exec))
+	c, err := controller.New(log, (&countModel{}).call, controller.WithSessionUID("s"), controller.WithToolExecutor(newIdempotentTool().exec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,7 +548,7 @@ func TestUnmediatedToolCallRejected(t *testing.T) {
 	s, _ := openFile(t)
 	defer s.Close()
 	log := s.Session("s")
-	c, err := controller.New(log, (&countModel{}).call, controller.WithToolExecutor(newIdempotentTool().exec))
+	c, err := controller.New(log, (&countModel{}).call, controller.WithSessionUID("s"), controller.WithToolExecutor(newIdempotentTool().exec))
 	if err != nil {
 		t.Fatal(err)
 	}

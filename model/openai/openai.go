@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -48,9 +49,10 @@ const DefaultPath = "/chat/completions"
 // request into a session that can never be advanced.
 const defaultTimeout = 2 * time.Minute
 
-// ErrUnsupportedPart reports content this provider cannot represent. It is returned rather than
-// dropped: the log records the request the harness built, so silently sending less than that would
-// make the journal describe a call that never happened, and replay would reproduce the wrong thing.
+// ErrUnsupportedPart reports request content this provider cannot represent: a content part, or the
+// tools and tool choice offered to the model. It is returned rather than dropped: the log records
+// the request the harness built, so silently sending less than that would make the journal describe
+// a call that never happened, and replay would reproduce the wrong thing.
 var ErrUnsupportedPart = errors.New("openai: unsupported content part")
 
 // Client calls an OpenAI-compatible Chat Completions endpoint.
@@ -88,7 +90,9 @@ func WithAPIKey(k string) Option {
 
 // WithHeader sets a request header, replacing any previous value for the same name. It is how an
 // endpoint that authenticates outside the bearer convention is reached (an api-key or x-api-key
-// header), and how a gateway that needs routing or tenant headers is satisfied.
+// header), and how a gateway that needs routing or tenant headers is satisfied. Headers are sent
+// only to the base URL's origin (scheme, host and port): a redirect to any other origin is refused
+// rather than followed, so a credential set here never reaches a host the caller did not configure.
 //
 // This exists because those endpoints differ from OpenAI only in the envelope: the request body
 // they accept is identical, so requiring a separate provider implementation for them would be a
@@ -123,7 +127,9 @@ func WithModel(m string) Option {
 	}
 }
 
-// WithHTTPClient supplies the HTTP client, for custom transports, proxies, or tests.
+// WithHTTPClient supplies the HTTP client, for custom transports, proxies, or tests. The client is
+// copied, not modified: the copy refuses redirects that leave the base URL's origin and then
+// applies h.CheckRedirect, if any, to the redirects it allows.
 func WithHTTPClient(h *http.Client) Option {
 	return func(c *Client) {
 		if h != nil {
@@ -148,7 +154,62 @@ func New(opts ...Option) (*Client, error) {
 	if c.model == "" {
 		return nil, errors.New("openai: a default model is required (WithModel)")
 	}
+	c.http = sameOriginClient(c.http)
 	return c, nil
+}
+
+// maxRedirects is net/http's default redirect limit, which setting CheckRedirect replaces.
+const maxRedirects = 10
+
+// sameOriginClient returns a shallow copy of h whose redirect policy refuses any redirect that
+// leaves the origin of the original request.
+//
+// net/http copies a request's headers onto every redirect it follows and strips only
+// Authorization, WWW-Authenticate and Cookie, and only when the target is neither the same host nor
+// a subdomain of it (another port, or a subdomain, keeps even those), so a custom credential header
+// (api-key, x-api-key) would otherwise reach whatever host a provider or proxy redirects to. A 307
+// or 308 also resends the body. Refusing the hop is the only policy that keeps every configured
+// header on the configured origin.
+//
+// h is copied rather than modified because the caller may share it with other code. A policy h
+// already has runs after this one allows the redirect, and replaces the default limit, as it would
+// on h itself.
+func sameOriginClient(h *http.Client) *http.Client {
+	cp := *h
+	next := h.CheckRedirect
+	cp.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		from, to := via[0].URL, req.URL
+		if origin(from) != origin(to) {
+			// Name the origins, never a header value: the headers carry the credential.
+			return fmt.Errorf("refusing redirect from %s://%s to %s://%s: configured headers are sent only to the base URL's origin",
+				from.Scheme, from.Host, to.Scheme, to.Host)
+		}
+		if next != nil {
+			return next(req, via)
+		}
+		if len(via) >= maxRedirects {
+			return fmt.Errorf("stopped after %d redirects", maxRedirects)
+		}
+		return nil
+	}
+	return &cp
+}
+
+// origin returns u's scheme, host and port in a comparable form. Scheme and host compare
+// case-insensitively, and an explicit default port matches an omitted one, so
+// https://Host:443 and https://host are the same origin.
+func origin(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return scheme + "://" + strings.ToLower(u.Hostname()) + ":" + port
 }
 
 // Model performs one live completion. It satisfies controller.ModelFunc.
@@ -271,6 +332,11 @@ func (c *Client) buildRequest(req api.ModelRequest, stream bool) (string, []byte
 		// harnesses run against a real endpoint without every one of them hard-coding a model.
 		model = c.model
 	}
+	// Tool definitions are not mapped to this endpoint yet. Sending the call without them would
+	// let the model answer a request the harness never made while the journal hashes the tools in.
+	if len(req.Tools) > 0 || req.ToolChoice != nil {
+		return model, nil, fmt.Errorf("%w: tool definitions and tool choice are not supported yet", ErrUnsupportedPart)
+	}
 	msgs, err := toChatMessages(req.Messages)
 	if err != nil {
 		return model, nil, err
@@ -320,8 +386,9 @@ func statusError(model string, code int, raw []byte) error {
 // toChatMessages converts the neutral content model to chat messages.
 //
 // Reasoning parts are dropped on the way OUT by design: they are opaque provider state recorded for
-// replay continuity (I2), not input this endpoint accepts. File and data parts are refused instead,
-// because dropping them would change what the model saw while the journal still claims otherwise.
+// replay continuity (I2), not input this endpoint accepts. Every other part this adapter cannot map
+// (file, data, tool call, tool result, or a kind it does not know) is refused instead, because
+// dropping it would change what the model saw while the journal still claims otherwise.
 func toChatMessages(msgs []api.Message) ([]chatMessage, error) {
 	out := make([]chatMessage, 0, len(msgs))
 	for i := range msgs {
@@ -337,6 +404,12 @@ func toChatMessages(msgs []api.Message) ([]chatMessage, error) {
 				return nil, fmt.Errorf("%w: file parts are not supported yet", ErrUnsupportedPart)
 			case p.Data != nil:
 				return nil, fmt.Errorf("%w: data parts are not supported yet", ErrUnsupportedPart)
+			case p.ToolCall != nil:
+				return nil, fmt.Errorf("%w: tool call parts are not supported yet", ErrUnsupportedPart)
+			case p.ToolResult != nil:
+				return nil, fmt.Errorf("%w: tool result parts are not supported yet", ErrUnsupportedPart)
+			default:
+				return nil, fmt.Errorf("%w: part with no known content", ErrUnsupportedPart)
 			}
 		}
 		role := m.Role

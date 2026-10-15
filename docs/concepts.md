@@ -57,7 +57,9 @@ that tries. A session goes from live to a cold snapshot and back.
 
 The log holds what happened. It does not hold what the session *is* — the project that owns it, its
 display name, the configured harness and model — because none of that is an event. That lives in a
-metadata row alongside the log, written by `CreateSession` before any event exists.
+metadata row alongside the log, written by `CreateSession` before any event exists. Caller-supplied
+`labels` and `annotations` are stored there as JSON and returned by `CreateSession`, `GetSession` and
+`ListSessions`, including after the journal is reopened.
 
 This is why a session that was just created, with no turns and no compute, still shows up in
 `ListSessions`. A listing derived from the event table alone would drop exactly the sessions a user
@@ -91,6 +93,17 @@ entries or exactly `count` of them. Lineage is not lost by this: `parent_uid` an
 stored on the child, so a caller that wants to show "branched from X" has the structured data to
 build it from and does not need the server to flatten it into a string.
 
+Map metadata follows a separate rule: each child gets exactly `ForkRequest.labels`, never a merge
+with or copy of the parent's labels. Leaving request labels unset or empty gives children an empty
+label map. The parent's `annotations` and `origin` are inherited unchanged. Both maps are persisted
+and returned in the fork response and subsequent `GetSession` and `ListSessions` calls.
+
+`ForkRequest.identity` is unsupported because per-child principals are not enforced. Any supplied
+identity, even an empty message, is rejected with `INVALID_ARGUMENT` before placement,
+provisioning, or journal mutation. Leave it unset to fork; children do not inherit the parent's
+identity. This does not change `Session.identity`, which remains recorded provenance rather than
+authorization (see [security posture](security.md)).
+
 ## Event and the typed log
 
 The session log is a sequence of `Event`s. An event is not an opaque blob: it is typed, so provenance,
@@ -99,6 +112,7 @@ cost, audit, and tool approval are first-class rather than parsed out of text af
 
 | Kind | Meaning |
 |---|---|
+| `EXECUTION_START` | Host-owned execution config, cursor, input count, resolved harness name and advertised version, recorded before inputs for every new execution. |
 | `INPUT` | A user or producer input message. |
 | `MODEL_CALL` | A call to a model was made (records the model, params, and an input hash for the replay check). |
 | `OUTPUT` | Assistant output (a delta or a full message). |
@@ -109,9 +123,135 @@ cost, audit, and tool approval are first-class rather than parsed out of text af
 | `END` | The terminal state of one execution (`COMPLETED` / `FAILED` / `CANCELED`). |
 | `ERROR` | An error, mirroring a gRPC status. |
 
-The same `Event` type is shared by the session log and the harness stream, so what a harness emits is
-exactly what gets journaled. Content is carried as A2A-style `Message`s (a role plus a list of `Part`s:
-text, file, structured data, or an opaque reasoning block).
+The same `Event` type is shared by the session log and the harness stream. Durable harness events
+become journal records alongside host-owned invocation and lifecycle records. `PARKED` is a
+transport-only acknowledgement in the declared approval protocol, never a durable log outcome.
+The reference controller and bridge reject approval-gated calls; `Sessions.Approve` is declared
+but returns `UNIMPLEMENTED`. Content is
+carried as A2A-style `Message`s (a role plus a list of `Part`s: text, file, structured data, an opaque
+reasoning block, a model's tool call, or a tool's result).
+
+### Captured storage approval projection
+
+SQLite schema 3 reduces approval evidence while appending each persisted protobuf event, in the
+same transaction as metadata and the projection cursor. `SessionInfo.LastSeq` is derived from the
+indexed event head. `sqlitelog.SessionInfo.PendingApproval` selects a valid unanswered request in
+the latest first-seen execution, matching execution ID, tool-call ID and request sequence. Calls
+whose TOOL_CALL precedes the child's latest FORK are excluded; a later call in an inherited
+execution belongs to the child. Invalid approval-bearing evidence suppresses references;
+malformed nongated history does not. A projection that lags the event head also suppresses the
+reference. If an already-open older writer skips projection updates, later appends do not restore
+reporting for that session by skipping the missing evidence.
+
+This store-level projection does not enable the public approval workflow: Session replies still
+leave `pending_approval` unset. Host-only approval requests/decisions do not make cold compute live.
+The captured values remain valid after later appends, but are not an integrity check for direct
+out-of-band database edits. The v2 backfill preserves journal bytes/hashes and isolates undecodable
+sessions without exposing actionable references; SQL errors roll back. Older binaries refuse to
+reopen schema 3, so keep a backup if downgrade may be needed.
+
+### Durable execution invocation
+
+The controller commits an `EXECUTION_START` before inputs or harness execution for every new
+execution, including default-config, zero-cursor turns. It preserves opaque config bytes verbatim,
+including binary data and whitespace, and records the harness cursor and expected `INPUT` count at
+the same boundary. A direct `Controller.Exec` with no inputs records an explicit zero count.
+The caller's `expected_last_seq` guards this first committed record; if that append fails, neither
+the harness nor the model runs.
+
+The marker also records the executing **registry name**, which may differ from the harness's
+`Descriptor.ID`, and its advertised `Descriptor.Version`. Standalone controller/Placer calls use
+the descriptor ID as the name unless an explicit host harness option supplies an alias. The
+reference harnesses advertise replay version `"1"`; this is an author-owned implementation token,
+not the host binary's release/build version.
+
+Versioning is opt-in. Exec accepts an unversioned harness and records an empty version. Controller
+Replay checks all completed invocations against its single supplied harness before the first `Run`;
+interrupted Resume checks its selected turn before `Run`. A nonempty recorded version must match
+exactly, including rejection of an empty served version. No trimming or semantic-version ordering
+is applied. An empty recorded version retains existing behavior without a version check. Mismatches
+return `ErrHarnessMismatch` or `ErrHarnessVersionMismatch` without harness `Run`, model, or tool calls or new
+execution records; placement can already have allocated/restored compute and advanced its fence.
+Controller Replay is not a multi-harness dispatcher: callers supply a matching harness/name or it
+fails closed. `Sessions.Replay` still streams stored records without running or checking a harness.
+
+`Sessions.Resume` routes an interrupted turn to its recorded registry entry, including that entry's
+backend, model and tool executor. An unserved recorded name or mismatched version is
+`FAILED_PRECONDITION`, never fallback to another harness. Restore the recorded entry/version before
+retrying. A new Exec can supersede an interrupted turn and records its own invocation identity.
+An override is still per-turn: session metadata is unchanged and a later Exec with no override uses
+the stored default. Completed Resume, Suspend and Fork retain their existing session-default routing.
+
+Older start markers without a name fall back to the session's stored harness; those without a
+version retain unversioned behavior. These rules apply independently if only one field is missing,
+and do not relax input-count validation. Remote checks use `Describe`, not negotiation on the
+`Connect` stream; an endpoint/replica changing between those calls remains the documented
+[operator-controlled address limitation](security.md).
+
+The marker and inputs are separate appends. If an input append fails, or the process dies before all
+inputs commit, the marker's count prevents recovery from running a different invocation. Before any
+harness runs, controller Replay validates every completed invocation's count, and Resume validates
+the last interrupted invocation. Missing/negative counts, mismatched committed input counts, and
+payloadless `INPUT` records return `ErrInvalidExecutionLog` without running the harness/model/tool or
+appending execution records. Explicit zero permits genuinely inputless invocations; all inputs
+committed before a crash permits resume even if the harness has not run yet. Completed Replay skips
+an incomplete trailing invocation and remains read-only. A historical fork cut before all expected
+inputs likewise cannot resume, but completed prefixes and complete invocation boundaries still work.
+
+For ID-bearing executions, controller replay and interrupted-turn resume reconstruct each `Start`
+from its own recorded values, including in inherited fork prefixes. `History` is the exact prior
+journal prefix: it excludes the
+current execution's start marker and inputs, but retains markers from prior executions. Replay is
+read-only; recovery serves already-recorded effects rather than repeating them. The harness cursor
+is opaque and distinct from the append CAS cursor.
+
+**Legacy logs:** an execution without an `EXECUTION_START` reconstructs with empty config and a zero
+cursor, regardless of a new controller's `WithStart` option. Older builds discarded these values;
+non-empty config or non-zero cursors from those executions cannot be recovered retroactively. No
+SQLite schema migration or rewriting of existing records is needed. Experimental start markers
+without `input_count` fail closed when their invocation is selected for resume or is completed for
+replay: absence cannot distinguish a genuine inputless turn from lost inputs. Markerless logs retain
+their prior behavior and lack completeness information; only older writers omit the marker.
+
+Released v0.1.2 journals also lack execution IDs. Compatibility recognizes only their ID-less
+execution event kinds (`INPUT`, `MODEL_CALL`, `OUTPUT`, `TOOL_CALL`, `TOOL_RESULT`, `USAGE`,
+`END`, `ERROR`), with session-scoped lifecycle records allowed. Output deltas were ephemeral,
+not journal records. Controller Replay preserves v0.1.2's one whole-log harness invocation:
+all recorded inputs and the entire legacy journal as `History`, even for an unfinished log;
+usage is excluded from the served effect stream. Multi-turn legacy journals retain the old
+replay limitation (for example, echo can fail its model-input hash check), because inferring
+turn boundaries would change historical behavior. Controller Resume instead selects only the
+last `INPUT`, supplies its prior history, and continues an interrupted turn with ID-less records.
+Legacy harness invocations receive a `legacy-<sha256>` compatibility ID in `Start` and transport
+frames only. The digest includes the host-bound session UID, the original input record's sequence
+position, and its canonical event content (whole-log Replay uses the first input; Resume uses the
+last). If Replay has no input, it uses the first legacy record. Retrying the same turn preserves the
+ID while the turn remains pending; identical legacy bytes in different sessions have distinct
+IDs. A recorded END or ERROR finishes a legacy turn, so Resume then becomes a no-op. This namespace cannot collide with the controller's hexadecimal modern IDs. The token is
+never copied into journal event identity, including when echoed by a remote harness. Direct
+controller callers must bind a nonempty `WithSessionUID`; a selected legacy invocation without it
+returns `ErrMissingSessionUID` before running the harness or appending execution records.
+It still refuses unresolved inherited tool intents; a recorded model intent without a completion
+still fails recovery rather than repeating the model call.
+
+A new Exec may follow a completed, errored or unfinished legacy tail, just as v0.1.2 allowed another
+Exec after a failure. Its `EXECUTION_START` is an explicit legacy boundary even without a preceding
+END. Mixed Replay reconstructs the complete legacy prefix with its whole-log semantics, skips the
+abandoned failed/incomplete tail, and replays each completed modern execution normally; modern
+`History` still includes every original legacy event because Exec saw that same history. Resume
+selects the last modern turn rather than reviving the superseded tail. A completed legacy prefix
+includes a v0.1.2 crash recovered by the upgraded controller before a new Exec. ID-bearing modern
+events without a start marker still require a finished legacy boundary; remaining invalid-log
+refusals return `FAILED_PRECONDITION` through Sessions Exec/Resume.
+Once an `EXECUTION_START` or ID-bearing execution event appears, subsequent ID-less execution
+events are invalid, not legacy. ID-less start markers and other non-legacy kinds likewise fail
+closed. Existing records and hashes are never rewritten.
+
+**Rollback compatibility:** binaries older than this release fail chain verification for sessions
+containing `EXECUTION_START`, reporting a `content_hash` mismatch. Rollback is not supported for any
+session that executed a turn on this release, including existing markerless sessions that execute
+another turn after upgrading. Replay streams and harness `History` now carry one extra
+`EXECUTION_START` event per turn (in `History`, only prior turns).
 
 ## The event log: single writer, append-only, tamper-evident
 
@@ -204,8 +344,9 @@ sequenceDiagram
   participant M as Model
 
   C->>Ctrl: Exec(input, expectedLastSeq)
+  Ctrl->>Log: append EXECUTION_START (CAS + fence + hash)
   Ctrl->>Log: append INPUT (CAS + fence + hash)
-  Ctrl->>H: Run(Start{Inputs, History})
+  Ctrl->>H: Run(Start{Config, ResumeFromSeq, Inputs, History})
   H->>Ctrl: sink.Model(request)
   Ctrl->>M: invoke model (live only)
   M-->>Ctrl: completion
