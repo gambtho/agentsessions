@@ -855,11 +855,11 @@ func TestServerNormalClosureSealsRetainedSink(t *testing.T) {
 }
 
 func TestApprovalReportAcceptsExecutorError(t *testing.T) {
-	server := NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
+	server := harnesswire.NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
 		return sink.Report(ctx, api.ToolResult{ID: "ordinary", Code: api.ToolResultCodeExecutorError, IsError: true})
 	}})
 	host := &gateHost{}
-	if err := NewClientHarness(approvalClient(t, server)).Run(approvalContext(t), &api.Start{SessionUID: "session", ExecutionID: "exec"}, host); err != nil {
+	if err := harnesswire.NewClientHarness(approvalClient(t, server)).Run(approvalContext(t), &api.Start{SessionUID: "session", ExecutionID: "exec"}, host); err != nil {
 		t.Fatal(err)
 	}
 	if host.reports != 1 {
