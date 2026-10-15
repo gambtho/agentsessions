@@ -128,7 +128,8 @@ provide.
   migration/append failures roll back; database and metadata decode failures remain `INTERNAL`.
   `last_seq` remains journal-derived when an already-open older writer skips projection updates;
   lagging references stay suppressed across later appends and deletion. Low-level Append refuses
-  transport-only `PARKED`; remote reports with host receipt status/correlation are rejected.
+  transport-only `PARKED`; remote reports with host-owned approval receipt fields or codes other
+  than `CODE_UNSPECIFIED`/`EXECUTOR_ERROR` are rejected. `EXECUTOR_ERROR` remains accepted on reports.
 - Approval requests and suspended snapshots/handles are retained indefinitely, without expiry,
   automatic decision or reclamation. Cancel remains `UNIMPLEMENTED`; decisions
   provide no cancellation/teardown, policy hook, approval timeout or authorization. Identity is
