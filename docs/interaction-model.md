@@ -159,8 +159,9 @@ use `Suspend` to retry the recorded route's cold transition when needed.
 All Session replies use the same durable append-transaction projection, read atomically with
 metadata and `last_seq`; no query decodes journal events. An owned unanswered request in the latest
 first-seen execution reports `EXEC_AWAITING`; it exposes `pending_approval` only while the session
-is ACTIVE. Requests/decisions match execution ID, call ID and request sequence. A child's FORK excludes executions first seen before
-that marker, including their later calls/requests; a new child execution can own a request.
+is ACTIVE. Requests/decisions match execution ID, call ID and request sequence. A child's FORK
+excludes calls whose TOOL_CALL precedes that marker; a later call in an inherited execution can
+own a request.
 
 Malformed approval-bearing history withholds references even for a valid latest request, matching
 strict command inspection; malformed nongated history does not. Undecodable v2 journals are isolated
@@ -314,8 +315,9 @@ Real today, and worth knowing before you build on it:
 - **A harness registered by address is stateless-replay only.** `runtime/remote` attaches to a
   harness it did not start, so it cannot capture that process's memory and `CanPlace` refuses a
   `REQUIRES_MEMORY_SNAPSHOT` harness on it. Run those on a backend that owns the sandbox.
-- **Registering a harness by address takes a restart.** `agentsessionsd` reads `--harness` at
-  startup; there is no API to add one to a running host.
+- **`--harness` is read at startup.** Adding a harness with the flag takes a restart. To register
+  one on a running host, use the operator-only `HarnessRegistry` API on `--registry-addr` (see
+  [security.md](security.md#operator-access)).
 - **History is pushed whole on every turn.** The controller hands the harness the full log each
   time, which is fine for demos and does not scale to long sessions.
 - **Execution status is not admission authority.** An owned unresolved host approval is narrowly

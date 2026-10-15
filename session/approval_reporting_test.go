@@ -10,8 +10,8 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// Rendering must use first-seen execution ownership, not the gated call's sequence.
-// Late older records cannot select a different execution. Invalid gated histories withhold
+// Rendering selects the latest first-seen execution, then uses the gated call's sequence
+// for fork ownership. Late older records cannot select a different execution. Invalid gated histories withhold
 // references just like strict inspection; malformed nongated histories do not.
 func TestApprovalReportingOwnershipAndInterleaving(t *testing.T) {
 	start := func(id string) api.Event {
@@ -30,9 +30,9 @@ func TestApprovalReportingOwnershipAndInterleaving(t *testing.T) {
 		seq    int64
 		id     string
 	}{
-		{"late inherited call", []api.Event{start("inherited"), fork, call("inherited"), request("inherited")}, 0, ""},
+		{"late owned call", []api.Event{start("inherited"), fork, call("inherited"), request("inherited")}, 4, "inherited"},
 		{"new child execution", []api.Event{start("inherited"), fork, start("own"), call("own"), request("own")}, 5, "own"},
-		{"nested fork excludes child execution", []api.Event{start("parent"), fork, start("child"), fork, call("child"), request("child")}, 0, ""},
+		{"nested fork owns later child call", []api.Event{start("parent"), fork, start("child"), fork, call("child"), request("child")}, 6, "child"},
 		{"new nested execution", []api.Event{start("parent"), fork, start("child"), fork, start("grandchild"), call("grandchild"), request("grandchild")}, 7, "grandchild"},
 		{"late old malformed gated evidence", []api.Event{start("old"), start("latest"), call("latest"), request("latest"), request("old")}, 0, ""},
 		{"malformed nongated history", []api.Event{{ExecutionID: "old", Kind: api.EventExecutionStart}, start("latest"), call("latest"), request("latest")}, 4, "latest"},

@@ -57,11 +57,12 @@ func (s *Store) DeleteSession(ctx context.Context, uid string) (SessionInfo, err
 	if err != nil {
 		return fail("append intent", err)
 	}
-	// Like the lifecycle branch of projectApproval, DELETE advances only the captured
-	// cursor, not execution evidence. Keep it in the same context-bound metadata write.
+	// Like projectApproval, DELETE must not restore reporting over a gap left by an
+	// older writer. Keep the cursor and suppression in this context-bound metadata write.
 	if _, err := tx.ExecContext(ctx, `UPDATE sessions SET deletion_state = ?, deletion_requested_at = ?,
-		deletion_seq = ?, last_seq = ?, fence = ?, updated_at = ? WHERE session = ?`,
-		string(api.DeletionPending), now.UnixNano(), record.Seq, record.Seq, record.Fence, now.UnixNano(), uid); err != nil {
+		deletion_seq = ?, approval_corrupt = CASE WHEN last_seq != ? THEN 1 ELSE approval_corrupt END,
+		last_seq = ?, fence = ?, updated_at = ? WHERE session = ?`,
+		string(api.DeletionPending), now.UnixNano(), record.Seq, info.LastSeq, record.Seq, record.Fence, now.UnixNano(), uid); err != nil {
 		return fail("update intent", err)
 	}
 	out, err := txSessionInfo(ctx, tx, uid)
