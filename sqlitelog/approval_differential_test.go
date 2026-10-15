@@ -19,6 +19,7 @@ func TestApprovalProjectionMatchesStrictEvidence(t *testing.T) {
 		events []api.Event
 	}{
 		{"success then second call", append(append(append([]api.Event{}, base...), decision, receipt), api.Event{ExecutionID: "execution", Kind: api.EventToolCall, ToolCall: &api.ToolCall{ID: "second", IdempotencyKey: "second-key", Mediation: api.MediationRequiresApproval}}, api.Event{ExecutionID: "execution", Kind: api.EventApprovalRequest, Approval: &api.ApprovalRequest{ToolCallID: "second"}})},
+		{"child gate in inherited execution", []api.Event{base[0], {Kind: api.EventLifecycle, Lifecycle: &api.Lifecycle{Kind: api.LifecycleFork}}, base[1], base[2]}},
 		{"duplicate request", append(append([]api.Event{}, base...), base[2])},
 		{"duplicate decision", append(append([]api.Event{}, base...), decision, decision)},
 		{"duplicate gated call ID", append(append([]api.Event{}, base...), decision, receipt, base[1])},

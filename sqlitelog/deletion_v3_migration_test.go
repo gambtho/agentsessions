@@ -10,13 +10,13 @@ import (
 	"github.com/aramase/agentsessions/sqlitelog"
 )
 
-// Creator: #122 SHA 2c805c7c6b04b5886c2ee356400e4dbeba102d9e.
-// SHA-256: 1f83222a0af923da10b77dd9f8a2b3e6699cf3a4780537c5f8d134c93f2c8ec4.
+// Creator: approval controller slice SHA e600869 (revised unreleased v3 with call_seq).
+// SHA-256: b341bfbbbb8aba2f2440ff4c39fe244aeb067163276092055bae53878c5e19da.
 // Contains empty, parked and decided-without-receipt sessions, a retired registration
 // and a reserved static route, persisted through the first-lander public store API.
 const approvalV3Fixture = "testdata/approval-v3.db"
 
-// This file was written by actual #122, not current Open with a relabeled stamp.
+// This file was written by the actual v3 store, not current Open with a relabeled stamp.
 // The deletion rung must preserve the whole scalar approval projection and persisted audit.
 func TestDeletionUpgradesGenuineApprovalV3(t *testing.T) {
 	path := copyFixture(t, approvalV3Fixture)

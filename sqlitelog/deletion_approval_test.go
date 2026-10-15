@@ -15,7 +15,7 @@ import (
 // A bypass DELETE writer must advance the captured cursor, without reducing approval
 // execution evidence or touching compute; even historical decision retries lose authority.
 func TestDeletionPreservesApprovalProjectionAndRejectsDecisions(t *testing.T) {
-	for _, shape := range []string{"empty", "parked", "approved"} {
+	for _, shape := range []string{"empty", "parked", "approved", "lagging"} {
 		t.Run(shape, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "session.db")
 			s := deletionStore(t, path)
@@ -37,6 +37,15 @@ func TestDeletionPreservesApprovalProjectionAndRejectsDecisions(t *testing.T) {
 					if _, err := controller.Approve(log, decision); err != nil {
 						t.Fatal(err)
 					}
+				}
+			}
+			if shape == "lagging" {
+				// The last SUSPEND was appended by a writer that skipped the projection.
+				if _, err := s.db.Exec(`UPDATE sessions SET last_seq=3 WHERE session='s'`); err != nil {
+					t.Fatal(err)
+				}
+				if info := deletionInfo(t, s, "s"); info.LastSeq != 4 || info.PendingApproval != (api.ApprovalRef{}) {
+					t.Fatalf("lagging projection: %+v", info)
 				}
 			}
 			before := captureDeletion(t, s, "s")
