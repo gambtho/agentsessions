@@ -17,7 +17,8 @@ var ErrApprovalUnavailable = errors.New("controller: approval requires STATELESS
 // ErrInvalidApprovalCall rejects missing or reused gated call identities before intent is written.
 var ErrInvalidApprovalCall = errors.New("controller: invalid approval call identity")
 
-// ErrApprovalReceiptReport rejects in-harness reports carrying host-owned approval receipt fields.
+// ErrApprovalReceiptReport rejects harness reports and ordinary executor replies carrying
+// host-owned approval receipt fields or unsupported result codes.
 var ErrApprovalReceiptReport = errors.New("controller: approval receipts are host owned")
 
 // ErrMissingToolExecutor is a recoverable host precondition, not an executor-failure receipt.
@@ -28,7 +29,7 @@ func approvalPark(state *ApprovalState) error {
 }
 
 func approvalReportError(result api.ToolResult) error {
-	if result.Approval != nil || result.ApprovalRequestSeq != 0 || result.ApprovalDecisionSeq != 0 || result.Code == api.ToolResultCodeApprovalDenied {
+	if result.Approval != nil || result.ApprovalRequestSeq != 0 || result.ApprovalDecisionSeq != 0 || (result.Code != api.ToolResultCodeUnspecified && result.Code != api.ToolResultCodeExecutorError) {
 		return ErrApprovalReceiptReport
 	}
 	return nil
