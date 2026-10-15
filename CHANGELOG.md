@@ -89,6 +89,11 @@ provide.
   or hashes are rewritten, and no wire fields change. Older hosts refuse v5; this host also refuses
   required, unknown or missing authorization markers at v5 because it cannot enforce caller access.
   Back up before upgrading. Sessions RPCs remain unauthenticated and unenforced.
+- `Approve` and a stateful `Fork` on the same session now exclude each other through the shared
+  checkpoint mark. A refused approval returns `ABORTED` without minting a fence or writing a
+  decision; retry after the fork finishes. This coordination covers one Registry/host only.
+- Ordinary `Resume` and `Suspend` now return `ABORTED`, rather than `INTERNAL`, for journal CAS
+  conflicts (`eventlog.ErrConflict`) and superseded fences (`eventlog.ErrFenced`).
 - The `DeleteSession` contract defines permanent soft deletion: retain the UID, metadata and
   hash-chained journal forever, hide it from `ListSessions`, and keep `GetSession` and raw
   `Sessions.Replay` for audit. Deleted UIDs cannot be reused or mutated through `Exec`, historical
