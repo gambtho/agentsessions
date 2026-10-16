@@ -8,7 +8,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	v1 "github.com/aramase/agentsessions/api/genpb"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
 )
 
 // Deleted admission beats route/CAS/recovery faults on valid requests, while existing

@@ -13,13 +13,13 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/aramase/agentsessions/api"
-	v1 "github.com/aramase/agentsessions/api/genpb"
-	"github.com/aramase/agentsessions/eventlog"
-	"github.com/aramase/agentsessions/harness/echoagent"
-	"github.com/aramase/agentsessions/placement"
-	"github.com/aramase/agentsessions/runtime/local"
-	"github.com/aramase/agentsessions/sqlitelog"
+	"github.com/agent-primitives/sessions/api"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
+	"github.com/agent-primitives/sessions/eventlog"
+	"github.com/agent-primitives/sessions/harness/echoagent"
+	"github.com/agent-primitives/sessions/placement"
+	"github.com/agent-primitives/sessions/runtime/local"
+	"github.com/agent-primitives/sessions/sqlitelog"
 )
 
 type deleteBackend struct {
@@ -164,7 +164,7 @@ func TestDeletePublicGRPCAuditRetryAndReopen(t *testing.T) {
 				t.Fatal(err)
 			}
 			uid := active.GetMetadata().GetUid()
-			if active.GetDeletionState() != v1.DeletionState_DELETION_ACTIVE || active.GetDeletionRequestedTime() != nil || active.GetDeletionCompletedTime() != nil {
+			if active.GetDeletionState() != v1.DeletionState_DELETION_ACTIVE || active.GetDeletionRequestedTime() != nil {
 				t.Errorf("active deletion fields=%v", active)
 			}
 			wantExec, wantCompute := v1.ExecState_EXEC_PENDING, v1.ComputeState_COMPUTE_NONE
@@ -205,7 +205,7 @@ func TestDeletePublicGRPCAuditRetryAndReopen(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if deleted.GetDeletionState() != v1.DeletionState_DELETION_PENDING || deleted.GetDeletionRequestedTime() == nil || deleted.GetDeletionCompletedTime() != nil {
+			if deleted.GetDeletionState() != v1.DeletionState_DELETION_PENDING || deleted.GetDeletionRequestedTime() == nil {
 				t.Errorf("deletion state/times=%v", deleted)
 			}
 			if deleted.GetExecState() != wantExec || deleted.GetComputeState() != wantCompute || deleted.GetLastSeq() != before.GetLastSeq()+1 {
@@ -217,7 +217,6 @@ func TestDeletePublicGRPCAuditRetryAndReopen(t *testing.T) {
 			normalized := proto.Clone(deleted).(*v1.Session)
 			normalized.DeletionState = before.DeletionState
 			normalized.DeletionRequestedTime = nil
-			normalized.DeletionCompletedTime = nil
 			normalized.LastSeq = before.LastSeq
 			normalized.Metadata.UpdateTime = before.Metadata.UpdateTime
 			if !proto.Equal(before, normalized) {

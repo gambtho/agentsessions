@@ -8,8 +8,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/aramase/agentsessions/api"
-	"github.com/aramase/agentsessions/sqlitelog"
+	"github.com/agent-primitives/sessions/api"
+	"github.com/agent-primitives/sessions/sqlitelog"
 )
 
 // This is the original v0.1.x CREATE, not a fixture made through the current Open.

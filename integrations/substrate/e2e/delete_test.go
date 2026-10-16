@@ -11,9 +11,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/aramase/agentsessions/api"
-	ateadapter "github.com/aramase/agentsessions/integrations/substrate"
-	"github.com/aramase/agentsessions/runtime/substrate"
+	"github.com/agent-primitives/sessions/api"
+	ateadapter "github.com/agent-primitives/sessions/integrations/substrate"
+	"github.com/agent-primitives/sessions/runtime/substrate"
 )
 
 func TestSessionDeletePending(t *testing.T) {

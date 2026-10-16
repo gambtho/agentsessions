@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aramase/agentsessions/api"
-	"github.com/aramase/agentsessions/eventlog"
+	"github.com/agent-primitives/sessions/api"
+	"github.com/agent-primitives/sessions/eventlog"
 )
 
 // ErrSessionNotFound is returned for a session UID with no metadata row. It is distinct from an

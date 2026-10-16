@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/aramase/agentsessions/client"
+	"github.com/agent-primitives/sessions/client"
 )
 
 // Compile the new quickstart snippet in its caller context; it is not run against a server.
@@ -14,7 +14,7 @@ func ExampleClient_DeleteSession() {
 		if err != nil {
 			return err
 		}
-		fmt.Println(deleted.GetDeletionState(), deleted.GetDeletionRequestedTime(), deleted.GetDeletionCompletedTime())
+		fmt.Println(deleted.GetDeletionState(), deleted.GetDeletionRequestedTime())
 		return nil
 	}
 }

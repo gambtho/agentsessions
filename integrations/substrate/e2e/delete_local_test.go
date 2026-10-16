@@ -5,10 +5,10 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/aramase/agentsessions/api"
-	"github.com/aramase/agentsessions/eventlog"
-	"github.com/aramase/agentsessions/harness/echoagent"
-	"github.com/aramase/agentsessions/runtime/local"
+	"github.com/agent-primitives/sessions/api"
+	"github.com/agent-primitives/sessions/eventlog"
+	"github.com/agent-primitives/sessions/harness/echoagent"
+	"github.com/agent-primitives/sessions/runtime/local"
 )
 
 // Run the new audit/reopen/refusal fixture locally with real gRPC/SQLite/harness transport. This

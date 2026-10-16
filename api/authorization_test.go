@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/aramase/agentsessions/api"
+	"github.com/agent-primitives/sessions/api"
 )
 
 func TestOwnerAuthorizer(t *testing.T) {

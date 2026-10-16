@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/aramase/agentsessions/sqlitelog"
+	"github.com/agent-primitives/sessions/sqlitelog"
 )
 
 func TestOwnerSchemaDefaultsToUnboundAndOff(t *testing.T) {

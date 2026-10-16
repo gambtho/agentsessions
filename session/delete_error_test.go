@@ -14,11 +14,11 @@ import (
 	"google.golang.org/grpc/status"
 	"modernc.org/sqlite"
 
-	"github.com/aramase/agentsessions/api"
-	v1 "github.com/aramase/agentsessions/api/genpb"
-	"github.com/aramase/agentsessions/eventlog"
-	"github.com/aramase/agentsessions/placement"
-	"github.com/aramase/agentsessions/sqlitelog"
+	"github.com/agent-primitives/sessions/api"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
+	"github.com/agent-primitives/sessions/eventlog"
+	"github.com/agent-primitives/sessions/placement"
+	"github.com/agent-primitives/sessions/sqlitelog"
 )
 
 // Mapping coincidental backend statuses instead of typed local causes, or dropping Unwrap,
@@ -117,15 +117,15 @@ func TestDeleteDirectServiceContextsAndSQLFaultReleaseGuard(t *testing.T) {
 	}
 }
 
-// DELETE changes neither projection axis, including seeded COMPLETE audit rows (future reader
-// compatibility only). Unknown states fail closed at mutation admission, not as ACTIVE.
+// DELETE changes neither projection axis, including retained internal COMPLETE fixtures.
+// Internal/unknown states render as UNSPECIFIED and fail closed at admission, not as ACTIVE.
 func TestDeletionRenderingIndependentAxesAndUnknownState(t *testing.T) {
 	requested, completed := time.Unix(12, 34), time.Unix(15, 67)
 	for _, tc := range []struct {
 		state               api.DeletionState
 		wire                v1.DeletionState
 		request, completion time.Time
-	}{{api.DeletionActive, v1.DeletionState_DELETION_ACTIVE, time.Time{}, time.Time{}}, {api.DeletionPending, v1.DeletionState_DELETION_PENDING, requested, time.Time{}}, {api.DeletionComplete, v1.DeletionState_DELETION_COMPLETE, requested, completed}, {api.DeletionState("unknown"), v1.DeletionState_DELETION_STATE_UNSPECIFIED, time.Time{}, time.Time{}}} {
+	}{{api.DeletionActive, v1.DeletionState_DELETION_ACTIVE, time.Time{}, time.Time{}}, {api.DeletionPending, v1.DeletionState_DELETION_PENDING, requested, time.Time{}}, {api.DeletionComplete, v1.DeletionState_DELETION_STATE_UNSPECIFIED, requested, completed}, {api.DeletionState("unknown"), v1.DeletionState_DELETION_STATE_UNSPECIFIED, time.Time{}, time.Time{}}} {
 		info := sqlitelog.SessionInfo{SessionMeta: sqlitelog.SessionMeta{UID: "uid"}, ComputeState: api.ComputeCold, LastSeq: 1, DeletionSeq: 1, DeletionState: tc.state, DeletionRequestedAt: tc.request, DeletionCompletedAt: tc.completion}
 		got, err := sessionProto(info)
 		if err != nil {
@@ -134,14 +134,11 @@ func TestDeletionRenderingIndependentAxesAndUnknownState(t *testing.T) {
 		if got.GetDeletionState() != tc.wire || got.GetExecState() != v1.ExecState_EXEC_PENDING || got.GetComputeState() != v1.ComputeState_COMPUTE_COLD || got.GetLastSeq() != 1 {
 			t.Errorf("rendered axes=%v", got)
 		}
-		if (got.GetDeletionRequestedTime() == nil) != tc.request.IsZero() || (got.GetDeletionCompletedTime() == nil) != tc.completion.IsZero() {
+		if (got.GetDeletionRequestedTime() == nil) != tc.request.IsZero() {
 			t.Errorf("absence rendered as epoch: %v", got)
 		}
 		if !tc.request.IsZero() && !got.GetDeletionRequestedTime().AsTime().Equal(tc.request) {
 			t.Error("request timestamp changed")
-		}
-		if !tc.completion.IsZero() && !got.GetDeletionCompletedTime().AsTime().Equal(tc.completion) {
-			t.Error("completion timestamp changed")
 		}
 		err = deletedSessionError(info)
 		if tc.state == api.DeletionActive {

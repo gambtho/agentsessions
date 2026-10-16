@@ -17,14 +17,14 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
-	"github.com/aramase/agentsessions/api"
-	v1 "github.com/aramase/agentsessions/api/genpb"
-	"github.com/aramase/agentsessions/client"
-	"github.com/aramase/agentsessions/eventlog"
-	"github.com/aramase/agentsessions/harness/echoagent"
-	"github.com/aramase/agentsessions/placement"
-	"github.com/aramase/agentsessions/session"
-	"github.com/aramase/agentsessions/sqlitelog"
+	"github.com/agent-primitives/sessions/api"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
+	"github.com/agent-primitives/sessions/client"
+	"github.com/agent-primitives/sessions/eventlog"
+	"github.com/agent-primitives/sessions/harness/echoagent"
+	"github.com/agent-primitives/sessions/placement"
+	"github.com/agent-primitives/sessions/session"
+	"github.com/agent-primitives/sessions/sqlitelog"
 )
 
 // Observe, never replace, the runtime: a successful Delete must not even consult it. Cleanup and
@@ -179,7 +179,7 @@ func (a *deleteAPI) pending(t *testing.T, ctx context.Context, b *deleteRuntime,
 	if b.count() != calls {
 		t.Fatal("Delete consulted runtime (including Stop)")
 	}
-	if deleted.GetDeletionState() != v1.DeletionState_DELETION_PENDING || deleted.GetDeletionRequestedTime() == nil || deleted.GetDeletionCompletedTime() != nil || deleted.GetMetadata().GetUid() != uid || deleted.GetLastSeq() != before.GetLastSeq()+1 || deleted.GetComputeState() != before.GetComputeState() || deleted.GetExecState() != before.GetExecState() {
+	if deleted.GetDeletionState() != v1.DeletionState_DELETION_PENDING || deleted.GetDeletionRequestedTime() == nil || deleted.GetMetadata().GetUid() != uid || deleted.GetLastSeq() != before.GetLastSeq()+1 || deleted.GetComputeState() != before.GetComputeState() || deleted.GetExecState() != before.GetExecState() {
 		t.Fatalf("intent-only deletion axes: %v", deleted)
 	}
 	records := a.records(t, uid)

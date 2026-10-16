@@ -1,9 +1,9 @@
 # Changelog
 
 Release notes are generated from commits and published on the
-[releases page](https://github.com/aramase/agentsessions/releases). This file records what a reader
-needs to know beyond a commit list: what a release means for compatibility, and what it does not
-provide.
+[releases page](https://github.com/agent-primitives/sessions/releases). This file records what a
+reader needs to know beyond a commit list: what a release means for compatibility, and what it does
+not provide.
 
 ## Unreleased
 
@@ -86,7 +86,8 @@ provide.
   A transport park alone is not a successful public Session pause.
 - `Sessions.Approve` and `client.Client.Approve` commit only a decision; call Resume separately.
   CLI `approve` and `deny` commit then Resume, explicitly preserving the committed decision on
-  recovery failure. Identity is recorded provenance, not authorization. Cancel remains `UNIMPLEMENTED`; unresolved requests and retained snapshots have no expiry.
+  recovery failure. Identity is recorded provenance, not authorization. Cancel remains
+  `UNIMPLEMENTED`; unresolved requests and retained snapshots have no expiry.
 - Every Session reply and initial/final approval Exec frame uses captured metadata/cursor and
   the storage projection. Pending owned requests report AWAITING with `pending_approval`;
   clearing a reference after a decision does not prove a receipt or completion. SDK Exec retains
@@ -139,17 +140,27 @@ provide.
 - SQLite schema v5 follows approval v3 and deletion v4, adding indexed exact caller issuer/subject
   ownership and an off-mode journal authorization marker. Legacy and RPC-created sessions remain
   unbound; ordinary metadata writes and copied history cannot assign or replace owners. No events
-  or hashes are rewritten, and no wire fields change. Older hosts refuse v5; this host also refuses
-  required, unknown or missing authorization markers at v5 because it cannot enforce caller access.
-  Back up before upgrading. Sessions RPCs remain unauthenticated and unenforced.
-- `DeleteSession` permanently retains the UID, metadata and hash-chained journal for audit, hides
+  or hashes are rewritten, and no wire fields change. Older hosts refuse v5 at open time; this host
+  also refuses required, unknown or missing authorization markers at v5 because it cannot enforce
+  caller access. Stop all older writers before the first v5 open, following the
+  [rollout order](#sqlite-v4-rollout). Back up first. Sessions RPCs remain unauthenticated and
+  unenforced.
+- The Go module path is now `github.com/agent-primitives/sessions`; v0.1.x remain available at
+  `github.com/aramase/agentsessions`. Container images move to `ghcr.io/agent-primitives/sessions`.
+  One binary cannot link both module paths: both register the same proto files, and protobuf-go
+  panics at init (`file "common.proto" is already registered`). Move every dependency together.
+- <a name="sqlite-v4-rollout"></a>
+  `DeleteSession` permanently retains the UID, metadata and hash-chained journal for audit, hides
   the session from List and fences further mutations, including historical approval retries and
   forks. Get and raw Replay remain available; children are independent. PENDING acknowledges only
-  durable intent: no Runtime.Stop, cleanup or resource reclamation is attempted, and COMPLETE is
-  not reported. Actors, snapshots and fork pins remain retained until ownership/cleanup work (#88).
+  durable intent: no Runtime.Stop, cleanup or resource reclamation is attempted. Actors, snapshots
+  and fork pins remain retained until ownership/cleanup work (#88).
   SQLite schema v4 adds the tombstone state, timestamps and audit anchor after approval v3 in one
   transaction without rewriting old events or hashes; existing sessions stay ACTIVE. Older builds
-  refuse v4. Back up before upgrading. The new LIFECYCLE_DELETE hash requires a deletion-aware
+  refuse v4 at open time only. Already-open older writers can still append, mint fences and update
+  metadata after DELETE because they do not enforce tombstones. Before the first v4 open, stop
+  every older host and embedded `agentctl` process sharing the journal; upgrade all writers before
+  restarting them. Back up before upgrading. The new LIFECYCLE_DELETE hash requires a deletion-aware
   reader. Cancel remains unimplemented.
 - `Exec` refuses a stateless harness override when the session's served stored harness requires
   memory snapshots (`FAILED_PRECONDITION`, before any fence or journal write). `Resume` and

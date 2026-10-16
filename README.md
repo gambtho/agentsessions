@@ -85,8 +85,9 @@ determinism guarantees are exercised by a replay-conformance suite (`conformance
   have no expiry; `Cancel` returns `UNIMPLEMENTED`. See
   [approval recovery](docs/interaction-model.md#approval-decisions-and-recovery) for SDK/CLI examples.
 - **Permanent soft deletion:** `DeleteSession` / `agentctl delete --session <uid>` hides the UID from
-  List and refuses Exec, Fork (including historical forks), Resume and Suspend. Get and raw Replay
-  remain audit reads; UID, metadata and journal are retained forever, without cascade or erasure.
+  List and refuses Exec, Fork (including historical forks), Resume, Suspend and Approve (including
+  exact retries). Get and raw Replay remain audit reads; UID, metadata and journal are retained
+  forever, without cascade or erasure.
   `PENDING` acknowledges durable intent only: actors, snapshots and fork-child pins remain retained
   indefinitely. No Stop or cleanup is attempted; ownership and reclamation belong to #88. See
   [deletion semantics and admission limits](docs/concepts.md#permanent-soft-deletion).
@@ -94,7 +95,7 @@ determinism guarantees are exercised by a replay-conformance suite (`conformance
 ## Documentation
 
 The same docs are published, rendered and searchable, at
-**[anishram.com/agentsessions](https://anishram.com/agentsessions/)**, along with a walkthrough of
+**[sessions.agent-primitives.dev](https://sessions.agent-primitives.dev/)**, along with a walkthrough of
 how a turn runs and a recording of the full lifecycle on a real cluster.
 
 The sources live in [`docs/`](docs/README.md):
@@ -141,6 +142,9 @@ ghcr.io/aramase/agentsessions/agentsessionsd:v0.1.2
 ghcr.io/aramase/agentsessions/harnessnode:v0.1.2
 ```
 
+v0.1.x images stay at `ghcr.io/aramase/agentsessions`; releases from v0.2.0 publish to
+`ghcr.io/agent-primitives/sessions`.
+
 Multi-arch, built from the tagged source with no Dockerfile. `agentsessionsd` is the Sessions
 server; `harnessnode` is the in-sandbox harness the substrate manifests in `deploy/substrate/`
 reference. The server runs as uid 65532, so mount its journal path writable.
@@ -148,12 +152,15 @@ reference. The server runs as uid 65532, so mount its journal path writable.
 ## Install
 
 ```bash
-go install github.com/aramase/agentsessions/cmd/agentctl@latest
-go install github.com/aramase/agentsessions/cmd/agentsessionsd@latest
+go install github.com/aramase/agentsessions/cmd/agentctl@v0.1.2
+go install github.com/aramase/agentsessions/cmd/agentsessionsd@v0.1.2
 ```
 
+v0.1.x is published under the module path `github.com/aramase/agentsessions`; the
+`github.com/agent-primitives/sessions` path applies from v0.2.0.
+
 Signed archives for linux/darwin on amd64/arm64, with checksums and SBOMs, are on the
-[latest release](https://github.com/aramase/agentsessions/releases/latest).
+[latest release](https://github.com/agent-primitives/sessions/releases/latest).
 
 ## Try it
 

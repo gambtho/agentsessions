@@ -15,7 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	v1 "github.com/aramase/agentsessions/api/genpb"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
 )
 
 // Build and run the actual command map: testing cmdDelete alone would miss an unregistered command.
@@ -62,7 +62,7 @@ func TestDeleteCommandRequestAndPendingOutput(t *testing.T) {
 	default:
 		t.Fatal("delete command sent no RPC")
 	}
-	for _, want := range []string{"session delete-uid", "deletion=PENDING", "deletion_requested=2026-01-02T03:04:05.123456789Z", "deletion_completed=unset", "durable intent only", "compute and fork pins retained"} {
+	for _, want := range []string{"session delete-uid", "deletion=PENDING", "deletion_requested=2026-01-02T03:04:05.123456789Z", "durable intent only", "compute and fork pins retained"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q: %s", want, out)
 		}
@@ -80,10 +80,9 @@ type deleteRecorder struct {
 
 func (s *deleteRecorder) GetSession(_ context.Context, req *v1.GetSessionRequest) (*v1.Session, error) {
 	sess := &v1.Session{Metadata: &v1.ResourceMetadata{Uid: req.GetUid()}, DeletionState: v1.DeletionState_DELETION_ACTIVE}
-	if req.GetUid() == "complete" {
-		sess.DeletionState = v1.DeletionState_DELETION_COMPLETE
+	if req.GetUid() == "pending" {
+		sess.DeletionState = v1.DeletionState_DELETION_PENDING
 		sess.DeletionRequestedTime = timestamppb.New(time.Unix(0, 0))
-		sess.DeletionCompletedTime = timestamppb.New(time.Date(2026, 1, 2, 3, 4, 5, 123456789, time.UTC))
 	}
 	return sess, nil
 }
@@ -111,11 +110,11 @@ func TestDeleteHelpAndGetTimestampSemantics(t *testing.T) {
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
 	for _, tc := range []struct{ uid, want string }{
-		{"active", "deletion=ACTIVE deletion_requested=unset deletion_completed=unset"},
-		{"complete", "deletion=COMPLETE deletion_requested=1970-01-01T00:00:00Z deletion_completed=2026-01-02T03:04:05.123456789Z"},
+		{"active", "deletion=ACTIVE deletion_requested=unset"},
+		{"pending", "deletion=PENDING deletion_requested=1970-01-01T00:00:00Z"},
 	} {
 		out, err := run("get", "--server", lis.Addr().String(), "--session", tc.uid)
-		if err != nil || !strings.Contains(out, tc.want) {
+		if err != nil || !strings.Contains(out, tc.want) || strings.Contains(out, "deletion_completed") || strings.Contains(out, "deletion=COMPLETE") {
 			t.Fatalf("Get %s times: %s %v", tc.uid, out, err)
 		}
 	}
@@ -155,7 +154,7 @@ func TestEmbeddedDeleteAuditAndDescendants(t *testing.T) {
 	child := fields[1]
 	deleted := mustRun("delete", "--session", parent)
 	get := mustRun("get", "--session", parent)
-	if !strings.Contains(get, "deletion=PENDING") || !strings.Contains(get, "deletion_requested=") || !strings.Contains(get, "deletion_completed=unset") {
+	if !strings.Contains(get, "deletion=PENDING") || !strings.Contains(get, "deletion_requested=") || strings.Contains(get, "deletion_completed") || strings.Contains(get, "deletion=COMPLETE") {
 		t.Fatalf("Get hides intent fields: %s", get)
 	}
 	if retry := mustRun("delete", "--session", parent); retry != deleted {

@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aramase/agentsessions/api"
-	"github.com/aramase/agentsessions/sqlitelog"
+	"github.com/agent-primitives/sessions/api"
+	"github.com/agent-primitives/sessions/sqlitelog"
 )
 
 func TestOwnedCreationIsImmutableAndDoesNotInherit(t *testing.T) {
