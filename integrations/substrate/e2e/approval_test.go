@@ -57,8 +57,8 @@ func approvalSpec(t *testing.T, atespace, name, mode, pool, config string, class
 		WorkerSelector: &atepb.Selector{MatchLabels: map[string]string{"workload": pool}},
 		SandboxConfig:  &atepb.SandboxConfig{SandboxClass: class, ConfigName: config},
 		SnapshotConfig: &atepb.SnapshotConfig{
-			OnCommit:        atepb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL,
-			StorageLocation: env("SNAPSHOT_LOCATION", "gs://ate-snapshots/agentsessions/") + name + "/",
+			PreferredFidelity: atepb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+			StorageLocation:   env("SNAPSHOT_LOCATION", "gs://ate-snapshots/agentsessions/") + name + "/",
 		},
 	}
 }
@@ -82,7 +82,7 @@ func TestApprovalTemplateSpecs(t *testing.T) {
 			if c.GetEnv()[0].GetName() != "HARNESS_MODE" || c.GetEnv()[0].GetValue() != tc.mode || c.GetWakeupProbe().GetHttpGet().GetPort() != 8081 {
 				t.Fatalf("wrong served mode/readiness: %v", c)
 			}
-			if spec.GetWorkerSelector().GetMatchLabels()["workload"] != tc.pool || spec.GetSandboxConfig().GetSandboxClass() != tc.class || spec.GetSandboxConfig().GetConfigName() != tc.config || spec.GetSnapshotConfig().GetOnCommit() != atepb.SnapshotContentScope_SNAPSHOT_CONTENT_SCOPE_FULL {
+			if spec.GetWorkerSelector().GetMatchLabels()["workload"] != tc.pool || spec.GetSandboxConfig().GetSandboxClass() != tc.class || spec.GetSandboxConfig().GetConfigName() != tc.config || spec.GetSnapshotConfig().GetPreferredFidelity() != atepb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY {
 				t.Fatalf("wrong pool/snapshot selection: %v", spec)
 			}
 		})
