@@ -157,7 +157,7 @@ func runDeleteHierarchy(t *testing.T, f *fixture, template string, desc api.Desc
 			if cold {
 				want = atepb.ActorState_ACTOR_STATE_SUSPENDED
 			}
-			if actor.GetStatus().GetState() != want || (!cold && (actor.GetStatus().GetWorkerAssignment().GetWorkerPodUid() == "" || len(actor.GetStatus().GetWorkerAssignment().GetWorkerPodIps()) == 0)) || (cold && (actor.GetStatus().GetExternalSnapshot().GetSnapshotUri() == "" || actor.GetStatus().GetWorkerAssignment() != nil)) {
+			if actor.GetStatus().GetState() != want || (!cold && (actor.GetStatus().GetWorkerAssignment().GetWorkerPodUid() == "" || len(actor.GetStatus().GetWorkerAssignment().GetWorkerPodIps()) == 0)) || (cold && (deleteHeldSnapshotURI(actor.GetStatus()) == "" || actor.GetStatus().GetWorkerAssignment() != nil)) {
 				t.Fatalf("control state %s: %v", uid, actor)
 			}
 		}
@@ -262,17 +262,29 @@ func runDeleteHierarchy(t *testing.T, f *fixture, template string, desc api.Desc
 	t.Logf("retained parent/intermediate actors, %d clone pins, independent sibling/grandchild/own-fork; owned actors=%v", len(pins), owned)
 }
 
+// The held snapshot is the newest completed durable copy, matching the pinned Control API.
+func deleteHeldSnapshotURI(st *atepb.ActorStatus) string {
+	var held *atepb.Snapshot
+	for _, snap := range st.GetSnapshots() {
+		if snap.GetDurableSnapshot().GetStatus() == atepb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED &&
+			(held == nil || snap.GetGeneration() >= held.GetGeneration()) {
+			held = snap
+		}
+	}
+	return held.GetDurableSnapshot().GetObject().GetSnapshotUri()
+}
+
 func readDeletePin(t *testing.T, ctx context.Context, ctl atepb.ControlClient, observed *deleteControl, space, uid string) *atepb.Tag {
 	t.Helper()
 	tag := observed.tag("fork-" + uid)
-	if tag == nil || tag.GetMetadata().GetAtespace() != space || tag.GetMetadata().GetUid() == "" || tag.GetStatus().GetSnapshot().GetSnapshotUri() == "" || tag.GetStatus().GetActorTemplateUid() == "" || tag.GetScope() != atepb.TagScope_TAG_SCOPE_ATESPACE {
+	if tag == nil || tag.GetMetadata().GetAtespace() != space || tag.GetMetadata().GetUid() == "" || tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetObject().GetSnapshotUri() == "" || tag.GetStatus().GetActorTemplateUid() == "" || tag.GetScope() != atepb.TagScope_TAG_SCOPE_ATESPACE {
 		t.Fatalf("actual clone tag metadata %s: %v", uid, tag)
 	}
 	current, err := ctl.GetTag(ctx, &atepb.GetTagRequest{Tag: &atepb.ObjectRef{Atespace: space, Name: "fork-" + uid}})
 	if err != nil || !sameDeleteMessage(t, tag, current) {
 		t.Fatalf("pin no longer resolves exact tag-owned snapshot %s: %v %v", uid, current, err)
 	}
-	t.Logf("retained pin %s tagUID=%s snapshotURI=%s sourceActor=%s templateUID=%s", uid, tag.GetMetadata().GetUid(), tag.GetStatus().GetSnapshot().GetSnapshotUri(), tag.GetSourceActor().GetName(), tag.GetStatus().GetActorTemplateUid())
+	t.Logf("retained pin %s tagUID=%s snapshotURI=%s sourceActor=%s templateUID=%s", uid, tag.GetMetadata().GetUid(), tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetObject().GetSnapshotUri(), tag.GetSourceActor().GetName(), tag.GetStatus().GetActorTemplateUid())
 	return current
 }
 func assertDeleteResources(t *testing.T, ctx context.Context, ctl atepb.ControlClient, observed *deleteControl, space string, actors map[string]*atepb.Actor, pins map[string]*atepb.Tag) {
