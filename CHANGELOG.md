@@ -77,6 +77,12 @@ provide.
 
 ### Compatibility
 
+- Controller and bridge sink calls now honor their own context cancellation, both while queued
+  behind another effect and when an uncontended call arrives with an already-canceled context.
+  Canceled calls start no effects; Replay and Resume also refuse such calls against older journals
+  without consuming recorded evidence. An uncontended call still returns an existing sticky
+  park/failure before cancellation. Request/reply serialization and Run shutdown drainage are
+  unchanged.
 - `Approve` and a stateful `Fork` on the same session now exclude each other through the shared
   checkpoint mark. A refused approval returns `ABORTED` without minting a fence or writing a
   decision; retry after the fork finishes. This coordination covers one Registry/host only.
