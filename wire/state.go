@@ -1,8 +1,8 @@
 package wire
 
 import (
-	"github.com/aramase/agentsessions/api"
-	v1 "github.com/aramase/agentsessions/api/genpb"
+	"github.com/agent-primitives/sessions/api"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
 )
 
 // The domain types are strings and the wire types are enums, so an unknown value has to land
@@ -17,8 +17,6 @@ func DeletionStateToProto(d api.DeletionState) v1.DeletionState {
 		return v1.DeletionState_DELETION_ACTIVE
 	case api.DeletionPending:
 		return v1.DeletionState_DELETION_PENDING
-	case api.DeletionComplete:
-		return v1.DeletionState_DELETION_COMPLETE
 	default:
 		return v1.DeletionState_DELETION_STATE_UNSPECIFIED
 	}
@@ -31,8 +29,6 @@ func DeletionStateFromProto(d v1.DeletionState) api.DeletionState {
 		return api.DeletionActive
 	case v1.DeletionState_DELETION_PENDING:
 		return api.DeletionPending
-	case v1.DeletionState_DELETION_COMPLETE:
-		return api.DeletionComplete
 	default:
 		return ""
 	}

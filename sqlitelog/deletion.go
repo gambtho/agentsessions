@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/aramase/agentsessions/api"
-	"github.com/aramase/agentsessions/eventlog"
+	"github.com/agent-primitives/sessions/api"
+	"github.com/agent-primitives/sessions/eventlog"
 )
 
 // DeleteSession commits permanent deletion intent, not runtime cleanup. The retained journal

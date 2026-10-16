@@ -9,8 +9,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	v1 "github.com/aramase/agentsessions/api/genpb"
-	"github.com/aramase/agentsessions/client"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
+	"github.com/agent-primitives/sessions/client"
 )
 
 // A missing or misdirected SDK Delete leaves the requested UID writable; normalizing its response
@@ -59,7 +59,7 @@ func TestDeleteSessionPendingAuditAndRefusal(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if deleted.GetMetadata().GetUid() != uid || deleted.GetDeletionState() != v1.DeletionState_DELETION_PENDING || deleted.GetDeletionRequestedTime() == nil || deleted.GetDeletionCompletedTime() != nil {
+			if deleted.GetMetadata().GetUid() != uid || deleted.GetDeletionState() != v1.DeletionState_DELETION_PENDING || deleted.GetDeletionRequestedTime() == nil {
 				t.Fatalf("Delete lost UID or intent-only state/times: %v", deleted)
 			}
 			requested := deleted.GetDeletionRequestedTime().AsTime()

@@ -3,9 +3,9 @@ package wire_test
 import (
 	"testing"
 
-	"github.com/aramase/agentsessions/api"
-	v1 "github.com/aramase/agentsessions/api/genpb"
-	"github.com/aramase/agentsessions/wire"
+	"github.com/agent-primitives/sessions/api"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
+	"github.com/agent-primitives/sessions/wire"
 )
 
 func TestDeletionStateConversion(t *testing.T) {
@@ -17,7 +17,6 @@ func TestDeletionStateConversion(t *testing.T) {
 	}{
 		{"active", "ACTIVE", 1},
 		{"pending", "PENDING", 2},
-		{"complete", "COMPLETE", 3},
 		{"unspecified", "", 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -29,12 +28,12 @@ func TestDeletionStateConversion(t *testing.T) {
 			}
 		})
 	}
-	for _, unknown := range []api.DeletionState{"UNKNOWN", "DELETED"} {
+	for _, unknown := range []api.DeletionState{"COMPLETE", "UNKNOWN", "DELETED"} {
 		if got := wire.DeletionStateToProto(unknown); got != v1.DeletionState_DELETION_STATE_UNSPECIFIED {
 			t.Errorf("unknown domain %q = %v, want UNSPECIFIED", unknown, got)
 		}
 	}
-	for _, unknown := range []v1.DeletionState{-1, 99} {
+	for _, unknown := range []v1.DeletionState{-1, 3, 99} {
 		if got := wire.DeletionStateFromProto(unknown); got != "" {
 			t.Errorf("unknown wire %d = %q, want empty", unknown, got)
 		}

@@ -22,14 +22,14 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/aramase/agentsessions/api"
-	v1 "github.com/aramase/agentsessions/api/genpb"
-	"github.com/aramase/agentsessions/controller"
-	"github.com/aramase/agentsessions/eventlog"
-	"github.com/aramase/agentsessions/observability"
-	"github.com/aramase/agentsessions/placement"
-	"github.com/aramase/agentsessions/sqlitelog"
-	"github.com/aramase/agentsessions/wire"
+	"github.com/agent-primitives/sessions/api"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
+	"github.com/agent-primitives/sessions/controller"
+	"github.com/agent-primitives/sessions/eventlog"
+	"github.com/agent-primitives/sessions/observability"
+	"github.com/agent-primitives/sessions/placement"
+	"github.com/agent-primitives/sessions/sqlitelog"
+	"github.com/agent-primitives/sessions/wire"
 )
 
 // Service implements v1.SessionsServer over a sqlitelog store and the controller.
@@ -118,9 +118,6 @@ func sessionProto(info sqlitelog.SessionInfo) (*v1.Session, error) {
 	}
 	if !info.DeletionRequestedAt.IsZero() {
 		out.DeletionRequestedTime = timestamppb.New(info.DeletionRequestedAt)
-	}
-	if !info.DeletionCompletedAt.IsZero() {
-		out.DeletionCompletedTime = timestamppb.New(info.DeletionCompletedAt)
 	}
 	if ref := info.PendingApproval; ref.RequestSeq > 0 && info.DeletionState == api.DeletionActive {
 		out.PendingApproval = &v1.ApprovalRef{ExecutionId: ref.ExecutionID, ToolCallId: ref.ToolCallID, RequestSeq: ref.RequestSeq}

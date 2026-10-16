@@ -141,13 +141,13 @@ authorization (see [security posture](security.md)).
 
 `DeleteSession` atomically appends one session-scoped `DELETE` lifecycle record, advances the fence
 and permanently tombstones the UID. `deletion_state` is independent of execution and compute:
-`ACTIVE` has no deletion timestamps; `PENDING` has the committed request time and no completion time.
+`ACTIVE` has no deletion request time; `PENDING` has the committed request time.
 Delete preserves the recorded compute state, not a claim that a running actor has stopped.
 
 `PENDING` acknowledges durable intent only. Until ownership and cleanup are implemented in #88,
 actors, snapshots and fork-child pins remain retained indefinitely: Delete does not call
-`Runtime.Stop`, reclaim resources or produce `COMPLETE`. Metadata and the immutable journal preserve
-route, lineage and snapshot evidence for audit, not an authoritative cleanup-target inventory;
+`Runtime.Stop`, reclaim resources or report cleanup completion. Metadata and the immutable journal
+preserve route, lineage and snapshot evidence for audit, not an authoritative cleanup-target inventory;
 #88 owns that schema. Do not infer cleanup from gRPC OK.
 
 List hides tombstones before pagination. Get and raw `Sessions.Replay` remain audit reads, including
@@ -163,15 +163,18 @@ session remains `PENDING`, and a parked request remains `AWAITING` without an ac
 An empty UID is `INVALID_ARGUMENT`, an unknown UID is `NOT_FOUND` without creation, and local overlap
 is `ABORTED` before mutation. Retry busy calls after the holder finishes; use Get or retry after a
 lost response to learn whether intent committed. One Registry serializes Delete, Exec, Fork, Resume,
-Suspend and Approve across its Placers. This is not cross-host compute exclusion: an independent host can
-provision before its first durable fence, although tombstones reject subsequent durable writes.
+Suspend and Approve across its Placers. This is not cross-host compute exclusion: an independent
+host can provision before its first durable fence. This build's writers reject subsequent durable
+writes to tombstones; already-open older writers do not. Follow the
+[v4 rollout order](../CHANGELOG.md#sqlite-v4-rollout) before the first upgraded open.
 Direct durable-log wrappers must forward the optional `CheckWritable` preflight to refuse before
-compute; final SQLite write barriers still enforce the permanent tombstone.
+compute; this build's storage write barriers still enforce the permanent tombstone.
 
-Opening an older SQLite journal migrates it transactionally through approval-reporting v3 to deletion
-schema v4, with old sessions ACTIVE and deletion times absent. Existing metadata, projections, records and hashes are preserved. Older
-binaries refuse the newer schema; back up before upgrade if rollback is required. Old verifiers
-cannot verify new `LIFECYCLE_DELETE` enum-name hashes; use a descriptor that includes DELETE.
+Opening an older SQLite journal migrates it transactionally through approval-reporting v3 to
+schema v4, with old sessions ACTIVE and deletion times absent. Existing metadata, projections,
+records and hashes are preserved. Older binaries refuse the newer schema at open time; stop all
+older writers as described in the rollout note and back up before upgrading if rollback is required.
+Old verifiers cannot verify new `LIFECYCLE_DELETE` enum-name hashes; use a descriptor with DELETE.
 
 ## Event and the typed log
 

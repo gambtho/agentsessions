@@ -9,7 +9,7 @@ import (
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	v1 "github.com/aramase/agentsessions/api/genpb"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
 )
 
 func cmdDelete(args []string) error {
@@ -35,9 +35,9 @@ func cmdDelete(args []string) error {
 }
 
 func deletionFields(s *v1.Session) string {
-	return fmt.Sprintf("deletion=%s deletion_requested=%s deletion_completed=%s",
+	return fmt.Sprintf("deletion=%s deletion_requested=%s",
 		strings.TrimPrefix(s.GetDeletionState().String(), "DELETION_"),
-		deletionTime(s.GetDeletionRequestedTime()), deletionTime(s.GetDeletionCompletedTime()))
+		deletionTime(s.GetDeletionRequestedTime()))
 }
 
 func deletionTime(t *timestamppb.Timestamp) string {

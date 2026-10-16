@@ -5,9 +5,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/aramase/agentsessions/api"
-	"github.com/aramase/agentsessions/eventlog"
-	"github.com/aramase/agentsessions/harness/echoagent"
+	"github.com/agent-primitives/sessions/api"
+	"github.com/agent-primitives/sessions/eventlog"
+	"github.com/agent-primitives/sessions/harness/echoagent"
 )
 
 type deletionForkFaultBackend struct {
