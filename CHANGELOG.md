@@ -138,7 +138,7 @@ not provide.
   `github.com/aramase/agentsessions`. Container images move to `ghcr.io/agent-primitives/sessions`.
   One binary cannot link both module paths: both register the same proto files, and protobuf-go
   panics at init (`file "common.proto" is already registered`). Move every dependency together.
-- <a id="sqlite-v4-rollout"></a>
+- <a name="sqlite-v4-rollout"></a>
   `DeleteSession` permanently retains the UID, metadata and hash-chained journal for audit, hides
   the session from List and fences further mutations, including historical approval retries and
   forks. Get and raw Replay remain available; children are independent. PENDING acknowledges only
