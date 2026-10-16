@@ -4,15 +4,12 @@ import (
 	"context"
 	"errors"
 	"net"
-	"reflect"
 	"testing"
 	"time"
 
 	"github.com/aramase/agentsessions/api"
 	v1 "github.com/aramase/agentsessions/api/genpb"
-	"github.com/aramase/agentsessions/controller"
 	"github.com/aramase/agentsessions/harnesswire"
-	"github.com/aramase/agentsessions/wire"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -112,156 +109,73 @@ func rawApprovalHarness(t *testing.T, p *approvalWirePeer) api.Harness {
 	return harnesswire.NewClientHarness(v1.NewHarnessClient(conn))
 }
 
-func TestWireApprovalProtoParkDecisionReceiptReplay(t *testing.T) {
+type approvalHost struct {
+	result  api.ToolResult
+	err     error
+	outputs int
+}
+
+func (*approvalHost) Model(context.Context, api.ModelRequest) (api.ModelResponse, error) {
+	return api.ModelResponse{}, nil
+}
+func (h *approvalHost) Output(context.Context, string) error { h.outputs++; return nil }
+func (h *approvalHost) ToolCall(context.Context, api.ToolCall) (api.ToolResult, error) {
+	return h.result, h.err
+}
+func (*approvalHost) Report(context.Context, api.ToolResult) error { return nil }
+func (*approvalHost) Usage(context.Context, api.Usage) error       { return nil }
+
+func TestApprovalRawProtocol(t *testing.T) {
 	for _, shape := range []struct {
-		name          string
-		approved      bool
-		executorError bool
-		code          v1.ToolResult_Code
+		name     string
+		approved bool
+		code     api.ToolResultCode
+		isError  bool
 	}{
-		{"approved", true, false, v1.ToolResult_CODE_UNSPECIFIED},
-		{"denied", false, false, v1.ToolResult_APPROVAL_DENIED},
-		{"approved executor failure", true, true, v1.ToolResult_EXECUTOR_ERROR},
+		{"approved", true, api.ToolResultCodeUnspecified, false}, {"denied", false, api.ToolResultCodeApprovalDenied, true}, {"executor failure", true, api.ToolResultCodeExecutorError, true},
 	} {
 		t.Run(shape.name, func(t *testing.T) {
-			store, _ := openFile(t)
-			defer store.Close()
-			log := store.Session("session")
-			peer := &approvalWirePeer{frames: make(chan []*v1.ControllerFrame, 4)}
-			har := rawApprovalHarness(t, peer)
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			peer := &approvalWirePeer{frames: make(chan []*v1.ControllerFrame, 1)}
+			host := &approvalHost{result: api.ToolResult{ID: "call", ApprovalRequestSeq: 3, ApprovalDecisionSeq: 4, Code: shape.code, IsError: shape.isError, Approval: &api.ApprovalResult{ToolCallID: "call", RequestSeq: 3, Approved: shape.approved}}}
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 			defer cancel()
-			effects := 0
-			executor := func(context.Context, controller.ToolCallContext, api.ToolCall) (api.ToolResult, error) {
-				effects++
-				if shape.executorError {
-					return api.ToolResult{}, errors.New("executor unavailable")
-				}
-				return api.ToolResult{}, nil
-			}
-			c, err := controller.New(log, nil, controller.WithSessionUID("session"), controller.WithToolExecutor(executor))
-			if err != nil {
+			if err := rawApprovalHarness(t, peer).Run(ctx, &api.Start{SessionUID: "session", ExecutionID: "e"}, host); err != nil {
 				t.Fatal(err)
 			}
-			if err := c.Exec(ctx, har, nil, 0); err == nil {
-				t.Fatal("park cannot complete the execution")
-			}
-			park := (<-peer.frames)[0].GetPark()
-			records, err := log.Read(1)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var requestSeq int64
-			for _, record := range records {
-				ev := wire.EventToProto(record.Event)
-				switch ev.GetKind() {
-				case v1.EventKind_EVENT_APPROVAL_REQUEST:
-					if ev.GetExecutionId() != park.GetExecutionId() || ev.GetApproval().GetToolCallId() != park.GetToolCallId() {
-						t.Fatalf("request does not bind park: %v", ev)
-					}
-					requestSeq = record.Seq
-				case v1.EventKind_EVENT_PARKED, v1.EventKind_EVENT_END, v1.EventKind_EVENT_ERROR, v1.EventKind_EVENT_TOOL_RESULT:
-					t.Fatalf("park wrote transport/terminal/receipt event: %v", ev)
-				}
-			}
-			if requestSeq <= 0 || requestSeq != park.GetRequestSeq() || effects != 0 {
-				t.Fatalf("park request/effects = %d/%d; frame %v", requestSeq, effects, park)
-			}
-			committed, err := controller.Approve(log, api.ApprovalDecision{ExecutionID: park.GetExecutionId(), ToolCallID: "call", RequestSeq: requestSeq, Approved: shape.approved, Reason: "reviewed"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			// A fresh controller represents a separate invocation; wire recovery must use
-			// the committed decision's actual sequence, not a fabricated positive number.
-			recovering, err := controller.New(log, nil, controller.WithSessionUID("session"), controller.WithToolExecutor(executor))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if resumed, err := recovering.Resume(ctx, har); err != nil || !resumed {
-				t.Fatalf("Resume = %v, %v", resumed, err)
-			}
-			pair := <-peer.frames
-			decision, receipt := pair[0].GetApproval(), pair[1].GetTool()
-			if decision.GetApproved() != shape.approved || receipt.GetCode() != shape.code || receipt.GetApprovalRequestSeq() != requestSeq || receipt.GetApprovalDecisionSeq() != committed.Seq {
-				t.Fatalf("decision/receipt = %v/%v, committed seq %d", decision, receipt, committed.Seq)
-			}
-			wantEffects := 0
-			if shape.approved {
-				wantEffects = 1
-			}
-			if effects != wantEffects {
-				t.Fatalf("effects = %d, want %d", effects, wantEffects)
-			}
-			before, err := log.Read(1)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if outputs, err := recovering.Replay(ctx, har); err != nil || !reflect.DeepEqual(outputs, []string{"continued"}) {
-				t.Fatalf("Replay = %v, %v", outputs, err)
-			}
-			replayPair := <-peer.frames
-			if replayPair[0].GetApproval().GetRequestSeq() != requestSeq || replayPair[1].GetTool().GetApprovalDecisionSeq() != committed.Seq {
-				t.Fatalf("replayed pair = %v", replayPair)
-			}
-			after, err := log.Read(1)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !reflect.DeepEqual(before, after) || effects != wantEffects {
-				t.Fatal("replay mutated journal or invoked executor")
-			}
-			if err := log.Verify(); err != nil {
-				t.Fatal(err)
+			frames := <-peer.frames
+			if len(frames) != 2 || frames[0].GetApproval().GetApproved() != shape.approved || frames[1].GetTool().GetCode() != v1.ToolResult_Code(map[api.ToolResultCode]int32{api.ToolResultCodeUnspecified: 0, api.ToolResultCodeApprovalDenied: 1, api.ToolResultCodeExecutorError: 2}[shape.code]) || host.outputs != 1 {
+				t.Fatalf("frames=%v outputs=%d", frames, host.outputs)
 			}
 		})
 	}
-}
-
-func TestWireApprovalFailedAckPreservesDurableRequest(t *testing.T) {
-	store, _ := openFile(t)
-	defer store.Close()
-	log := store.Session("session")
-	peer := &approvalWirePeer{frames: make(chan []*v1.ControllerFrame, 1), wrongAck: true, parkRejection: make(chan codes.Code, 1)}
-	c, err := controller.New(log, nil, controller.WithSessionUID("session"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	err = c.Exec(ctx, rawApprovalHarness(t, peer), nil, 0)
-	if err == nil {
-		t.Fatal("foreign ack accepted")
-	}
-	if ctx.Err() != nil {
-		t.Fatalf("ack was not rejected before the caller deadline: %v", err)
-	}
-	select {
-	case code := <-peer.parkRejection:
-		if code != codes.Canceled {
-			t.Fatalf("raw peer after foreign ack received %s, want host cancellation before EOF", code)
-		}
-	case <-ctx.Done():
-		t.Fatalf("raw peer did not observe rejection before EOF: %v", ctx.Err())
-	}
-	frames := <-peer.frames
-	records, err := log.Read(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, record := range records {
-		ev := wire.EventToProto(record.Event)
-		switch ev.GetKind() {
-		case v1.EventKind_EVENT_APPROVAL_REQUEST:
-			found = record.Seq == frames[0].GetPark().GetRequestSeq()
-		case v1.EventKind_EVENT_END, v1.EventKind_EVENT_ERROR, v1.EventKind_EVENT_PARKED, v1.EventKind_EVENT_TOOL_RESULT:
-			t.Fatalf("failed handoff erased awaiting state: %v", ev)
-		}
-	}
-	if !found {
-		t.Fatal("failed handoff lost committed request")
-	}
-	if err := log.Verify(); err != nil {
-		t.Fatal(err)
+	for _, wrong := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ACK EOF", true: "wrong ACK cancels"}[wrong], func(t *testing.T) {
+			peer := &approvalWirePeer{frames: make(chan []*v1.ControllerFrame, 1), wrongAck: wrong}
+			if wrong {
+				peer.parkRejection = make(chan codes.Code, 1)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			host := &approvalHost{err: &api.ApprovalParkedError{Ref: api.ApprovalRef{ExecutionID: "e", ToolCallID: "call", RequestSeq: 3}}}
+			err := rawApprovalHarness(t, peer).Run(ctx, &api.Start{SessionUID: "session", ExecutionID: "e"}, host)
+			if wrong {
+				if err == nil || errors.Is(err, api.ErrApprovalParked) {
+					t.Fatalf("bad ACK accepted %v", err)
+				}
+				select {
+				case code := <-peer.parkRejection:
+					if code != codes.Canceled {
+						t.Fatal(code)
+					}
+				case <-ctx.Done():
+					t.Fatal("peer not canceled")
+				}
+			} else if !errors.Is(err, api.ErrApprovalParked) {
+				t.Fatal(err)
+			}
+			if host.outputs != 0 {
+				t.Fatal("park produced output")
+			}
+		})
 	}
 }

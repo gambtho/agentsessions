@@ -13,8 +13,34 @@ provide.
   a redirect. net/http copied custom headers such as `api-key` to any redirect target, so a provider
   or proxy answering with a cross-host redirect received the credential. A redirect that changes
   scheme, host or port is now refused; same-origin redirects are followed as before.
+- `agentsessionsd` refuses to start when a model API key is set (`MODEL_API_KEY` or
+  `OPENAI_API_KEY`) and `-model-base-url` is plain `http` to a host other than a loopback address,
+  `localhost`, or a name ending in `.svc` or `.svc.cluster.local` (case-insensitive, port ignored):
+  the key and every prompt would cross the network unencrypted. The service-name allowance is a
+  trusted-network exception: it checks the name only, not that it resolves to a cluster service or
+  that the traffic stays in the cluster, and that traffic is still cleartext on the pod network. The
+  error names the host and asks for `https`; it never prints the key. `https`, and `http` with no
+  key, are unchanged. The check is in `internal/modelconfig.New`.
 
 ### Fixed
+
+- A harness can now journal the usage of a host-mediated model call. `harnesswire` dropped
+  `ModelResponse.Usage` in both directions, so a remote harness always saw zero usage, and Replay
+  and Resume served a recorded completion with no usage, so a harness reporting the usage it was
+  given diverged from its record. The host now sends `ModelResult.usage` (already in the proto) and
+  the harness side reads it; Replay and Resume serve the `USAGE` recorded directly after the
+  completion. A harness built against an older `harnesswire` ignores the field, and an older host
+  sends none, which reads as zero usage. If a turn is cut between its `OUTPUT` and its `USAGE`,
+  Resume serves zero usage and does not re-invoke the model, so that call's usage is journaled as
+  zero (a harness that always reports the usage it was given), or not at all (one that skips zero).
+  v0.1.2 journals replay as before, with no usage served.
+
+- `model/openai` joins the completions path to the base URL's path instead of appending it to the
+  string, so a base URL with a query (`-model-base-url 'https://h/v1?api-version=2'`) reaches
+  `/v1/chat/completions` with the query kept, ahead of any query `-model-path` carries. A fragment
+  is dropped. Before, the path landed inside the query or fragment and every turn went to `/v1`.
+  `agentsessionsd`'s startup log names that joined endpoint (`openai.Client.Endpoint`), with a
+  userinfo password masked, instead of the base URL and path concatenated.
 
 - The substrate adapter (`integrations/substrate`) builds against agent-substrate `96dffb28`, which
   replaced `ActorStatus.external_snapshot` with a `snapshots` list (substrate `f03327bd`) and
@@ -45,11 +71,33 @@ provide.
 - Go SDK `Client.DeleteSession(ctx, uid)` and `agentctl delete --session <uid>` request permanent
   soft deletion. Get/delete CLI report deletion state and requested/completed times; PENDING output
   explicitly says durable intent only, with compute and fork pins retained.
-- Durable `REQUIRES_APPROVAL` gates for stateless-replay harnesses. Sessions RPC and Go SDK
-  `Approve` commit an explicit approval or denial only; callers Resume separately. `agentctl approve`
-  and `deny` discover a pending tuple or accept complete explicit correlation, record optional
-  reason/identity provenance, then Resume. A recovery failure exits unsuccessfully and says the
-  decision is committed, without retracting it.
+- Controller `InspectApproval` and decision-only `Approve` validate durable request/decision/receipt
+  evidence, including exact retries and session-owned versus inherited effects. The internal
+  approval engine supports captured-head repair and correlated denial/executor-error receipts.
+  Live `REQUIRES_APPROVAL` calls now park stateless executions at a durable host-owned request.
+  Placement closes the invocation, snapshots externally and commits SUSPEND before reporting
+  a successful pause; transport/close/snapshot/append failures remain errors with the request
+  recoverable.
+- `Harness.Connect` bridge supports the stateless approval exchange: full session/execution/call
+  correlation, park acknowledgement plus actual stream closure, and decision-before-receipt order.
+  A transport park alone is not a successful public Session pause.
+- `Sessions.Approve` and `client.Client.Approve` commit only a decision; call Resume separately.
+  CLI `approve` and `deny` commit then Resume, explicitly preserving the committed decision on
+  recovery failure. Identity is recorded provenance, not authorization. Cancel remains `UNIMPLEMENTED`; unresolved requests and retained snapshots have no expiry.
+- Every Session reply and initial/final approval Exec frame uses captured metadata/cursor and
+  the storage projection. Pending owned requests report AWAITING with `pending_approval`;
+  clearing a reference after a decision does not prove a receipt or completion. SDK Exec retains
+  the latest Session and maximum committed cursor, including partial failure.
+- Approval wire types provide correlated request references, explicit receipt statuses/sequences
+  and transport-only park acknowledgements without changing old field numbers or default hashes.
+- SQLite `SessionInfo` captures the journal-derived `last_seq` and a reporting-only
+  `PendingApproval` with metadata, using an incremental approval projection in the append
+  transaction. Calls whose `TOOL_CALL` precedes the child's latest `FORK` are excluded, as are
+  invalid approval-bearing histories and projections lagging the journal head; the reference
+  is not command authority or a runtime/integrity probe.
+- `agentctl replay -v` also prints each record's content hash and previous hash (16 hex), the
+  execution id, a model call's model and input hash, and a usage record's token counts. Without
+  `-v` the output is unchanged.
 - Go SDK callers can pass opaque per-execution config through `client.ExecOptions.Config`.
   Omitting it keeps the existing empty-config behavior. Config is durable journal content exposed
   by Replay; do not include credentials. No wire or journal schema change.
@@ -85,92 +133,68 @@ provide.
 
 ### Compatibility
 
+- `DeleteSession` permanently retains the UID, metadata and hash-chained journal for audit, hides
+  the session from List and fences further mutations, including historical approval retries and
+  forks. Get and raw Replay remain available; children are independent. PENDING acknowledges only
+  durable intent: no Runtime.Stop, cleanup or resource reclamation is attempted, and COMPLETE is
+  not reported. Actors, snapshots and fork pins remain retained until ownership/cleanup work (#88).
+  SQLite schema v4 adds the tombstone state, timestamps and audit anchor after approval v3 in one
+  transaction without rewriting old events or hashes; existing sessions stay ACTIVE. Older builds
+  refuse v4. Back up before upgrading. The new LIFECYCLE_DELETE hash requires a deletion-aware
+  reader. Cancel remains unimplemented.
+- `Exec` refuses a stateless harness override when the session's served stored harness requires
+  memory snapshots (`FAILED_PRECONDITION`, before any fence or journal write). `Resume` and
+  no-input Exec recovery also refuse an older interrupted override before compute changes or
+  journal repair; an ordinary interrupted turn can be superseded by a new Exec on the stored
+  harness. Parking only the override cannot checkpoint the stored harness's live memory.
+  Stateless-to-stateless overrides are unchanged: a stored runtime without memory-snapshot
+  support is not contacted for this check, even when its remote harness is down.
+- `Approve` and a stateful `Fork` on the same session now exclude each other through the shared
+  checkpoint mark. A refused approval returns `ABORTED` without minting a fence or writing a
+  decision; retry after the fork finishes. This coordination covers one Registry/host only.
+- Ordinary `Resume` and `Suspend` now return `ABORTED`, rather than `INTERNAL`, for journal CAS
+  conflicts (`eventlog.ErrConflict`) and superseded fences (`eventlog.ErrFenced`).
+- Owned unreceipted approval calls block new input, including after a decision. No-input Exec
+  recovers the existing current approval invocation with its recorded config, inputs, route and
+  cursor, checking CAS/deadline under the guard before runtime IO or request repair. Unrelated
+  inputless Exec retains ordinary new-turn behavior. Pending Resume queries do not touch compute;
+  recorded-route Suspend can retry failed automatic handoff for owned approvals, with no
+  stored-default fallback. Inherited approvals suspend through the child's stored-default harness
+  so its own compute is checkpointed; Resume still refuses unresolved inherited tool intents.
+  Gated executor failures become handled EXECUTOR_ERROR receipts for model continuation; a
+  missing executor is a recoverable precondition, not a receipt. Ordinary tool errors are unchanged.
+- Controller Start now carries the session UID on live, replay and resumed invocations, and the
+  bridge includes it on host control frames. Hosts serving tool results must echo the Start
+  session as well as execution/call correlation; omitted or different tool-frame namespaces
+  are rejected, including for ordinary tools. Model reply namespace validation is unchanged.
+  Harness-emitted host-owned request/decision/execution-start records and unsolicited PARKED
+  acknowledgements are rejected by the bridge rather than forwarded to the host sink.
+- Controller and bridge sink methods are serialized per invocation and refuse use after Run
+  closes. A recorded-prefix identity/correlation mismatch remains fatal even if the harness
+  handles the error; it cannot enable later effects or successful completion. Callbacks must
+  not re-enter the same sink. Ordinary handled pre-intent rejections and operational executor
+  errors retain their continuation behavior.
 - Controller and bridge sink calls now honor their own context cancellation, both while queued
   behind another effect and when an uncontended call arrives with an already-canceled context.
   Canceled calls start no effects; Replay and Resume also refuse such calls against older journals
   without consuming recorded evidence. An uncontended call still returns an existing sticky
   park/failure before cancellation. Request/reply serialization and Run shutdown drainage are
   unchanged.
-- `Approve` and a stateful `Fork` on the same session now exclude each other through the shared
-  checkpoint mark. A refused approval returns `ABORTED` without minting a fence or writing a
-  decision; retry after the fork finishes. This coordination covers one Registry/host only.
-- Ordinary `Resume` and `Suspend` now return `ABORTED`, rather than `INTERNAL`, for journal CAS
-  conflicts (`eventlog.ErrConflict`) and superseded fences (`eventlog.ErrFenced`).
-- The `DeleteSession` contract defines permanent soft deletion: retain the UID, metadata and
-  hash-chained journal forever, hide it from `ListSessions`, and keep `GetSession` and raw
-  `Sessions.Replay` for audit. Deleted UIDs cannot be reused or mutated through `Exec`, historical
-  `Fork`, `Resume`, `Suspend`, or approval decisions, including exact approval retries;
-  children remain independent. `OK` with `deletion_state=PENDING` acknowledges durable intent only.
-  Until ownership and cleanup land in #88, actors, fork-child pins and snapshots remain retained:
-  deletion does not call `Runtime.Stop`, report `COMPLETE`, or imply resource reclamation or data
-  erasure. The journal is audit evidence, not an authoritative cleanup-target inventory; #88 owns
-  that schema. Repeated PENDING deletion preserves all timestamps, the journal, fence and compute
-  projection. DELETE advances the captured cursor without resolving a parked approval; deleted
-  sessions retain their execution axis but expose no actionable reference. Local Delete/Fork overlap
-  is `ABORTED` before mutation; serialization covers one Registry/host only, not compute provisioning
-  by an independent host before its first fence.
-  Stateful Fork still supersedes in-flight parent turns by closing their harness streams before
-  checkpointing. Failed fan-out releases the checkpoint before rollback so new parent turns may
-  run, while Delete remains refused until rollback finishes.
-  The new `LIFECYCLE_DELETE` enum-name hash cannot be verified by older binaries; existing records
-  and their canonical hashes are unchanged. The new deletion fields and timestamps are independent
-  of execution and compute state. SQLite schema v4 follows approval-reporting v3 and adds tombstone
-  state/times and the internal audit anchor transactionally; existing rows become ACTIVE with absent
-  times, without rewriting old events or hashes. Older binaries refuse the newer schema: back up before upgrading if rollback
-  is needed. Cancel remains unimplemented.
-- Approval is stateless only: memory-snapshot harnesses cannot use this gate. Requests and decisions
-  are host-owned journal events; exact retries on ACTIVE sessions return the original decision
-  record, including after a receipt or later turn. Deleted sessions refuse even exact retries.
-  Get/List and successful paused/recovery Exec streams expose correlation at their captured cursor. Exec sends an initial Session and, after a successful gate pause or
-  approval-bearing no-input recovery, a final current Session. SDK `TurnResult.Session` and
-  `OnSession` use the latest frame; `LastSeq` includes Session cursors even on query-only recovery
-  and error paths. Clients must drain the stream, not treat its first frame as the outcome.
-- For an existing current approval-bearing execution, no-input Exec uses recorded recovery rather
-  than creating a new invocation: original inputs/config/harness/version/cursor and host routing
-  rules win over request overrides. Explicit CAS is checked under the Registry guard before repair
-  or provisioning, and the request deadline bounds recovery. New inputs are refused until an owned
-  call has a receipt, even after a decision clears `pending_approval`. Ordinary inputless Exec is
-  unchanged; use Resume for general interrupted-turn recovery. Pending/repair Resume has no runtime
-  IO and does not prove compute cold; actual live park success requires ACK, EOF, connection closure,
-  external snapshot and a durable SUSPEND. A second gate does not append RESUME. Suspend of an
-  owned unreceipted approval uses its recorded route, not a fallback session default, with existing
-  registered pins/static collision checks; retired registrations still serve existing sessions.
-  Inherited approvals suspend through the child's stored-default harness so its own compute is
-  checkpointed; Resume still refuses unresolved inherited tool intents.
-  Approval handoffs and recorded-route Suspend hold the Registry's shared checkpoint mark through
-  snapshot and journal append, excluding stateful forks on other routes. A checkpoint-superseded
-  approval turn reports `ABORTED` without starting a second approval snapshot.
-- All Session replies project `EXEC_AWAITING` for valid owned unanswered host approval requests;
-  calls whose `TOOL_CALL` precedes the child's latest `FORK` are excluded. [Reporting and compatibility states](docs/concepts.md#how-exec_state-is-derived).
-- SQLite schema v3 backfills approval reporting without rewriting events/hashes; older builds refuse
-  the database (no downgrade). Undecodable v2 journals are isolated per session without actionable
-  references. Malformed approval evidence stays appendable/readable, but strict commands still refuse
-  it; invalid gated history suppresses references while malformed nongated history does not. SQL
-  migration/append failures roll back; database and metadata decode failures remain `INTERNAL`.
-  `last_seq` remains journal-derived when an already-open older writer skips projection updates;
-  lagging references stay suppressed across later appends and deletion. Low-level Append refuses
-  transport-only `PARKED`; remote reports with host-owned approval receipt fields or codes other
-  than `CODE_UNSPECIFIED`/`EXECUTOR_ERROR` are rejected. `EXECUTOR_ERROR` remains accepted on reports.
-- Approval requests and suspended snapshots/handles are retained indefinitely, without expiry,
-  automatic decision or reclamation. Cancel remains `UNIMPLEMENTED`; decisions
-  provide no cancellation/teardown, policy hook, approval timeout or authorization. Identity is
-  recorded on the decision as caller-supplied provenance only. Hosts still need an external executor
-  with durable deduplication on session UID plus idempotency key. The stock daemon has no executor,
-  and provider tool mapping/application tool loops are not supplied by this gate. Approved executor
-  failures become durable `EXECUTOR_ERROR` receipts for continuation; a missing executor instead
-  leaves the decision recoverable with `FAILED_PRECONDITION`. Denial never invokes the executor.
-- Gate sink operations are serialized, and observer/model/executor callbacks must not re-enter the
-  same sink. Recorded-prefix identity/correlation mismatches remain sticky divergence even if the
-  harness catches the error; they cannot authorize later effects or complete recovery. Changing a
-  recorded gate to keyless controller mediation also diverges; historical keyless ordinary fallback
-  remains handleable. In-harness reports cannot reuse a gated call ID within the invocation, even
-  without approval fields: rejection seals the sink before append, preserving the completed receipt
-  for recovery. A Run error joining a park with an independent failure retains the actual error and
-  pending request without a successful SUSPEND; Sessions returns the normal Exec/Resume failure,
-  not a successful pause or final Session frame. Wrapped or joined matching parks still hand off.
-  Ordinary mediation defaults and argument normalization are unchanged. Populated approval
-  request/decision sequences and receipt fields require a verifier that understands them; zero-valued
-  legacy canonical forms and literal digest vectors are preserved without journal rewrites.
+- SQLite schema version 3 adds the approval projection and captured cursor. Opening a version 2
+  database backfills them atomically without changing event bytes or hashes. An undecodable v2
+  session is isolated with no actionable reference; healthy sessions remain readable. SQL faults
+  roll back the migration, and the older version 1 namespace migration still fails closed.
+  Builds supporting at most version 2 refuse the upgraded database; back it up before upgrading
+  if rollback may be needed. An already-open older writer can still append without updating
+  the projection: `last_seq` stays current, but references remain suppressed for that session
+  rather than skipping missing evidence. Direct out-of-band edits do not refresh the projection.
+- Approval additions preserve old field numbers, default receipt/decision bytes and model-input
+  hashes. New durable receipt status/correlation fields are hash-bound; transient Go approval
+  carriers are excluded from wire receipts and model-input hashing. Low-level Append refuses
+  transport-only `PARKED` events but otherwise remains permissive; projection suppression does
+  not replace validation at command boundaries. Remote harness reports with host-owned approval
+  receipt fields or codes other than `CODE_UNSPECIFIED`/`EXECUTOR_ERROR` are rejected by
+  approval-aware Report validation; `EXECUTOR_ERROR` remains accepted on harness reports.
 - `agentsessionsd -registry-addr` is off by default. Enabling it creates a plaintext,
   unauthenticated **local admin surface** on a separate literal-loopback listener; Sessions still
   refuses registry RPCs, and neither listener gains TLS or authentication. Any local or same-pod
@@ -196,11 +220,19 @@ provide.
   until this host restarts or loads it through `RegisterHarness` with the identical compatible spec.
   For a RETIRED row, restart this host to serve its existing sessions without reactivating it:
   `RegisterHarness` reactivates the row for every host sharing the journal.
+- `openai.New` refuses a base URL that is not absolute (no scheme or host), so `agentsessionsd`
+  exits at startup with `-model-base-url` set to one. Such a URL used to fail every request.
+  It also refuses a query parameter that both the base URL and the path (`WithPath`,
+  `-model-path`) set, such as an `api-version` in each, which was sent twice; set it in one of
+  them. The error names the parameter, never its value.
+- `agentsessionsd` exits at startup with a model API key and a plain-`http` `-model-base-url` to a
+  host that is not loopback, `localhost` or a `.svc` name (see Security). Switch such an
+  endpoint to `https`, or unset the key, before upgrading.
 - New `EXECUTION_START` records include the resolved registry harness name and optional advertised
   harness version (`HarnessDescriptor.version`). Interrupted `Sessions.Resume` uses the recorded
   registry entry, not the session default; an unserved recorded entry or known-version mismatch is
   `FAILED_PRECONDITION`. Session metadata and later default Exec selection are unchanged, as are
-  completed Resume and ordinary Suspend/Fork routing. Older markers without a name fall back to session
+  completed Resume and Suspend/Fork routing. Older markers without a name fall back to session
   metadata; missing/empty recorded versions keep existing unversioned behavior. New Exec still
   accepts unversioned harnesses. Nonempty recorded versions must exactly match the served version,
   including rejection of served empty. Controller Replay preflights all completed invocations
@@ -223,11 +255,9 @@ provide.
   start markers and non-legacy kinds are invalid. Once a modern start marker or ID-bearing
   execution event appears, later ID-less execution events still fail closed. Remaining invalid-log
   refusals are FAILED_PRECONDITION. Inherited-tool safety checks and rollback restrictions remain.
-- Operations that reach the Registry's shared session guard return gRPC `ABORTED` on local overlap:
-  `Exec`, `Suspend`, `Resume`, and `Approve` for one session across all its Placers. New-input Exec
-  against an owned unreceipted approval is an admission `FAILED_PRECONDITION` before that guard.
-  Refused calls do not change compute or the journal. Retry after the in-flight operation finishes;
-  other sessions remain independent. Direct Placer calls return `placement.ErrSessionBusy`.
+- Overlapping `Exec`, `Suspend`, and `Resume` calls for one session across all Placers in one Registry
+  now return gRPC `ABORTED` without changing compute or the journal. Retry after the in-flight operation
+  finishes; other sessions remain independent. Direct Placer calls return `placement.ErrSessionBusy`.
   Standalone Placers have private guards; separate Registries or hosts are not fenced by this guard.
   Construct the Registry before using its Placers; registering already-used Placers or sharing them
   between Registries is unsupported. Idle session guard entries are reclaimed.
@@ -235,8 +265,8 @@ provide.
 - `Runtime.Snapshot(..., SnapshotExternal)` owns the cold transition: capture state, release dedicated
   compute where applicable, and retain any handle needed by `Restore`. Out-of-tree runtimes that only
   capture state must implement that transition themselves; the Placer no longer calls `Stop` afterward.
-  Suspended actors and fork-child snapshot pins are retained indefinitely: intent-only
-  `DeleteSession` does not call `Stop` or reclaim them. Operators must reclaim them directly in Substrate.
+  Suspended actors and fork-child snapshot pins are retained indefinitely: `DeleteSession` is
+  unimplemented and no session teardown calls `Stop`. Operators must reclaim them directly in Substrate.
   No signatures or wire formats change, and restoring a snapshot after destructive `Stop` is not
   guaranteed.
 

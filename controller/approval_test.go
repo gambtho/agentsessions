@@ -1,678 +1,613 @@
-package controller_test
+package controller
 
 import (
+	"context"
+	"database/sql"
 	"errors"
-	"fmt"
 	"path/filepath"
-	"reflect"
 	"testing"
 
 	"github.com/aramase/agentsessions/api"
-	"github.com/aramase/agentsessions/controller"
 	"github.com/aramase/agentsessions/eventlog"
 	"github.com/aramase/agentsessions/sqlitelog"
 )
 
-func approvalLog(t *testing.T, backend string) eventlog.Store {
-	t.Helper()
-	if backend == "memory" {
-		return eventlog.AsStore(eventlog.New())
+func gateEvents() []api.Event {
+	n := int64(0)
+	return []api.Event{
+		{ExecutionID: "e", Kind: api.EventExecutionStart, ExecutionStart: &api.ExecutionStart{InputCount: &n}},
+		{ExecutionID: "e", Kind: api.EventToolCall, ToolCall: &api.ToolCall{ID: "c", Tool: "write", IdempotencyKey: "k", Mediation: api.MediationRequiresApproval}},
+		{ExecutionID: "e", Kind: api.EventApprovalRequest, Approval: &api.ApprovalRequest{ToolCallID: "c"}},
+		{ExecutionID: "e", Kind: api.EventApprovalResult, ApprovalResult: &api.ApprovalResult{ToolCallID: "c", RequestSeq: 3, Approved: true}},
+		{ExecutionID: "e", Kind: api.EventToolResult, Result: &api.ToolResult{ID: "c", ApprovalRequestSeq: 3, ApprovalDecisionSeq: 4}},
+		{ExecutionID: "e", Kind: api.EventEnd, End: &api.HarnessEnd{State: "COMPLETED"}},
 	}
-	s, err := sqlitelog.Open(filepath.Join(t.TempDir(), "journal.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { s.Close() })
-	return s.Session("session")
 }
-
-func approvalAppend(t *testing.T, log eventlog.Store, fence int64, events ...api.Event) eventlog.Record {
+func gateAppend(t *testing.T, log eventlog.Store, events ...api.Event) {
 	t.Helper()
-	var rec eventlog.Record
 	for _, ev := range events {
 		head, err := log.Head()
 		if err != nil {
 			t.Fatal(err)
 		}
-		rec, err = log.Append(head, fence, ev)
-		if err != nil {
+		if _, err := log.Append(head, 0, ev); err != nil {
 			t.Fatal(err)
 		}
 	}
-	return rec
 }
-
-func approvalRecord(t *testing.T, log eventlog.Store, kind api.EventKind) eventlog.Record {
+func gateLog(t *testing.T, events ...api.Event) eventlog.Store {
 	t.Helper()
-	recs, err := log.Read(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, rec := range recs {
-		if rec.Event.Kind == kind {
-			return rec
-		}
-	}
-	t.Fatalf("missing %s", kind)
-	return eventlog.Record{}
+	log := eventlog.AsStore(eventlog.New())
+	gateAppend(t, log, events...)
+	return log
 }
 
-func approvalCall(id string) api.Event {
-	return api.Event{ExecutionID: "e1", Kind: api.EventToolCall, ToolCall: &api.ToolCall{
-		ID: id, Tool: "write", Args: map[string]any{"path": "report.txt"},
-		Mediation: api.MediationRequiresApproval, IdempotencyKey: "key",
-	}}
+type approvalHarness struct {
+	runs, describes int
+	fn              func(context.Context, *api.Start, api.EventSink) error
 }
 
-func approvalSeed(t *testing.T, log eventlog.Store, modern bool, cut api.EventKind) {
-	t.Helper()
-	if modern {
-		count := int64(1)
-		approvalAppend(t, log, 0,
-			api.Event{ExecutionID: "e1", Kind: api.EventExecutionStart, ExecutionStart: &api.ExecutionStart{
-				InputCount: &count, Config: []byte("opaque"), ResumeFromSeq: 17, Harness: "recorded", HarnessVersion: "v1",
-			}},
-			api.Event{ExecutionID: "e1", Kind: api.EventInput, Message: api.TextMessage("user", "write")})
-	}
-	approvalAppend(t, log, 0, approvalCall("c1"))
-	if cut == api.EventToolCall {
-		return
-	}
-	req := approvalAppend(t, log, 0, api.Event{ExecutionID: "e1", Kind: api.EventApprovalRequest, Approval: &api.ApprovalRequest{ToolCallID: "c1", Reason: "destructive"}})
-	if cut == api.EventApprovalRequest {
-		return
-	}
-	dec := approvalAppend(t, log, 0, api.Event{ExecutionID: "e1", Kind: api.EventApprovalResult, ApprovalResult: &api.ApprovalResult{ToolCallID: "c1", RequestSeq: req.Seq, Approved: true, Reason: "ok"}})
-	if cut == api.EventApprovalResult {
-		return
-	}
-	approvalAppend(t, log, 0, api.Event{ExecutionID: "e1", Kind: api.EventToolResult, Result: &api.ToolResult{ID: "c1", ApprovalRequestSeq: req.Seq, ApprovalDecisionSeq: dec.Seq}})
-	if cut == api.EventToolResult {
-		return
-	}
-	approvalAppend(t, log, 0, api.Event{ExecutionID: "e1", Kind: api.EventEnd, End: &api.HarnessEnd{State: "COMPLETED"}})
+func (h *approvalHarness) Describe(context.Context) (api.Descriptor, error) {
+	h.describes++
+	return api.Descriptor{ID: "gate", Capabilities: api.Capabilities{Resumability: api.ResumabilityStatelessReplay}}, nil
 }
-
-func TestInspectApprovalCuts(t *testing.T) {
-	for _, backend := range []string{"memory", "sqlite"} {
-		for _, modern := range []bool{false, true} {
-			for _, cut := range []api.EventKind{api.EventToolCall, api.EventApprovalRequest, api.EventApprovalResult, api.EventToolResult, api.EventEnd} {
-				t.Run(fmt.Sprintf("%s/modern=%t/%s", backend, modern, cut), func(t *testing.T) {
-					log := approvalLog(t, backend)
-					approvalSeed(t, log, modern, cut)
-					head, _ := log.Head()
-					got, err := controller.InspectApproval(log, 0)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if got == nil || got.ExecutionID != "e1" || got.Call == nil || got.Call.ID != "c1" || got.Head != head || got.Inherited || got.Completed != (cut == api.EventEnd) {
-						t.Fatalf("state=%+v", got)
-					}
-					if !reflect.DeepEqual(*got.Call, *approvalCall("c1").ToolCall) {
-						t.Fatalf("changed original call: %+v", got.Call)
-					}
-					if modern {
-						if got.Invocation == nil || string(got.Invocation.Config) != "opaque" || got.Invocation.ResumeFromSeq != 17 || got.Invocation.Harness != "recorded" || got.Invocation.HarnessVersion != "v1" || got.Invocation.InputCount == nil || *got.Invocation.InputCount != 1 {
-							t.Fatalf("invocation=%+v", got.Invocation)
-						}
-					} else if got.Invocation != nil {
-						t.Fatalf("invented legacy invocation: %+v", got.Invocation)
-					}
-					for _, check := range []struct {
-						kind api.EventKind
-						got  *eventlog.Record
-						want bool
-					}{
-						{api.EventApprovalRequest, got.Request, cut != api.EventToolCall},
-						{api.EventApprovalResult, got.Decision, cut == api.EventApprovalResult || cut == api.EventToolResult || cut == api.EventEnd},
-						{api.EventToolResult, got.Receipt, cut == api.EventToolResult || cut == api.EventEnd},
-					} {
-						if (check.got != nil) != check.want {
-							t.Fatalf("%s=%+v want present=%t", check.kind, check.got, check.want)
-						}
-						if check.want && !reflect.DeepEqual(*check.got, approvalRecord(t, log, check.kind)) {
-							t.Fatalf("did not retain original %s record", check.kind)
-						}
-					}
-				})
-			}
-		}
+func (h *approvalHarness) Run(ctx context.Context, start *api.Start, sink api.EventSink) error {
+	h.runs++
+	if h.fn != nil {
+		return h.fn(ctx, start, sink)
 	}
+	return nil
 }
-
-func TestInspectApprovalCapturedPrefix(t *testing.T) {
-	for _, backend := range []string{"memory", "sqlite"} {
-		t.Run(backend, func(t *testing.T) {
-			log := approvalLog(t, backend)
-			approvalSeed(t, log, true, api.EventApprovalRequest)
-			req := approvalRecord(t, log, api.EventApprovalRequest)
-			approvalAppend(t, log, 0,
-				api.Event{ExecutionID: "e1", Kind: api.EventApprovalResult, ApprovalResult: &api.ApprovalResult{ToolCallID: "c1", RequestSeq: req.Seq, Approved: true}},
-				api.Event{ExecutionID: "e2", Kind: api.EventInput, Message: api.TextMessage("user", "new")},
-				api.Event{ExecutionID: "e2", Kind: api.EventApprovalRequest, Approval: &api.ApprovalRequest{ToolCallID: "bogus"}})
-			got, err := controller.InspectApproval(log, req.Seq)
-			if err != nil || got == nil || got.Head != req.Seq || got.Decision != nil || got.ExecutionID != "e1" {
-				t.Fatalf("captured state=%+v err=%v", got, err)
-			}
-			if _, err := controller.InspectApproval(log, 0); !errors.Is(err, controller.ErrInvalidExecutionLog) {
-				t.Fatalf("current err=%v want invalid log", err)
-			}
-		})
-	}
-}
-
-func TestInspectApprovalFirstSeenSelectionAndOrdinaryEscape(t *testing.T) {
-	for _, backend := range []string{"memory", "sqlite"} {
-		t.Run(backend, func(t *testing.T) {
-			log := approvalLog(t, backend)
-			approvalSeed(t, log, true, api.EventApprovalRequest)
-			approvalAppend(t, log, 0,
-				api.Event{ExecutionID: "e2", Kind: api.EventExecutionStart}, // unrelated incomplete/malformed start must not be validated
-				api.Event{ExecutionID: "e1", Kind: api.EventError, Err: &api.Error{Description: "late old error"}},
-				api.Event{ExecutionID: "tail", Kind: api.EventLifecycle, Lifecycle: &api.Lifecycle{Kind: api.LifecycleSuspend}})
-			got, err := controller.InspectApproval(log, 0)
-			if err != nil || got != nil {
-				t.Fatalf("nongated latest state=%+v err=%v", got, err)
-			}
-			oldReq := approvalRecord(t, log, api.EventApprovalRequest)
-			if _, err := controller.Approve(log, api.ApprovalDecision{ExecutionID: "e1", ToolCallID: "c1", RequestSeq: oldReq.Seq, Approved: true}); !errors.Is(err, controller.ErrInvalidApprovalDecision) {
-				t.Fatalf("superseded request err=%v", err)
-			}
-		})
-	}
-}
-
-func TestInspectApprovalSequentialCalls(t *testing.T) {
-	log := approvalLog(t, "sqlite")
-	approvalSeed(t, log, false, api.EventToolResult)
-	approvalAppend(t, log, 0, approvalCall("c2"))
-	middleRequest := approvalAppend(t, log, 0, api.Event{ExecutionID: "e1", Kind: api.EventApprovalRequest, Approval: &api.ApprovalRequest{ToolCallID: "c2"}})
-	middleDecision := approvalAppend(t, log, 0, api.Event{ExecutionID: "e1", Kind: api.EventApprovalResult, ApprovalResult: &api.ApprovalResult{ToolCallID: "c2", RequestSeq: middleRequest.Seq, Approved: true}})
-	approvalAppend(t, log, 0, api.Event{ExecutionID: "e1", Kind: api.EventToolResult, Result: &api.ToolResult{ID: "c2", ApprovalRequestSeq: middleRequest.Seq, ApprovalDecisionSeq: middleDecision.Seq}}, approvalCall("c3"))
-	req := approvalAppend(t, log, 0, api.Event{ExecutionID: "e1", Kind: api.EventApprovalRequest, Approval: &api.ApprovalRequest{ToolCallID: "c3"}})
-	got, err := controller.InspectApproval(log, 0)
-	if err != nil || got == nil || got.Call.ID != "c3" || got.Request.Seq != req.Seq || got.Decision != nil || got.Receipt != nil {
-		t.Fatalf("later unresolved state=%+v err=%v", got, err)
-	}
-	// An identical older decision remains retryable within the same execution too.
-	oldReq := approvalRecord(t, log, api.EventApprovalRequest)
-	oldDec := approvalRecord(t, log, api.EventApprovalResult)
-	gotDec, err := controller.Approve(log, api.ApprovalDecision{ExecutionID: "e1", ToolCallID: "c1", RequestSeq: oldReq.Seq, Approved: true, Reason: "ok"})
-	if err != nil || !reflect.DeepEqual(gotDec, oldDec) {
-		t.Fatalf("historical retry=%+v err=%v", gotDec, err)
-	}
-}
-
-// These literals deliberately do not use projection or production correlation helpers.
-func approvalEvidence() []api.Event {
-	return []api.Event{
-		approvalCall("c1"),
-		{ExecutionID: "e1", Kind: api.EventApprovalRequest, Approval: &api.ApprovalRequest{ToolCallID: "c1"}},
-		{ExecutionID: "e1", Kind: api.EventApprovalResult, ApprovalResult: &api.ApprovalResult{ToolCallID: "c1", RequestSeq: 2, Approved: true}},
-		{ExecutionID: "e1", Kind: api.EventToolResult, Result: &api.ToolResult{ID: "c1", ApprovalRequestSeq: 2, ApprovalDecisionSeq: 3}},
-	}
-}
-
-func TestInspectApprovalRejectsBadEvidence(t *testing.T) {
-	cases := []struct {
-		name              string
-		kind              api.EventKind
-		mutate            func(*api.Event)
-		remove, duplicate bool
-		want              error
-	}{
-		{name: "idless gate", kind: api.EventToolCall, mutate: func(e *api.Event) { e.ExecutionID = "" }, want: controller.ErrInvalidExecutionLog},
-		{name: "call missing id", kind: api.EventToolCall, mutate: func(e *api.Event) { e.ToolCall.ID = "" }, want: controller.ErrInvalidExecutionLog},
-		{name: "call missing key", kind: api.EventToolCall, mutate: func(e *api.Event) { e.ToolCall.IdempotencyKey = "" }, want: controller.ErrMissingIdempotencyKey},
-		{name: "not mediated", kind: api.EventToolCall, mutate: func(e *api.Event) { e.ToolCall.Mediation = api.MediationControllerMediated }, want: controller.ErrInvalidExecutionLog},
-		{name: "call missing", kind: api.EventToolCall, remove: true, want: controller.ErrInvalidExecutionLog},
-		{name: "call duplicate", kind: api.EventToolCall, duplicate: true, want: controller.ErrInvalidExecutionLog},
-		{name: "request missing", kind: api.EventApprovalRequest, remove: true, want: controller.ErrInvalidExecutionLog},
-		{name: "request payload", kind: api.EventApprovalRequest, mutate: func(e *api.Event) { e.Approval = nil }, want: controller.ErrInvalidExecutionLog},
-		{name: "request wrong call", kind: api.EventApprovalRequest, mutate: func(e *api.Event) { e.Approval.ToolCallID = "wrong" }, want: controller.ErrReplayDiverged},
-		{name: "request wrong execution", kind: api.EventApprovalRequest, mutate: func(e *api.Event) { e.ExecutionID = "other" }, want: controller.ErrInvalidExecutionLog},
-		{name: "request duplicate", kind: api.EventApprovalRequest, duplicate: true, want: controller.ErrInvalidExecutionLog},
-		{name: "decision missing", kind: api.EventApprovalResult, remove: true, want: controller.ErrInvalidExecutionLog},
-		{name: "decision payload", kind: api.EventApprovalResult, mutate: func(e *api.Event) { e.ApprovalResult = nil }, want: controller.ErrInvalidExecutionLog},
-		{name: "decision wrong call", kind: api.EventApprovalResult, mutate: func(e *api.Event) { e.ApprovalResult.ToolCallID = "wrong" }, want: controller.ErrReplayDiverged},
-		{name: "decision zero seq", kind: api.EventApprovalResult, mutate: func(e *api.Event) { e.ApprovalResult.RequestSeq = 0 }, want: controller.ErrReplayDiverged},
-		{name: "decision wrong seq", kind: api.EventApprovalResult, mutate: func(e *api.Event) { e.ApprovalResult.RequestSeq = 1 }, want: controller.ErrReplayDiverged},
-		{name: "decision duplicate", kind: api.EventApprovalResult, duplicate: true, want: controller.ErrInvalidExecutionLog},
-		{name: "decision conflict", kind: api.EventApprovalResult, duplicate: true, mutate: func(e *api.Event) { e.ApprovalResult.Approved = false }, want: controller.ErrInvalidExecutionLog},
-		{name: "receipt payload", kind: api.EventToolResult, mutate: func(e *api.Event) { e.Result = nil }, want: controller.ErrInvalidExecutionLog},
-		{name: "receipt wrong call", kind: api.EventToolResult, mutate: func(e *api.Event) { e.Result.ID = "wrong" }, want: controller.ErrReplayDiverged},
-		{name: "receipt zero request", kind: api.EventToolResult, mutate: func(e *api.Event) { e.Result.ApprovalRequestSeq = 0 }, want: controller.ErrReplayDiverged},
-		{name: "receipt wrong request", kind: api.EventToolResult, mutate: func(e *api.Event) { e.Result.ApprovalRequestSeq = 1 }, want: controller.ErrReplayDiverged},
-		{name: "receipt zero decision", kind: api.EventToolResult, mutate: func(e *api.Event) { e.Result.ApprovalDecisionSeq = 0 }, want: controller.ErrReplayDiverged},
-		{name: "receipt wrong decision", kind: api.EventToolResult, mutate: func(e *api.Event) { e.Result.ApprovalDecisionSeq = 2 }, want: controller.ErrReplayDiverged},
-		{name: "receipt duplicate", kind: api.EventToolResult, duplicate: true, want: controller.ErrInvalidExecutionLog},
-		{name: "receipt contradicts approval", kind: api.EventToolResult, mutate: func(e *api.Event) { e.Result.Code = api.ToolResultCodeApprovalDenied; e.Result.IsError = true }, want: controller.ErrReplayDiverged},
-	}
-	for _, backend := range []string{"memory", "sqlite"} {
-		for _, tc := range cases {
-			t.Run(backend+"/"+tc.name, func(t *testing.T) {
-				log := approvalLog(t, backend)
-				for _, ev := range approvalEvidence() {
-					if ev.Kind == tc.kind {
-						if tc.remove {
-							continue
-						}
-						if tc.duplicate {
-							approvalAppend(t, log, 0, ev)
-						}
-						if tc.mutate != nil {
-							tc.mutate(&ev)
-						}
-					}
-					approvalAppend(t, log, 0, ev)
-				}
-				if _, err := controller.InspectApproval(log, 0); !errors.Is(err, tc.want) {
-					t.Fatalf("err=%v want %v", err, tc.want)
-				}
-			})
-		}
-	}
-}
-
-func TestInspectApprovalRejectsContinuation(t *testing.T) {
-	for _, cut := range []api.EventKind{api.EventToolCall, api.EventApprovalRequest, api.EventApprovalResult} {
-		for _, ev := range []api.Event{
-			{ExecutionID: "e1", Kind: api.EventModelCall, ModelCall: &api.ModelCall{ID: "model"}},
-			{ExecutionID: "e1", Kind: api.EventOutput, Message: api.TextMessage("assistant", "continued")},
-			approvalCall("c2"),
-			{ExecutionID: "e1", Kind: api.EventUsage, Usage: &api.Usage{}},
-			{ExecutionID: "e1", Kind: api.EventInput, Message: api.TextMessage("user", "continued")},
-			{ExecutionID: "e1", Kind: api.EventEnd, End: &api.HarnessEnd{State: "COMPLETED"}},
-		} {
-			t.Run(string(cut)+"/"+string(ev.Kind), func(t *testing.T) {
-				log := approvalLog(t, "memory")
-				approvalSeed(t, log, false, cut)
-				approvalAppend(t, log, 0, ev)
-				if _, err := controller.InspectApproval(log, 0); !errors.Is(err, controller.ErrInvalidExecutionLog) {
-					t.Fatalf("err=%v want invalid log", err)
-				}
-			})
-		}
-	}
-}
-
-func TestInspectApprovalErrorAndLifecycleDoNotResolve(t *testing.T) {
-	log := approvalLog(t, "sqlite")
-	approvalSeed(t, log, false, api.EventApprovalRequest)
-	approvalAppend(t, log, 0,
-		api.Event{ExecutionID: "e1", Kind: api.EventError, Err: &api.Error{Description: "interrupted"}},
-		api.Event{ExecutionID: "unrelated", Kind: api.EventLifecycle, Lifecycle: &api.Lifecycle{Kind: api.LifecycleSuspend}})
-	got, err := controller.InspectApproval(log, 0)
-	if err != nil || got == nil || got.Decision != nil || got.Completed || got.ExecutionID != "e1" {
-		t.Fatalf("state=%+v err=%v", got, err)
-	}
-}
-
-func TestApproveDecisionAndHistoricRetryDoNotFence(t *testing.T) {
-	for _, backend := range []string{"memory", "sqlite"} {
-		for _, approved := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/approved=%t", backend, approved), func(t *testing.T) {
-				log := approvalLog(t, backend)
-				approvalSeed(t, log, true, api.EventApprovalRequest)
-				req := approvalRecord(t, log, api.EventApprovalRequest)
-				decision := api.ApprovalDecision{ExecutionID: "e1", ToolCallID: "c1", RequestSeq: req.Seq, Approved: approved, Reason: "explicit", Identity: api.IdentityRef{Principal: "human", Issuer: "issuer", Subject: "subject"}}
-				rec, err := controller.Approve(log, decision)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if rec.Seq != req.Seq+1 || rec.Event.Kind != api.EventApprovalResult || rec.Event.ExecutionID != "e1" || rec.Event.Actor != decision.Identity || rec.Event.ApprovalResult == nil || *rec.Event.ApprovalResult != (api.ApprovalResult{ToolCallID: "c1", RequestSeq: req.Seq, Approved: approved, Reason: "explicit"}) {
-					t.Fatalf("decision record=%+v", rec)
-				}
-				writer, err := log.NewFence()
-				if err != nil {
-					t.Fatal(err)
-				}
-				immediate, err := controller.Approve(log, decision)
-				if err != nil || !reflect.DeepEqual(immediate, rec) {
-					t.Fatalf("decided-prefix exact retry=%+v err=%v", immediate, err)
-				}
-				result := &api.ToolResult{ID: "c1", ApprovalRequestSeq: req.Seq, ApprovalDecisionSeq: rec.Seq}
-				if !approved {
-					result.Code = api.ToolResultCodeApprovalDenied
-					result.IsError = true
-					result.Error = "explicit"
-				}
-				approvalAppend(t, log, writer,
-					api.Event{ExecutionID: "e1", Kind: api.EventToolResult, Result: result},
-					api.Event{ExecutionID: "e1", Kind: api.EventEnd, End: &api.HarnessEnd{State: "COMPLETED"}},
-					api.Event{ExecutionID: "e2", Kind: api.EventInput, Message: api.TextMessage("user", "next")})
-				head, _ := log.Head()
-				retry, err := controller.Approve(log, decision)
-				if err != nil || !reflect.DeepEqual(retry, rec) {
-					t.Fatalf("exact retry=%+v err=%v want %+v", retry, err, rec)
-				}
-				if after, _ := log.Head(); after != head {
-					t.Fatalf("retry appended: %d -> %d", head, after)
-				}
-				approvalAppend(t, log, writer, api.Event{ExecutionID: "e2", Kind: api.EventError, Err: &api.Error{Description: "still owns fence"}})
-				if err := log.Verify(); err != nil {
-					t.Fatal(err)
-				}
-			})
-		}
-	}
-}
-
-func TestApproveInvalidDoesNotFence(t *testing.T) {
-	for _, backend := range []string{"memory", "sqlite"} {
-		for _, mode := range []string{"pending", "decided", "call-only"} {
-			for _, field := range []string{"execution", "call", "seq", "missing execution", "missing call", "zero seq", "negative seq", "approved", "reason", "principal", "issuer", "subject"} {
-				if mode != "decided" && (field == "approved" || field == "reason" || field == "principal" || field == "issuer" || field == "subject") {
-					continue
-				}
-				t.Run(backend+"/"+mode+"/"+field, func(t *testing.T) {
-					log := approvalLog(t, backend)
-					cut := api.EventApprovalRequest
-					switch mode {
-					case "decided":
-						cut = api.EventApprovalResult
-					case "call-only":
-						cut = api.EventToolCall
-					}
-					approvalSeed(t, log, false, cut)
-					decision := api.ApprovalDecision{ExecutionID: "e1", ToolCallID: "c1", RequestSeq: 2, Approved: true, Reason: "ok"}
-					switch field {
-					case "execution":
-						decision.ExecutionID = "wrong"
-					case "call":
-						decision.ToolCallID = "wrong"
-					case "seq":
-						decision.RequestSeq = 1
-					case "missing execution":
-						decision.ExecutionID = ""
-					case "missing call":
-						decision.ToolCallID = ""
-					case "zero seq":
-						decision.RequestSeq = 0
-					case "negative seq":
-						decision.RequestSeq = -1
-					case "approved":
-						decision.Approved = false
-					case "reason":
-						decision.Reason = "changed"
-					case "principal":
-						decision.Identity.Principal = "changed"
-					case "issuer":
-						decision.Identity.Issuer = "changed"
-					case "subject":
-						decision.Identity.Subject = "changed"
-					}
-					writer, err := log.NewFence()
-					if err != nil {
-						t.Fatal(err)
-					}
-					head, _ := log.Head()
-					if _, err := controller.Approve(log, decision); !errors.Is(err, controller.ErrInvalidApprovalDecision) {
-						t.Fatalf("err=%v want invalid decision", err)
-					}
-					if after, _ := log.Head(); after != head {
-						t.Fatal("invalid decision appended")
-					}
-					approvalAppend(t, log, writer, api.Event{ExecutionID: "e1", Kind: api.EventError, Err: &api.Error{Description: "writer retained fence"}})
-				})
-			}
-		}
-	}
-}
-
-func TestInspectAndApproveForkOwnership(t *testing.T) {
-	for _, backend := range []string{"memory", "sqlite"} {
-		for _, cut := range []api.EventKind{api.EventToolCall, api.EventApprovalRequest, api.EventApprovalResult, api.EventToolResult} {
-			t.Run(backend+"/"+string(cut), func(t *testing.T) {
-				parent := approvalLog(t, backend)
-				approvalSeed(t, parent, false, cut)
-				child := approvalLog(t, backend)
-				atSeq, err := parent.Head()
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := controller.Fork(parent, child, atSeq); err != nil {
-					t.Fatal(err)
-				}
-				writer, err := child.NewFence()
-				if err != nil {
-					t.Fatal(err)
-				}
-				got, err := controller.InspectApproval(child, 0)
-				if err != nil || got == nil || !got.Inherited {
-					t.Fatalf("fork state=%+v err=%v", got, err)
-				}
-				decision := api.ApprovalDecision{ExecutionID: "e1", ToolCallID: "c1", RequestSeq: 2, Approved: true, Reason: "ok"}
-				if _, err := controller.Approve(child, decision); !errors.Is(err, controller.ErrInvalidApprovalDecision) {
-					t.Fatalf("inherited decision err=%v", err)
-				}
-				if cut == api.EventApprovalResult {
-					approvalAppend(t, child, writer, api.Event{ExecutionID: "e1", Kind: api.EventToolResult, Result: &api.ToolResult{ID: "c1", ApprovalRequestSeq: 2, ApprovalDecisionSeq: 3}})
-					got, err = controller.InspectApproval(child, 0)
-					if err != nil || got == nil || got.Receipt == nil || !got.Inherited {
-						t.Fatalf("later inherited receipt=%+v err=%v", got, err)
-					}
-				}
-				approvalAppend(t, child, writer, api.Event{ExecutionID: "e2", Kind: api.EventInput, Message: api.TextMessage("user", "new")})
-				if got, err := controller.InspectApproval(child, 0); err != nil || got != nil {
-					t.Fatalf("child new-turn escape state=%+v err=%v", got, err)
-				}
-			})
-		}
-	}
-}
-
-func TestInspectApprovalLatestGateWithLateOldRecords(t *testing.T) {
-	for _, backend := range []string{"memory", "sqlite"} {
-		t.Run(backend, func(t *testing.T) {
-			log := approvalLog(t, backend)
-			approvalSeed(t, log, false, api.EventApprovalResult)
-			oldRequest := approvalRecord(t, log, api.EventApprovalRequest)
-			oldDecision := approvalRecord(t, log, api.EventApprovalResult)
-			call := approvalCall("c1") // IDs and keys may be reused by another execution.
-			call.ExecutionID = "e2"
-			approvalAppend(t, log, 0, call)
-			request := approvalAppend(t, log, 0, api.Event{ExecutionID: "e2", Kind: api.EventApprovalRequest, Approval: &api.ApprovalRequest{ToolCallID: "c1"}})
-			approvalAppend(t, log, 0,
-				api.Event{ExecutionID: "e1", Kind: api.EventToolResult, Result: &api.ToolResult{ID: "c1", ApprovalRequestSeq: oldRequest.Seq, ApprovalDecisionSeq: oldDecision.Seq}},
-				api.Event{ExecutionID: "e1", Kind: api.EventEnd, End: &api.HarnessEnd{State: "COMPLETED"}},
-				api.Event{ExecutionID: "e1", Kind: api.EventError, Err: &api.Error{Description: "late"}},
-				api.Event{ExecutionID: "lifecycle", Kind: api.EventLifecycle, Lifecycle: &api.Lifecycle{Kind: api.LifecycleSuspend}})
-			got, err := controller.InspectApproval(log, 0)
-			if err != nil || got == nil || got.ExecutionID != "e2" || got.Request.Seq != request.Seq || got.Completed {
-				t.Fatalf("latest state=%+v err=%v", got, err)
-			}
-			decision, err := controller.Approve(log, api.ApprovalDecision{ExecutionID: "e2", ToolCallID: "c1", RequestSeq: request.Seq, Approved: true})
-			if err != nil || decision.Event.ExecutionID != "e2" {
-				t.Fatalf("latest decision=%+v err=%v", decision, err)
-			}
-		})
-	}
-}
-
-func TestInspectApprovalInvocationValidationIsScoped(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		count   *int64
-		message *api.Message
-		want    error
-	}{
-		{name: "missing count", message: api.TextMessage("user", "hi"), want: controller.ErrInvalidExecutionLog},
-		{name: "negative count", count: approvalCount(-1), message: api.TextMessage("user", "hi"), want: controller.ErrInvalidExecutionLog},
-		{name: "incomplete", count: approvalCount(2), message: api.TextMessage("user", "hi"), want: controller.ErrIncompleteInvocation},
-		{name: "too many", count: approvalCount(0), message: api.TextMessage("user", "hi"), want: controller.ErrInvalidExecutionLog},
-		{name: "missing message", count: approvalCount(1), want: controller.ErrInvalidExecutionLog},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			log := approvalLog(t, "sqlite")
-			approvalAppend(t, log, 0,
-				api.Event{ExecutionID: "e1", Kind: api.EventExecutionStart, ExecutionStart: &api.ExecutionStart{InputCount: tc.count}},
-				api.Event{ExecutionID: "e1", Kind: api.EventInput, Message: tc.message},
-				approvalCall("c1"))
-			request := approvalAppend(t, log, 0, api.Event{ExecutionID: "e1", Kind: api.EventApprovalRequest, Approval: &api.ApprovalRequest{ToolCallID: "c1"}})
-			writer, err := log.NewFence()
+func TestApprovalPublicActivation(t *testing.T) {
+	for _, cut := range []int{2, 3, 4, 5, 6} {
+		t.Run(string(rune('0'+cut)), func(t *testing.T) {
+			log := gateLog(t, gateEvents()[:cut]...)
+			effects := 0
+			c, err := New(log, nil, WithSessionUID("s"), WithToolExecutor(func(context.Context, ToolCallContext, api.ToolCall) (api.ToolResult, error) {
+				effects++
+				return api.ToolResult{}, nil
+			}))
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := controller.InspectApproval(log, 0); !errors.Is(err, tc.want) {
-				t.Fatalf("inspect err=%v want %v", err, tc.want)
+			h := &approvalHarness{fn: func(ctx context.Context, _ *api.Start, s api.EventSink) error {
+				_, err := s.ToolCall(ctx, *gateEvents()[1].ToolCall)
+				return err
+			}}
+			_, err = c.Resume(t.Context(), h)
+			if cut <= 3 {
+				if !errors.Is(err, api.ErrApprovalParked) || h.runs != 0 || h.describes != 0 || effects != 0 {
+					t.Fatalf("pending=%v runs=%d describe=%d effects=%d", err, h.runs, h.describes, effects)
+				}
+				if head, _ := log.Head(); head != 3 {
+					t.Fatalf("repair head=%d", head)
+				}
+			} else if err != nil || effects != map[int]int{4: 1, 5: 0, 6: 0}[cut] {
+				t.Fatalf("decided=%v effects=%d", err, effects)
 			}
-			if _, err := controller.Approve(log, api.ApprovalDecision{ExecutionID: "e1", ToolCallID: "c1", RequestSeq: request.Seq}); !errors.Is(err, tc.want) {
-				t.Fatalf("approve err=%v want %v", err, tc.want)
-			}
-			approvalAppend(t, log, writer, api.Event{ExecutionID: "e1", Kind: api.EventError, Err: &api.Error{Description: "still owns fence"}})
 		})
 	}
-	for _, events := range [][]api.Event{
-		nil,
-		{{Kind: api.EventLifecycle, Lifecycle: &api.Lifecycle{Kind: api.LifecycleSuspend}}},
-		{{Kind: api.EventInput, Message: api.TextMessage("user", "ID-less legacy")}, {Kind: api.EventToolCall}},
-		{{ExecutionID: "ordinary", Kind: api.EventExecutionStart}, {ExecutionID: "ordinary", Kind: api.EventToolCall}},
+	t.Run("live sticky public park", func(t *testing.T) {
+		log := gateLog(t)
+		c, err := New(log, nil, WithSessionUID("s"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := &approvalHarness{fn: func(ctx context.Context, _ *api.Start, s api.EventSink) error {
+			_, err := s.ToolCall(ctx, *gateEvents()[1].ToolCall)
+			if !errors.Is(err, api.ErrApprovalParked) {
+				t.Fatalf("live gate=%v", err)
+			}
+			for _, late := range allGateMethods(ctx, s) {
+				if !errors.Is(late, api.ErrApprovalParked) {
+					t.Fatalf("late=%v", late)
+				}
+			}
+			return err
+		}}
+		if err := c.Exec(t.Context(), h, nil, 0); !errors.Is(err, api.ErrApprovalParked) {
+			t.Fatal(err)
+		}
+		if head, _ := log.Head(); head != 3 {
+			t.Fatalf("head=%d", head)
+		}
+		if err := c.Exec(t.Context(), h, []api.Message{*api.TextMessage("user", "new")}, 3); !errors.Is(err, ErrApprovalBlocked) || controllerErrorKind(err) != "approval_blocked" {
+			t.Fatal(err)
+		}
+	})
+	t.Run("marked malformed receipt", func(t *testing.T) {
+		log := gateLog(t, api.Event{ExecutionID: "e", Kind: api.EventToolResult, Result: &api.ToolResult{ID: "ordinary", ApprovalRequestSeq: 9}})
+		c, err := New(log, nil, WithSessionUID("s"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := &approvalHarness{}
+		_, err = c.Resume(t.Context(), h)
+		if !errors.Is(err, ErrInvalidExecutionLog) || h.runs != 0 || h.describes != 0 {
+			t.Fatalf("malformed=%v", err)
+		}
+	})
+}
+
+func TestApprovalScannerAndSQLOracle(t *testing.T) {
+	base := gateEvents()
+	for _, tc := range []struct {
+		name    string
+		events  []api.Event
+		invalid bool
+	}{
+		{"call", base[:2], false}, {"request", base[:3], false}, {"decision", base[:4], false}, {"receipt", base[:5], false}, {"complete", base, false},
+		{"second request", append(append([]api.Event{}, base[:5]...), api.Event{ExecutionID: "e", Kind: api.EventToolCall, ToolCall: &api.ToolCall{ID: "second", IdempotencyKey: "k2", Mediation: api.MediationRequiresApproval}}, api.Event{ExecutionID: "e", Kind: api.EventApprovalRequest, Approval: &api.ApprovalRequest{ToolCallID: "second"}}), false},
+		{"duplicate request", append(append([]api.Event{}, base[:3]...), base[2]), true},
+		{"continue open", append(append([]api.Event{}, base[:3]...), base[5]), true},
+		{"unbound decision", []api.Event{base[0], base[3]}, true},
+		{"unbound receipt", []api.Event{base[0], base[4]}, true},
 	} {
-		log := approvalLog(t, "memory")
-		approvalAppend(t, log, 0, events...)
-		if got, err := controller.InspectApproval(log, 0); err != nil || got != nil {
-			t.Fatalf("ordinary history state=%+v err=%v", got, err)
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := sqlitelog.Open(filepath.Join(t.TempDir(), "journal.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			log := store.Session("s")
+			gateAppend(t, log, tc.events...)
+			state, strictErr := InspectApproval(log, 0)
+			if (strictErr != nil) != tc.invalid {
+				t.Fatalf("strict oracle: state=%+v err=%v", state, strictErr)
+			}
+			info, err := store.SessionInfo("s")
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := api.ApprovalRef{}
+			if strictErr == nil && state != nil && !state.Inherited && !state.Completed && state.Request != nil && state.Decision == nil {
+				want = api.ApprovalRef{ExecutionID: state.ExecutionID, ToolCallID: state.Call.ID, RequestSeq: state.Request.Seq}
+			}
+			if info.PendingApproval != want {
+				t.Fatalf("projection=%+v strict=%+v", info.PendingApproval, want)
+			}
+		})
+	}
+	for _, status := range []api.ToolResultCode{api.ToolResultCodeApprovalDenied, api.ToolResultCodeExecutorError} {
+		t.Run(string(status), func(t *testing.T) {
+			b := gateEvents()
+			b[3].ApprovalResult.Approved = status != api.ToolResultCodeApprovalDenied
+			b[4].Result.Code = status
+			b[4].Result.IsError = true
+			b = append(b[:5], api.Event{ExecutionID: "e", Kind: api.EventToolCall, ToolCall: &api.ToolCall{ID: "second", IdempotencyKey: "k2", Mediation: api.MediationRequiresApproval}}, api.Event{ExecutionID: "e", Kind: api.EventApprovalRequest, Approval: &api.ApprovalRequest{ToolCallID: "second"}})
+			s, err := sqlitelog.Open(":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			gateAppend(t, s.Session("s"), b...)
+			state, err := InspectApproval(s.Session("s"), 0)
+			if err != nil || state.Call.ID != "second" {
+				t.Fatalf("strict=%+v %v", state, err)
+			}
+			info, err := s.SessionInfo("s")
+			if err != nil || info.PendingApproval != (api.ApprovalRef{ExecutionID: "e", ToolCallID: "second", RequestSeq: 7}) {
+				t.Fatalf("projection=%+v %v", info, err)
+			}
+		})
+	}
+	for _, change := range []struct {
+		name   string
+		mutate func([]api.Event)
+	}{
+		{"empty key", func(b []api.Event) { b[1].ToolCall.IdempotencyKey = "" }},
+		{"empty id", func(b []api.Event) { b[1].ToolCall.ID = "" }},
+		{"wrong request", func(b []api.Event) { b[2].Approval.ToolCallID = "wrong" }},
+		{"wrong decision", func(b []api.Event) { b[3].ApprovalResult.RequestSeq = 2 }},
+		{"wrong receipt id", func(b []api.Event) { b[4].Result.ID = "wrong" }},
+		{"wrong receipt seq", func(b []api.Event) { b[4].Result.ApprovalDecisionSeq = 2 }},
+		{"wrong status", func(b []api.Event) { b[4].Result.IsError = true }},
+	} {
+		t.Run(change.name, func(t *testing.T) {
+			b := gateEvents()
+			change.mutate(b)
+			if _, err := InspectApproval(gateLog(t, b...), 0); err == nil {
+				t.Fatal("bad evidence accepted")
+			}
+		})
+	}
+}
+
+func TestApprovalSelectionDecisionAndOwnership(t *testing.T) {
+	log := gateLog(t, gateEvents()[:3]...)
+	dec := api.ApprovalDecision{ExecutionID: "e", ToolCallID: "c", RequestSeq: 3, Approved: true, Reason: "reviewed", Identity: api.IdentityRef{}}
+	r, err := Approve(log, dec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A retained writer is not evicted by an exact retry, even after receipt/newer execution.
+	c, err := New(log, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := gateEvents()[4]
+	receipt.Result.ApprovalDecisionSeq = r.Seq
+	if _, err := log.Append(r.Seq, c.fence, receipt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(r.Seq+1, c.fence, api.Event{ExecutionID: "new", Kind: api.EventOutput, Message: api.TextMessage("assistant", "new")}); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := Approve(log, dec)
+	if err != nil || retry.Seq != r.Seq {
+		t.Fatalf("retry=%+v %v", retry, err)
+	}
+	dec.Reason = "changed"
+	if _, err := Approve(log, dec); !errors.Is(err, ErrInvalidApprovalDecision) {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(r.Seq+2, c.fence, api.Event{ExecutionID: "e", Kind: api.EventError}); err != nil {
+		t.Fatalf("retry/invalid fenced writer: %v", err)
+	}
+	if state, err := InspectApproval(log, 3); err != nil || state.Request.Seq != 3 || state.Head != 3 || state.Decision != nil {
+		t.Fatalf("captured state=%+v %v", state, err)
+	}
+	if state, err := InspectApproval(log, 0); err != nil || state != nil {
+		t.Fatalf("late old record won selection: %+v %v", state, err)
+	}
+	for _, cut := range []int{2, 3, 4, 5} {
+		t.Run(string(rune('0'+cut)), func(t *testing.T) {
+			parent := gateLog(t, gateEvents()[:cut]...)
+			child := gateLog(t)
+			if err := Fork(parent, child, int64(cut)); err != nil {
+				t.Fatal(err)
+			}
+			state, err := InspectApproval(child, 0)
+			if err != nil || !state.Inherited {
+				t.Fatalf("ownership=%+v %v", state, err)
+			}
+			if _, err := Approve(child, api.ApprovalDecision{ExecutionID: "e", ToolCallID: "c", RequestSeq: 3}); !errors.Is(err, ErrInvalidApprovalDecision) {
+				t.Fatalf("inherited decision=%v", err)
+			}
+			if cut == 4 {
+				late := gateEvents()[4]
+				head, _ := child.Head()
+				if _, err := child.Append(head, 1, late); err != nil {
+					t.Fatal(err)
+				}
+				state, err = InspectApproval(child, 0)
+				if err != nil || state.Receipt == nil || !state.Inherited {
+					t.Fatalf("late inherited receipt=%+v %v", state, err)
+				}
+			}
+		})
+	}
+}
+
+func gateLive(c *Controller) *liveSink {
+	return &liveSink{c: c, executionID: "e", guard: &sinkGuard{}, desc: &api.Descriptor{Capabilities: api.Capabilities{Resumability: api.ResumabilityStatelessReplay}}, calls: make(map[string]bool)}
+}
+func allGateMethods(ctx context.Context, s api.EventSink) []error {
+	_, m := s.Model(ctx, api.ModelRequest{})
+	_, c := s.ToolCall(ctx, *gateEvents()[1].ToolCall)
+	return []error{m, c, s.Output(ctx, "late"), s.Report(ctx, api.ToolResult{ID: "c"}), s.Usage(ctx, api.Usage{})}
+}
+func TestApprovalPrivateParkAndRecovery(t *testing.T) {
+	log := gateLog(t, gateEvents()[:1]...)
+	c, err := New(log, nil, WithSessionUID("s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := gateLive(c)
+	_, err = s.parkTool(t.Context(), *gateEvents()[1].ToolCall)
+	if !errors.Is(err, api.ErrApprovalParked) {
+		t.Fatal(err)
+	}
+	for _, late := range allGateMethods(t.Context(), s) {
+		if !errors.Is(late, api.ErrApprovalParked) {
+			t.Fatalf("park not sticky: %v", late)
+		}
+	}
+	s.guard.close()
+	for _, late := range allGateMethods(t.Context(), s) {
+		if !errors.Is(late, api.ErrApprovalParked) {
+			t.Fatal(late)
+		}
+	}
+	if head, _ := log.Head(); head != 3 {
+		t.Fatalf("late effect appended %d", head)
+	}
+	for _, approved := range []bool{true, false} {
+		t.Run(map[bool]string{true: "executor error", false: "denied"}[approved], func(t *testing.T) {
+			log := gateLog(t, gateEvents()[:3]...)
+			_, err := Approve(log, api.ApprovalDecision{ExecutionID: "e", ToolCallID: "c", RequestSeq: 3, Approved: approved})
+			if err != nil {
+				t.Fatal(err)
+			}
+			effects := 0
+			c, err := New(log, func(context.Context, api.ModelRequest) (api.ModelResponse, error) {
+				return api.ModelResponse{Message: *api.TextMessage("assistant", "continued")}, nil
+			}, WithSessionUID("s"), WithToolExecutor(func(context.Context, ToolCallContext, api.ToolCall) (api.ToolResult, error) {
+				effects++
+				return api.ToolResult{}, errors.New("offline")
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			scan, err := scanApprovals(log, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			events := []api.Event{}
+			recs, _ := log.Read(1)
+			for _, r := range recs {
+				events = append(events, r.Event)
+			}
+			execs, err := recordedExecutions(events)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sink := &resumeSink{live: *gateLive(c), stream: execs[0].stream, approvals: approvalEvidence(scan, "e")}
+			result, err := sink.ToolCall(t.Context(), *gateEvents()[1].ToolCall)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := api.ToolResultCodeApprovalDenied
+			if approved {
+				want = api.ToolResultCodeExecutorError
+			}
+			if result.Code != want || !result.IsError || result.Approval == nil || result.ApprovalDecisionSeq != 4 {
+				t.Fatalf("receipt=%+v", result)
+			}
+			if effects != map[bool]int{true: 1, false: 0}[approved] {
+				t.Fatal("wrong effect count")
+			}
+			if _, err := sink.Model(t.Context(), api.ModelRequest{}); err != nil {
+				t.Fatalf("receipt could not continue: %v", err)
+			}
+			recs, _ = log.Read(1)
+			if recs[4].Event.Result.Approval != nil {
+				t.Fatal("transient authority persisted")
+			}
+			state, err := InspectApproval(log, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			served, err := serveApproval(state, state.Receipt.Event.Result)
+			if err != nil || served.Code != want {
+				t.Fatalf("serve=%+v %v", served, err)
+			}
+		})
+	}
+}
+
+func TestApprovalMismatchAndClosureSeal(t *testing.T) {
+	for _, method := range []string{"tool", "model", "output", "report", "usage"} {
+		t.Run(method, func(t *testing.T) {
+			log := gateLog(t, gateEvents()...)
+			scan, err := scanApprovals(log, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := gateEvents()[1:5]
+			c, err := New(log, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rs := &resumeSink{live: *gateLive(c), stream: b, approvals: approvalEvidence(scan, "e")}
+			ps := &replaySink{stream: b, guard: &sinkGuard{}, approvals: approvalEvidence(scan, "e"), calls: make(map[string]bool)}
+			for _, s := range []api.EventSink{rs, ps} {
+				switch method {
+				case "tool":
+					call := *b[0].ToolCall
+					call.IdempotencyKey = "changed"
+					_, err = s.ToolCall(t.Context(), call)
+				case "model":
+					_, err = s.Model(t.Context(), api.ModelRequest{})
+				case "output":
+					err = s.Output(t.Context(), "wrong")
+				case "report":
+					err = s.Report(t.Context(), api.ToolResult{})
+				case "usage":
+					err = s.Usage(t.Context(), api.Usage{})
+				}
+				if !errors.Is(err, ErrReplayDiverged) {
+					t.Fatalf("mismatch=%v", err)
+				}
+				for _, late := range allGateMethods(t.Context(), s) {
+					if !errors.Is(late, ErrReplayDiverged) {
+						t.Fatalf("mismatch unlocked method: %v", late)
+					}
+				}
+			}
+		})
+	}
+	c, err := New(gateLog(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := gateLive(c)
+	s.guard.close()
+	for _, err := range allGateMethods(t.Context(), s) {
+		if !errors.Is(err, ErrSinkClosed) {
+			t.Fatal(err)
 		}
 	}
 }
 
-func approvalCount(n int64) *int64 { return &n }
-
-func TestApproveColdReopenAndEmptyIdentityRetry(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "cold.db")
-	s, err := sqlitelog.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	log := s.Session("session")
-	approvalSeed(t, log, true, api.EventToolCall)
-	approvalAppend(t, log, 0, api.Event{Kind: api.EventLifecycle, Lifecycle: &api.Lifecycle{Kind: api.LifecycleSuspend}})
-	request := approvalAppend(t, log, 0, api.Event{ExecutionID: "e1", Kind: api.EventApprovalRequest, Approval: &api.ApprovalRequest{ToolCallID: "c1"}})
-	input := api.ApprovalDecision{ExecutionID: "e1", ToolCallID: "c1", RequestSeq: request.Seq, Approved: true}
-	decision, err := controller.Approve(log, input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	info, err := s.SessionInfo("session")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.ComputeState != api.ComputeCold || info.LastSeq != decision.Seq {
-		t.Fatalf("host writes moved compute: %+v", info)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := sqlitelog.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
-	input.Identity = api.IdentityRef{Principal: "", Issuer: "", Subject: ""}
-	retry, err := controller.Approve(reopened.Session("session"), input)
-	if err != nil || !reflect.DeepEqual(retry, decision) {
-		t.Fatalf("reopened exact retry=%+v err=%v", retry, err)
-	}
-	info, err = reopened.SessionInfo("session")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.ComputeState != api.ComputeCold || info.LastSeq != decision.Seq {
-		t.Fatalf("reopened state=%+v", info)
-	}
-}
-
-func TestApproveSessionScopedIDs(t *testing.T) {
-	s, err := sqlitelog.Open(filepath.Join(t.TempDir(), "sessions.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	for _, uid := range []string{"one", "two"} {
-		approvalSeed(t, s.Session(uid), false, api.EventApprovalRequest)
-	}
-	for _, uid := range []string{"one", "two"} {
-		rec, err := controller.Approve(s.Session(uid), api.ApprovalDecision{ExecutionID: "e1", ToolCallID: "c1", RequestSeq: 2, Approved: uid == "one"})
-		if err != nil || rec.Event.ApprovalResult.Approved != (uid == "one") {
-			t.Fatalf("%s decision=%+v err=%v", uid, rec, err)
-		}
-	}
-}
-
-// Fault injection decorates a real store; read/append/fence side effects remain real.
-type approvalFaultStore struct {
+type receiptFault struct {
 	eventlog.Store
-	readErr, fenceErr, appendErr error
-	onFence                      func(int64)
+	fail bool
 }
 
-func (s approvalFaultStore) Read(seq int64) ([]eventlog.Record, error) {
-	if s.readErr != nil {
-		return nil, s.readErr
-	}
-	return s.Store.Read(seq)
-}
-func (s approvalFaultStore) NewFence() (int64, error) {
-	if s.fenceErr != nil {
-		return 0, s.fenceErr
-	}
-	f, err := s.Store.NewFence()
-	if err == nil && s.onFence != nil {
-		s.onFence(f)
-	}
-	return f, err
-}
-func (s approvalFaultStore) Append(head, fence int64, ev api.Event) (eventlog.Record, error) {
-	if s.appendErr != nil {
-		return eventlog.Record{}, s.appendErr
+func (s *receiptFault) Append(head, fence int64, ev api.Event) (eventlog.Record, error) {
+	if s.fail && ev.Kind == api.EventToolResult {
+		return eventlog.Record{}, errors.New("receipt lost")
 	}
 	return s.Store.Append(head, fence, ev)
 }
+func TestApprovalDurableEffectBeforeReceipt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "effects.db")
+	open := func() *sql.DB {
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return db
+	}
+	db := open()
+	defer func() { db.Close() }()
+	if _, err := db.Exec("CREATE TABLE effects(session TEXT,key TEXT,PRIMARY KEY(session,key))"); err != nil {
+		t.Fatal(err)
+	}
+	attempts := 0
+	executor := func(_ context.Context, scope ToolCallContext, call api.ToolCall) (api.ToolResult, error) {
+		attempts++
+		if (scope.SessionUID != "a" && scope.SessionUID != "b") || call.ID != "c" || call.IdempotencyKey != "k" || call.Mediation != api.MediationRequiresApproval {
+			t.Fatalf("lost original scope/call: %+v %+v", scope, call)
+		}
+		_, err := db.Exec("INSERT INTO effects VALUES(?,?) ON CONFLICT DO NOTHING", scope.SessionUID, call.IdempotencyKey)
+		return api.ToolResult{}, err
+	}
+	for _, session := range []string{"a", "b"} {
+		journalPath := filepath.Join(t.TempDir(), "journal.db")
+		journal, err := sqlitelog.Open(journalPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		log := journal.Session(session)
+		gateAppend(t, log, gateEvents()[:4]...)
+		fault := &receiptFault{Store: log, fail: true}
+		c, err := New(fault, nil, WithSessionUID(session), WithToolExecutor(executor))
+		if err != nil {
+			t.Fatal(err)
+		}
+		state, err := InspectApproval(log, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := gateLive(c)
+		if _, err := s.completeApproval(t.Context(), state); err == nil {
+			t.Fatal("receipt fault missed")
+		}
+		for _, err := range allGateMethods(t.Context(), s) {
+			if err == nil {
+				t.Fatal("uncertain effect unlocked sink")
+			}
+		}
+		db.Close()
+		db = open()
+		journal.Close()
+		journal, err = sqlitelog.Open(journalPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fault.Store = journal.Session(session)
+		fault.fail = false
+		c, err = New(fault, nil, WithSessionUID(session), WithToolExecutor(executor))
+		if err != nil {
+			t.Fatal(err)
+		}
+		state, err = InspectApproval(fault.Store, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := gateLive(c).completeApproval(t.Context(), state); err != nil {
+			t.Fatal(err)
+		}
+		journal.Close()
+	}
+	var count int
+	if err := db.QueryRow("SELECT count(*) FROM effects").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 || attempts != 4 {
+		t.Fatalf("durable scoped effects=%d attempts=%d", count, attempts)
+	}
+}
 
-func TestApproveOperationalCausesAndHeadCAS(t *testing.T) {
-	for _, backend := range []string{"memory", "sqlite"} {
-		for _, op := range []string{"read", "fence", "append conflict", "append fenced", "head advance"} {
-			t.Run(backend+"/"+op, func(t *testing.T) {
-				log := approvalLog(t, backend)
-				approvalSeed(t, log, false, api.EventApprovalRequest)
-				fault := approvalFaultStore{Store: log}
-				cause := errors.New("backend unavailable")
-				switch op {
-				case "read":
-					fault.readErr = fmt.Errorf("read: %w", cause)
-				case "fence":
-					fault.fenceErr = fmt.Errorf("fence: %w", cause)
-				case "append conflict":
-					cause = eventlog.ErrConflict
-					fault.appendErr = fmt.Errorf("append: %w", cause)
-				case "append fenced":
-					cause = eventlog.ErrFenced
-					fault.appendErr = fmt.Errorf("append: %w", cause)
-				case "head advance":
-					cause = eventlog.ErrConflict
-					fault.onFence = func(fence int64) {
-						approvalAppend(t, log, fence, api.Event{ExecutionID: "e2", Kind: api.EventInput, Message: api.TextMessage("user", "raced")})
-					}
+func TestApprovalPrivateRepairCapturedHeadFenceAndObserver(t *testing.T) {
+	for _, mode := range []string{"repair", "CAS", "fenced", "inherited", "observer"} {
+		t.Run(mode, func(t *testing.T) {
+			log := gateLog(t, gateEvents()[:2]...)
+			observed := 0
+			c, err := New(log, nil, WithObserver(Observer{OnRecord: func(r eventlog.Record) {
+				observed++
+				if r.Seq != 3 || r.Event.Kind != api.EventApprovalRequest {
+					t.Fatal(r)
 				}
-				_, err := controller.Approve(fault, api.ApprovalDecision{ExecutionID: "e1", ToolCallID: "c1", RequestSeq: 2, Approved: true})
-				if !errors.Is(err, cause) || errors.Is(err, controller.ErrReplayDiverged) || errors.Is(err, controller.ErrInvalidApprovalDecision) {
-					t.Fatalf("err=%v want operational cause %v", err, cause)
+			}}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			scan, err := scanApprovals(log, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := api.ErrApprovalParked
+			switch mode {
+			case "CAS":
+				if _, err := log.Append(2, c.fence, api.Event{ExecutionID: "e", Kind: api.EventError}); err != nil {
+					t.Fatal(err)
 				}
-				if op == "head advance" && err != eventlog.ErrConflict {
-					t.Fatalf("head advance err=%v want exact conflict", err)
+				want = eventlog.ErrConflict
+			case "fenced":
+				if _, err := log.NewFence(); err != nil {
+					t.Fatal(err)
 				}
-				recs, err := log.Read(1)
+				want = eventlog.ErrFenced
+			case "inherited":
+				scan.selected.Inherited = true
+				want = ErrInheritedToolIntent
+			case "observer":
+				c.observer.OnRecord = func(eventlog.Record) { observed++ }
+			}
+			_, err = c.pendingApproval(scan, "e")
+			if !errors.Is(err, want) {
+				t.Fatalf("repair=%v want=%v", err, want)
+			}
+			wantObserved := 0
+			if mode == "repair" || mode == "observer" {
+				wantObserved = 1
+			}
+			if observed != wantObserved {
+				t.Fatalf("observer=%d", observed)
+			}
+			if wantObserved == 1 {
+				scan, err = scanApprovals(log, 0)
 				if err != nil {
 					t.Fatal(err)
 				}
-				for _, rec := range recs {
-					if rec.Event.Kind == api.EventApprovalResult {
-						t.Fatal("failed operation wrote a decision")
-					}
+				if _, err = c.pendingApproval(scan, "e"); !errors.Is(err, api.ErrApprovalParked) {
+					t.Fatal(err)
 				}
-			})
+				if observed != 1 {
+					t.Fatal("request repaired twice")
+				}
+			}
+		})
+	}
+}
+func TestApprovalInheritedReceiptAndReportAuthority(t *testing.T) {
+	parent := gateLog(t, gateEvents()[:4]...)
+	child := gateLog(t)
+	if err := Fork(parent, child, 4); err != nil {
+		t.Fatal(err)
+	}
+	head, _ := child.Head()
+	if _, err := child.Append(head, 1, gateEvents()[4]); err != nil {
+		t.Fatal(err)
+	}
+	state, err := InspectApproval(child, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := serveApproval(state, state.Receipt.Event.Result); err != nil || result.ID != "c" {
+		t.Fatalf("inherited receipt=%+v %v", result, err)
+	}
+	for _, code := range []api.ToolResultCode{api.ToolResultCodeUnspecified, api.ToolResultCodeExecutorError} {
+		if err := approvalReportError(api.ToolResult{Code: code}); err != nil {
+			t.Fatalf("ordinary code %v rejected: %v", code, err)
+		}
+	}
+	for _, r := range []api.ToolResult{{Approval: &api.ApprovalResult{}}, {ApprovalRequestSeq: 3}, {ApprovalDecisionSeq: 4}, {Code: api.ToolResultCodeApprovalDenied}, {Code: api.ToolResultCode(7)}} {
+		if err := approvalReportError(r); !errors.Is(err, ErrApprovalReceiptReport) {
+			t.Fatal(err)
 		}
 	}
 }

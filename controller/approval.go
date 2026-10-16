@@ -40,7 +40,7 @@ func InspectApproval(log eventlog.Store, throughSeq int64) (*ApprovalState, erro
 }
 
 // Approve commits only a decision, never an effect or a compute transition. Validation and
-// exact historical retries on writable sessions happen before NewFence, so neither invalid input nor retries evict
+// exact historical retries happen before NewFence, so neither invalid input nor retries evict
 // an existing writer. A new decision uses the head from that same validated scan for append CAS.
 // Callers must serialize this operation with other session work; CAS also protects against
 // external writers advancing the journal between validation and append.

@@ -11,7 +11,9 @@ import (
 // ErrApprovalBlocked rejects a new turn while this session owns an approval intent without receipt.
 var ErrApprovalBlocked = errors.New("controller: unresolved approval blocks a new execution")
 
-// ErrApprovalUnavailable rejects gating on a harness that cannot reconstruct its Run by replay.
+// ErrApprovalUnavailable is returned by Exec, Resume and Replay for approval on a
+// non-STATELESS_REPLAY harness, or when replay/recovery reproduces a historical
+// pre-intent approval rejection without consuming a different call's evidence.
 var ErrApprovalUnavailable = errors.New("controller: approval requires STATELESS_REPLAY")
 
 // ErrInvalidApprovalCall rejects missing or reused gated call identities before intent is written.
@@ -173,4 +175,28 @@ func serveApproval(state *ApprovalState, receipt *api.ToolResult) (api.ToolResul
 	decision := *state.Decision.Event.ApprovalResult
 	result.Approval = &decision
 	return result, nil
+}
+
+// pendingApproval repairs a call-only cut with the captured scan head and existing fence.
+// It does not need a harness or executor, and never mints a fence on invalid evidence.
+func (c *Controller) pendingApproval(scan *approvalScan, executionID string) (bool, error) {
+	state := scan.selected
+	if state == nil || state.ExecutionID != executionID || state.Receipt != nil {
+		return false, nil
+	}
+	if state.Inherited {
+		return false, ErrInheritedToolIntent
+	}
+	if state.Request == nil {
+		r, err := c.log.Append(scan.head, c.fence, api.Event{ExecutionID: state.ExecutionID, Kind: api.EventApprovalRequest, Approval: &api.ApprovalRequest{ToolCallID: state.Call.ID}})
+		if err != nil {
+			return true, err
+		}
+		c.observe(r)
+		state.Request = &r
+	}
+	if state.Decision == nil {
+		return true, approvalPark(state)
+	}
+	return false, nil
 }
