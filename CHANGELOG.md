@@ -83,6 +83,12 @@ provide.
 
 ### Compatibility
 
+- Controller and bridge sink calls now honor their own context cancellation, both while queued
+  behind another effect and when an uncontended call arrives with an already-canceled context.
+  Canceled calls start no effects; Replay and Resume also refuse such calls against older journals
+  without consuming recorded evidence. An uncontended call still returns an existing sticky
+  park/failure before cancellation. Request/reply serialization and Run shutdown drainage are
+  unchanged.
 - SQLite schema v5 follows approval v3 and deletion v4, adding indexed exact caller issuer/subject
   ownership and an off-mode journal authorization marker. Legacy and RPC-created sessions remain
   unbound; ordinary metadata writes and copied history cannot assign or replace owners. No events
