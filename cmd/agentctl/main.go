@@ -11,6 +11,10 @@
 //	agentctl fork    --session <uid> --at N    # branch into a child session
 //	agentctl suspend --session <uid>
 //	agentctl resume  --session <uid>
+//	agentctl approve <uid>                  # commit approval, then Resume
+//	agentctl deny    <uid> --reason "no"    # commit denial, then Resume
+//	agentctl harness register --server 127.0.0.1:8081 --name mine --spec spec.json
+//	agentctl harness get|list|retire --server 127.0.0.1:8081 [flags]
 package main
 
 import (
@@ -49,7 +53,10 @@ func main() {
 		"fork":    cmdFork,
 		"suspend": cmdSuspend,
 		"resume":  cmdResume,
+		"approve": cmdApprove,
+		"deny":    cmdDeny,
 		"version": cmdVersion,
+		"harness": cmdHarness,
 	}
 	run, ok := cmds[os.Args[1]]
 	if !ok {
@@ -63,7 +70,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: agentctl <create|list|get|exec|replay|fork|suspend|resume|version> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: agentctl <create|list|get|exec|replay|fork|suspend|resume|approve|deny|harness|version> [flags]")
 }
 
 type config struct {
@@ -104,6 +111,14 @@ func dial(cfg *config) (*client.Client, func(), error) {
 		_ = backend.Close()
 		_ = store.Close()
 		return nil, nil, err
+	}
+	// The journal may be shared with a host that registers harnesses. Reserving the names this
+	// embedded server runs refuses a journal where one is already registered, and stops one being
+	// registered later.
+	if err := session.ReserveStaticHarnessNames(store, registry); err != nil {
+		_ = backend.Close()
+		_ = store.Close()
+		return nil, nil, fmt.Errorf("journal %s: %w", cfg.journal, err)
 	}
 	svc := session.NewService(store, registry,
 		session.WithLogger(logger), session.WithDefaultProject(cfg.project))

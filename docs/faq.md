@@ -43,6 +43,13 @@ This is how a session with automatic failover still has exactly one writer. If a
 incarnation wakes up and tries to write (a zombie), its stale fence is refused. Fencing plus compare-and-
 swap on append is what makes "single writer" enforceable rather than a hope.
 
+## Can Exec, Suspend, and Resume overlap?
+
+Across all Placers in one Registry, overlapping calls for one session return gRPC `ABORTED` without
+changing compute or the journal. Suspend will not interrupt a running turn. Retry after the active call
+finishes, using the current cursor for Exec. Other sessions remain independent. A standalone Placer
+has its own guard; separate Registries or hosts are not fenced by this local guard.
+
 ## Is the provenance chain Go-specific?
 
 No. The `content_hash` is RFC 8785 JCS (JSON Canonicalization Scheme) computed over the proto3-JSON form
@@ -67,9 +74,11 @@ all plug in the same way. See [`harness-authoring.md`](harness-authoring.md).
 
 ## What happens if the harness crashes in the middle of a turn?
 
-The controller re-drives the interrupted execution at most once (invariant I3). An `Exec` with no inputs
-means "continue the last execution" rather than "start a new turn". Host-executed tools carry an
-idempotency key so a re-driven side-effecting call dedups on the tool side and the effect happens once.
+Use `Resume` to re-drive an interrupted execution. For an existing current approval-bearing execution,
+no-input `Exec` also continues that recorded invocation, ignoring request config/harness/cursor
+overrides. Other inputless Exec calls keep ordinary new-turn behavior. Host-executed tools carry an
+idempotency key; a durable executor must deduplicate on session UID plus that key and retrieve the
+original receipt after a crash. The journal alone does not make external effects exactly once.
 
 ## What is fork actually for?
 
@@ -121,9 +130,16 @@ fan-out costs N restores rather than one shared image — see
 
 Each tool declares a mediation tier. `IN_HARNESS_REPORTED` (the default) runs the tool in the sandbox and
 reports the result for audit. `CONTROLLER_MEDIATED` has the host execute the tool so it can apply authz,
-policy, and audit centrally. `REQUIRES_APPROVAL` pauses for a human or policy decision. The approval tier
-is declared in the contract; the approval gate itself is a tracked follow-up. Tool calls align with the
-MCP shape (name plus structured arguments), so MCP tools map onto them directly.
+policy, and audit centrally in a custom executor. `REQUIRES_APPROVAL` parks a stateless-replay execution
+for an explicit caller decision. RPC/SDK `Approve` commits only that decision; call `Resume` separately.
+CLI approve and deny do both, and say "decision committed" if recovery fails. Get/List and final paused
+Exec frames expose the pending tuple at their captured cursor. A decision clears that reference, but
+new input stays blocked until its receipt commits. Identity is not authorization; there is no policy
+hook, timeout or expiry. Snapshots and unresolved requests are retained indefinitely, and Cancel and
+DeleteSession remain `UNIMPLEMENTED`. Tool calls align with the MCP shape (name plus structured
+arguments), but the stock daemon has no executor and the bundled model adapter does not map tools;
+this is not a complete MCP/provider integration. See
+[approval recovery](interaction-model.md#approval-decisions-and-recovery).
 
 ## How do I list sessions, and can I trust the compute state I get back?
 
@@ -145,10 +161,11 @@ It is a working reference implementation (Go 1.26), not yet a productized servic
 single-writer event-sourced controller, the durable hash-chained log, bring-your-own-harness over
 `Harness.Connect`, the `Runtime` SPI with local and substrate backends, the replay-conformance suite, and
 real-substrate conformance across both capability tiers all run today. Session-level suspend and resume
-run through the `Placer` for stateless-replay harnesses, while a memory-snapshot harness still suspends
-through the raw `Runtime` SPI. There is no authentication, authorization, or transport security, and no
-managed control plane, enterprise identity and provenance, or confidential and GPU snapshots. See the
-Status section of the root README.
+use the `Placer` for both resumability tiers. See the
+[Substrate verification boundary](substrate-conformance.md#verification-boundary) for live-test coverage
+and limitations. There is no authentication, authorization, or transport security, and no managed
+control plane, enterprise identity and provenance, or confidential and GPU snapshots. See the Status
+section of the root README.
 
 ## Where is the wire format?
 
@@ -158,5 +175,6 @@ In `api/*.proto` (Sessions, Harness, Runtime, and the shared Event). The hand-wr
 ## How do I run it on real agent-substrate?
 
 See [`substrate-conformance.md`](substrate-conformance.md). It runs in CI across both capability tiers
-(stateless-replay on gVisor and memory-snapshot continuity on a micro-VM), against a real `ate-system` in
-kind, with the core importing zero substrate code.
+(stateless-replay and memory-snapshot continuity, both on a micro-VM), against a real `ate-system` in
+kind, with the core importing zero substrate code. On a host without KVM, both tiers can run on gVisor
+instead.

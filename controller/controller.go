@@ -10,6 +10,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -27,23 +28,48 @@ import (
 // ErrReplayInvokedModel is returned when a replay caused a live model call — an I1 violation.
 var ErrReplayInvokedModel = errors.New("controller: replay invoked the model (I1 violated)")
 
-// ErrReplayDiverged is returned when a replay does not consume the recorded effect stream exactly:
-// the harness requested fewer effects than were journaled, so it took a different path than when
-// the log was written (a determinism violation, symmetric to the I0 input-hash check).
+// ErrReplayDiverged is returned when replay or recorded-prefix recovery diverges from the journal:
+// tool request identity or result correlation differs, required tool evidence is missing, or the
+// harness leaves recorded effects unconsumed.
 var ErrReplayDiverged = errors.New("controller: replay diverged from the journal")
 
-// ErrInvalidExecutionLog is returned when execution-scoped events do not carry a valid, contiguous
-// execution ID. Replay and resume require this durable identity to recover exact turn boundaries.
+// ErrInvalidExecutionLog is returned when modern execution-scoped events lack execution identity,
+// a legacy-to-modern boundary is ambiguous, or a start marker cannot establish a complete
+// invocation. Replay and resume reject such turns
+// before running the harness.
 var ErrInvalidExecutionLog = errors.New("controller: invalid execution log")
+
+// ErrHarnessDescribeFailed identifies failure to Describe the supplied harness before execution.
+// The original cause is retained for callers to distinguish cancellation from endpoint failure.
+var ErrHarnessDescribeFailed = errors.New("controller: describe harness failed")
+
+// ErrHarnessMismatch rejects replay/recovery with a different resolved harness name.
+var ErrHarnessMismatch = errors.New("controller: harness does not match recorded invocation")
+
+// ErrHarnessVersionMismatch rejects replay/recovery when a nonempty recorded harness version
+// differs from the supplied harness's advertised version, including an empty advertised version.
+var ErrHarnessVersionMismatch = errors.New("controller: harness version does not match recorded invocation")
+
+// ErrInheritedToolIntent rejects recovery of a forked execution whose copied prefix contains an
+// unresolved tool intent. Re-driving it under the child's UID could repeat the parent's effect.
+var ErrInheritedToolIntent = fmt.Errorf("%w: inherited tool intent cannot be resumed", ErrInvalidExecutionLog)
+
+// ErrMissingSessionUID rejects an unscoped tool executor or a selected legacy harness invocation
+// whose compatibility identity cannot be scoped to a session.
+var ErrMissingSessionUID = errors.New("controller: a session UID is required")
+
+// ErrIncompleteInvocation identifies an unfinished trailing turn whose inputs were only partly
+// committed. It wraps ErrInvalidExecutionLog; the caller can retry with Exec and all inputs.
+var ErrIncompleteInvocation = fmt.Errorf("%w: incomplete invocation", ErrInvalidExecutionLog)
 
 // ErrMissingIdempotencyKey rejects a CONTROLLER_MEDIATED tool call that omits the idempotency key
 // the crash-recovery re-drive needs to dedup its side effect (I3). Without a key, at-most-once
 // silently would not hold, so the host fails loud rather than record an unrecoverable intent. The
-// full key contract (generation, TTL, scope) is the §10 spike; this is the minimal guard.
+// remaining key contract (generation, TTL) is the §10 spike; this is the minimal guard.
 var ErrMissingIdempotencyKey = errors.New("controller: CONTROLLER_MEDIATED tool call requires an idempotency key")
 
 // ErrUnmediatedToolCall rejects a ToolCall whose mediation tier is not host-executed. ToolCall is
-// only for CONTROLLER_MEDIATED (and, once implemented, REQUIRES_APPROVAL); an UNSPECIFIED or
+// only for CONTROLLER_MEDIATED and REQUIRES_APPROVAL; an UNSPECIFIED or
 // IN_HARNESS_REPORTED call must not execute here (the latter uses Report), so it is rejected before
 // anything is recorded — closing the keyless-execute bypass.
 var ErrUnmediatedToolCall = errors.New("controller: ToolCall requires a host-mediated tier")
@@ -66,9 +92,9 @@ type ModelFunc func(ctx context.Context, req api.ModelRequest) (api.ModelRespons
 // harness wire protocol.
 type StreamFunc func(ctx context.Context, req api.ModelRequest, onChunk func(string)) (api.ModelResponse, error)
 
-// Observer receives a turn's events as they happen. Both callbacks fire on the goroutine driving
-// the turn, in order, so an implementation that writes to a stream needs no synchronization of its
-// own but must not block for long.
+// Observer receives a turn's events as they happen. Sink callbacks are serialized in effect
+// order for one invocation, so an implementation that writes to a stream needs no synchronization
+// of its own but must not block for long.
 type Observer struct {
 	// OnRecord fires once per committed record, after it is durable.
 	OnRecord func(eventlog.Record)
@@ -76,18 +102,27 @@ type Observer struct {
 	OnDelta func(api.Delta)
 }
 
-// ToolFunc executes a CONTROLLER_MEDIATED tool. The host calls it between appending the TOOL_CALL
-// intent and appending the TOOL_RESULT (the two-phase write-ahead of §3/I3). It receives the call's
-// IdempotencyKey and owns tool-side deduplication: on crash-recovery the host re-executes the same
-// call under the same key, and an idempotent tool MUST NOT repeat the external effect. ctx carries
-// the execution's cancellation and deadline.
-type ToolFunc func(ctx context.Context, tc api.ToolCall) (api.ToolResult, error)
+// ToolCallContext carries host-owned identity for tool authorization and durable deduplication.
+// It is separate from context.Context, which carries execution cancellation and deadlines.
+type ToolCallContext struct {
+	SessionUID string // Nonempty identity configured by WithSessionUID.
+}
+
+// ToolFunc executes a CONTROLLER_MEDIATED or approved REQUIRES_APPROVAL tool. The host calls it between appending the TOOL_CALL
+// intent and appending the TOOL_RESULT (the two-phase write-ahead of §3/I3). The host owns
+// tool/resource authorization and durable deduplication scoped by scope.SessionUID plus the
+// harness-chosen IdempotencyKey, which is only unique within a session. On same-session
+// crash-recovery it receives the same session and recorded call, and MUST NOT repeat the external
+// effect. Resume rejects unresolved inherited intents across a fork. ctx carries the execution's
+// cancellation and deadline.
+type ToolFunc func(ctx context.Context, scope ToolCallContext, call api.ToolCall) (api.ToolResult, error)
 
 // Option configures a Controller at construction.
 type Option func(*Controller)
 
-// WithToolExecutor sets the executor for CONTROLLER_MEDIATED tool calls. Without it, a harness that
+// WithToolExecutor sets the executor for CONTROLLER_MEDIATED and approved tool calls. Without it, a harness that
 // emits a host-mediated ToolCall gets an error (in-harness-reported tools use Report instead).
+// A non-nil executor requires a nonempty WithSessionUID; New rejects an unscoped executor.
 func WithToolExecutor(tool ToolFunc) Option { return func(c *Controller) { c.tool = tool } }
 
 // WithFence binds the controller to a fence the caller already minted from the log (via NewFence),
@@ -109,8 +144,8 @@ func WithStreamingModel(fn StreamFunc) Option { return func(c *Controller) { c.s
 func WithObserver(o Observer) Option { return func(c *Controller) { c.observer = o } }
 
 // WithStart carries per-execution values the caller supplied straight through to the harness: the
-// opaque config and the resume cursor. They are passed rather than interpreted, since only the
-// harness knows what they mean.
+// opaque config and the resume cursor. Exec journals them before running the harness; Replay and
+// Resume use the recorded values, not this option. Only the harness knows what they mean.
 func WithStart(config []byte, resumeFromSeq int64) Option {
 	return func(c *Controller) {
 		c.startConfig = config
@@ -118,7 +153,14 @@ func WithStart(config []byte, resumeFromSeq int64) Option {
 	}
 }
 
-// WithSessionUID adds session correlation to controller logs.
+// WithHarness records and checks the resolved registry name independently of Descriptor.ID.
+// Standalone callers that omit it use the supplied harness's descriptor ID instead.
+func WithHarness(name string) Option {
+	return func(c *Controller) { c.harnessName = name }
+}
+
+// WithSessionUID binds the session identity passed to tool executors and controller logs.
+// Direct controller users must set it to scope host authorization and durable tool deduplication.
 func WithSessionUID(sessionUID string) Option {
 	return func(c *Controller) { c.sessionUID = sessionUID }
 }
@@ -140,16 +182,21 @@ type Controller struct {
 	liveToolCalls      int
 	logger             *slog.Logger
 	sessionUID         string
+	harnessName        string
 }
 
 // New starts an incarnation over log. Unless the caller supplies a fence via WithFence, it advances
 // the log's fencing token (superseding any prior incarnation, e.g. a dead pod) and binds to it. When
 // WithFence is supplied (the placement layer minted the fence and stamped it on the incarnation), New
-// uses that token instead — the log remains the single authority either way.
+// uses that token instead — the log remains the single authority either way. A tool executor
+// without a nonempty WithSessionUID returns ErrMissingSessionUID before advancing the fence.
 func New(log eventlog.Store, model ModelFunc, opts ...Option) (*Controller, error) {
 	c := &Controller{log: log, model: model, logger: slog.New(slog.DiscardHandler)}
 	for _, o := range opts {
 		o(c)
+	}
+	if c.tool != nil && c.sessionUID == "" {
+		return nil, ErrMissingSessionUID
 	}
 	if c.logger == nil {
 		c.logger = slog.New(slog.DiscardHandler)
@@ -165,9 +212,10 @@ func New(log eventlog.Store, model ModelFunc, opts ...Option) (*Controller, erro
 	return c, nil
 }
 
-// Exec runs one live execution/turn. The first INPUT append is guarded by the caller's
-// expectedLastSeq (the single-writer CAS at the session boundary); the harness then runs
-// host-mediated, and the turn ends with an END event.
+// Exec runs one live execution/turn. The first append (EXECUTION_START) is guarded by
+// expectedLastSeq (the single-writer CAS at the session boundary); the harness runs
+// host-mediated, and a completed turn ends with END. A durable approval request seals the sink
+// and returns a typed park without ERROR/END. An owned unresolved gate blocks new turns before Describe.
 func (c *Controller) Exec(ctx context.Context, har api.Harness, inputs []api.Message, expectedLastSeq int64) (err error) {
 	ctx = observability.EnsureRequestID(ctx)
 	executionID := newID()
@@ -198,17 +246,53 @@ func (c *Controller) Exec(ctx context.Context, har api.Harness, inputs []api.Mes
 		return err
 	}
 	historyEvents = len(prior)
+	scan, err := scanApprovalRecords(prior, 0)
+	if err != nil {
+		return err
+	}
+	if state := scan.selected; state != nil && !state.Inherited && state.Receipt == nil {
+		return ErrApprovalBlocked
+	}
 	history := make([]api.Event, 0, len(prior))
 	for _, r := range prior {
 		history = append(history, r.Event)
 	}
 
+	// Reject an already-ambiguous legacy/modern boundary. The start marker below explicitly
+	// supersedes an unfinished pure legacy tail, just as the old writer allowed a new Exec.
+	if _, err := legacyPrefix(history); err != nil {
+		return err
+	}
+
+	// Capture the actual supplied harness's advertised contract, not caller-provided version data.
+	// Failure leaves no invocation or inputs to recover.
+	desc, err := describeHarness(ctx, har)
+	if err != nil {
+		return err
+	}
+
+	// Record every invocation before inputs so recovery can detect partially committed turns.
+	config := bytes.Clone(c.startConfig)
 	last := expectedLastSeq
+	inputCount := int64(len(inputs))
+	rec, err := c.log.Append(last, c.fence, api.Event{
+		ExecutionID: executionID,
+		Kind:        api.EventExecutionStart,
+		ExecutionStart: &api.ExecutionStart{
+			// Keep journaled bytes separate from Start.Config, which harness code can mutate.
+			Config: bytes.Clone(config), ResumeFromSeq: c.startResumeFromSeq, InputCount: &inputCount,
+			Harness: c.resolvedHarnessName(desc), HarnessVersion: desc.Version,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	c.observe(rec)
+	last = rec.Seq
 	for i := range inputs {
 		in := inputs[i]
-		// This is the CAS-guarded append, so it cannot go through appendSeq (which reads the head
-		// itself). It still has to be observed, or a caller watching the turn would never see the
-		// input that started it.
+		// Extend the committed invocation prefix, not a freshly read head. Observe so a
+		// watching caller sees each input before the harness runs.
 		rec, err := c.log.Append(last, c.fence, api.Event{
 			ExecutionID: executionID,
 			Kind:        api.EventInput,
@@ -227,12 +311,23 @@ func (c *Controller) Exec(ctx context.Context, har api.Harness, inputs []api.Mes
 	)
 	start := &api.Start{
 		ExecutionID:   executionID,
+		SessionUID:    c.sessionUID,
 		History:       history,
 		Inputs:        inputs,
-		Config:        c.startConfig,
+		Config:        config,
 		ResumeFromSeq: c.startResumeFromSeq,
 	}
-	if err := har.Run(ctx, start, &liveSink{c: c, executionID: executionID}); err != nil {
+	sink := &liveSink{c: c, executionID: executionID, guard: &sinkGuard{}, desc: &desc, har: har, calls: make(map[string]bool)}
+	runErr := har.Run(ctx, start, sink)
+	stop := sink.guard.close()
+	if stop != nil {
+		if runErr == nil || !errors.Is(stop, api.ErrApprovalParked) {
+			runErr = stop
+		}
+		runFinished(runErr, "error_kind", controllerErrorKind(runErr))
+		return runErr // no terminal/audit record past an open approval intent
+	}
+	if err := runErr; err != nil {
 		runFinished(err, "error_kind", "harness_run_failed")
 		// Best-effort: record the failure. If this append itself fails we still surface the
 		// original harness error to the caller.
@@ -240,14 +335,15 @@ func (c *Controller) Exec(ctx context.Context, har api.Harness, inputs []api.Mes
 		return err
 	}
 	runFinished(nil)
-	rec, err := c.appendSeq(executionID, api.Event{Kind: api.EventEnd, End: &api.HarnessEnd{State: "COMPLETED"}})
+	rec, err = c.appendSeq(executionID, api.Event{Kind: api.EventEnd, End: &api.HarnessEnd{State: "COMPLETED"}})
 	finalSeq = rec.Seq
 	return err
 }
 
-// Replay reconstructs the session by re-executing each completed execution with its recorded
-// effects. It asserts the model is never invoked (I1) and that each recorded model-input hash
-// matches (I0), returning the reconstructed outputs for an equivalence check. It is read-only.
+// Replay reconstructs the session by re-executing each completed modern execution with recorded
+// effects. Pure legacy logs use v0.1.2's whole-log Run, even if unfinished. A modern boundary
+// abandons the legacy tail after its last END for replay only; modern history retains it. Replay asserts
+// the model is never invoked (I1) and each recorded model-input hash matches (I0). It is read-only.
 func (c *Controller) Replay(ctx context.Context, har api.Harness) (outputs []string, err error) {
 	ctx = observability.EnsureRequestID(ctx)
 	var recordCount, effectCount int
@@ -274,21 +370,65 @@ func (c *Controller) Replay(ctx context.Context, har api.Harness) (outputs []str
 	if err != nil {
 		return nil, err
 	}
+	scan, err := scanApprovalRecords(recs, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check every selected turn before the first Run. A later incompatible version must not
+	// allow even the compatible prefix to execute against the supplied harness. Legacy replay
+	// projections intentionally lack a completed flag and retain whole-log replay semantics.
+	selected := make([]recordedExecution, 0, len(executions))
+	for _, execution := range executions {
+		if execution.completed || execution.legacyEnd > 0 {
+			selected = append(selected, execution)
+		}
+	}
+	if _, err := c.checkHarness(ctx, har, selected); err != nil {
+		return nil, err
+	}
 
 	before := c.liveModelCalls
-	for _, execution := range executions {
-		if !execution.completed {
-			continue
-		}
+	for _, execution := range selected {
+		legacy := execution.legacyEnd > 0
 		effectCount += len(execution.stream)
-		sink := &replaySink{stream: execution.stream}
-		start := &api.Start{
-			ExecutionID: execution.id,
-			History:     events[:execution.start],
-			Inputs:      execution.inputs,
+		sink := &replaySink{stream: execution.stream, legacy: legacy, guard: &sinkGuard{}, approvals: approvalEvidence(scan, execution.id), calls: make(map[string]bool)}
+		history := events[:execution.start]
+		invocationID := execution.id
+		if legacy {
+			history = events[:execution.legacyEnd]
+			// Whole-log legacy Replay has one invocation. Its first INPUT is a stable anchor;
+			// inputless legacy logs fall back to the first execution-scoped legacy record.
+			anchor := recs[0]
+			for _, record := range recs[:execution.legacyEnd] {
+				if record.Event.Kind == api.EventInput {
+					anchor = record
+					break
+				}
+				if anchor.Event.Kind == api.EventLifecycle {
+					anchor = record
+				}
+			}
+			invocationID, err = c.legacyExecutionID(anchor)
+			if err != nil {
+				return nil, err
+			}
 		}
-		if err := har.Run(ctx, start, sink); err != nil {
-			return nil, err
+		start := &api.Start{
+			ExecutionID:   invocationID,
+			SessionUID:    c.sessionUID,
+			History:       history,
+			Inputs:        execution.inputs,
+			Config:        execution.config,
+			ResumeFromSeq: execution.resumeFromSeq,
+		}
+		runErr := har.Run(ctx, start, sink)
+		_ = sink.guard.close()
+		if sink.failure != nil {
+			return nil, sink.failure
+		}
+		if runErr != nil {
+			return nil, runErr
 		}
 		if c.liveModelCalls != before {
 			return nil, ErrReplayInvokedModel
@@ -439,6 +579,14 @@ func controllerErrorKind(err error) string {
 		return "replay_diverged"
 	case errors.Is(err, ErrInvalidExecutionLog):
 		return "invalid_execution_log"
+	case errors.Is(err, ErrHarnessMismatch):
+		return "harness_mismatch"
+	case errors.Is(err, ErrHarnessVersionMismatch):
+		return "harness_version_mismatch"
+	case errors.Is(err, ErrApprovalUnavailable):
+		return "approval_unavailable"
+	case errors.Is(err, ErrApprovalBlocked):
+		return "approval_blocked"
 	case errors.Is(err, ErrMissingIdempotencyKey):
 		return "missing_idempotency_key"
 	case errors.Is(err, ErrUnmediatedToolCall):
