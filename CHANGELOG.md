@@ -68,6 +68,9 @@ not provide.
 
 ### Added
 
+- Verified-caller ownership scaffolding: `api.CallerIdentity`, `Authorizer` and owner-only
+  `OwnerAuthorizer` contracts, plus insert-only `CreateOwnedSession` and indexed owner-filtered
+  listings. These are trusted-host Go APIs, not RPC authentication or enforcement.
 - Go SDK `Client.DeleteSession(ctx, uid)` and `agentctl delete --session <uid>` request permanent
   soft deletion. Get/delete CLI report deletion state and requested/completed times; PENDING output
   explicitly says durable intent only, with compute and fork pins retained.
@@ -134,6 +137,14 @@ not provide.
 
 ### Compatibility
 
+- SQLite schema v5 follows approval v3 and deletion v4, adding indexed exact caller issuer/subject
+  ownership and an off-mode journal authorization marker. Legacy and RPC-created sessions remain
+  unbound; ordinary metadata writes and copied history cannot assign or replace owners. No events
+  or hashes are rewritten, and no wire fields change. Older hosts refuse v5 at open time; this host
+  also refuses required, unknown or missing authorization markers at v5 because it cannot enforce
+  caller access. Stop all older writers before the first v5 open, following the
+  [rollout order](#sqlite-v4-rollout). Back up first. Sessions RPCs remain unauthenticated and
+  unenforced.
 - The Go module path is now `github.com/agent-primitives/sessions`; v0.1.x remain available at
   `github.com/aramase/agentsessions`. Container images move to `ghcr.io/agent-primitives/sessions`.
   One binary cannot link both module paths: both register the same proto files, and protobuf-go
