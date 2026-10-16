@@ -25,7 +25,7 @@ func TestDeletionPreservesApprovalProjectionAndRejectsDecisions(t *testing.T) {
 			log := s.Session("s")
 			decision := api.ApprovalDecision{ExecutionID: "execution", ToolCallID: "call", RequestSeq: 3, Approved: true}
 			if shape != "empty" {
-				for i, ev := range projectionEvents("execution") {
+				for i, ev := range approvalEvents("execution") {
 					if _, err := log.Append(int64(i), 0, ev); err != nil {
 						t.Fatal(err)
 					}
@@ -85,7 +85,7 @@ func TestDeletionPreservesApprovalProjectionAndRejectsDecisions(t *testing.T) {
 // Failure of the tombstone/cursor write must roll back the bypass writer and approval state.
 func TestDeletionApprovalProjectionRollback(t *testing.T) {
 	s := deletionStore(t, ":memory:")
-	for i, ev := range projectionEvents("execution") {
+	for i, ev := range approvalEvents("execution") {
 		if _, err := s.Session("s").Append(int64(i), 0, ev); err != nil {
 			t.Fatal(err)
 		}

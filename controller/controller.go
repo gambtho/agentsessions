@@ -594,6 +594,10 @@ func controllerErrorKind(err error) string {
 		return "harness_mismatch"
 	case errors.Is(err, ErrHarnessVersionMismatch):
 		return "harness_version_mismatch"
+	case errors.Is(err, ErrApprovalUnavailable):
+		return "approval_unavailable"
+	case errors.Is(err, ErrApprovalBlocked):
+		return "approval_blocked"
 	case errors.Is(err, ErrMissingIdempotencyKey):
 		return "missing_idempotency_key"
 	case errors.Is(err, ErrUnmediatedToolCall):

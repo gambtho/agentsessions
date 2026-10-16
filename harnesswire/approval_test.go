@@ -1,4 +1,4 @@
-package harnesswire_test
+package harnesswire
 
 import (
 	"context"
@@ -6,14 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aramase/agentsessions/api"
 	v1 "github.com/aramase/agentsessions/api/genpb"
-	"github.com/aramase/agentsessions/harnesswire"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -21,8 +19,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 )
 
-// Every approval test traverses a real gRPC Connect. Raw peers exercise the public
-// envelope; Go harnesses also exercise the transient sink reply and sealing.
+// Transport tables traverse real gRPC Connect; lifecycle tables isolate pump and sink barriers.
 type connectPeer struct {
 	v1.UnimplementedHarnessServer
 	run func(v1.Harness_ConnectServer) error
@@ -115,35 +112,11 @@ func openGate(t *testing.T, client v1.HarnessClient, session string) v1.Harness_
 	return s
 }
 
-// Dropping the typed park before sending control, emitting END, or forgetting the
-// Start session breaks this actual transport round trip.
-func TestApprovalParkRoundTrip(t *testing.T) {
-	starts := make(chan *api.Start, 1)
-	server := harnesswire.NewServer(gateHarness{run: func(ctx context.Context, start *api.Start, sink api.EventSink) error {
-		starts <- start
-		_, err := sink.ToolCall(ctx, gateCall)
-		return err
-	}})
-	h := harnesswire.NewClientHarness(approvalClient(t, server))
-	host := &gateHost{err: fmt.Errorf("durable request: %w", &api.ApprovalParkedError{Ref: gateRef})}
-	err := h.Run(approvalContext(t), &api.Start{SessionUID: "session", ExecutionID: "exec"}, host)
-	var parked *api.ApprovalParkedError
-	if !errors.Is(err, api.ErrApprovalParked) || !errors.As(err, &parked) || parked.Ref != gateRef {
-		t.Fatalf("Run = %v, want correlated typed park", err)
-	}
-	if start := <-starts; start.SessionUID != "session" {
-		t.Fatalf("Start session = %q", start.SessionUID)
-	}
-	if host.calls != 1 || host.reports != 0 {
-		t.Fatalf("host calls/reports = %d/%d", host.calls, host.reports)
-	}
-}
-
 func TestApprovalParkServerAckAndEOF(t *testing.T) {
 	for _, swallow := range []bool{false, true} {
 		t.Run(fmt.Sprint("swallow=", swallow), func(t *testing.T) {
 			late := make(chan []error, 1)
-			server := harnesswire.NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
+			server := NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
 				_, err := sink.ToolCall(ctx, gateCall)
 				if !swallow {
 					return err
@@ -176,65 +149,320 @@ func TestApprovalParkServerAckAndEOF(t *testing.T) {
 }
 
 func TestApprovalParkDistinctRunFailure(t *testing.T) {
-	server := harnesswire.NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
-		_, _ = sink.ToolCall(ctx, gateCall)
-		return status.Error(codes.Unavailable, "harness unwind failed")
-	}})
-	stream := openGate(t, approvalClient(t, server), "session")
-	if err := stream.Send(parkFrame()); err != nil {
-		t.Fatal(err)
-	}
-	ev, err := stream.Recv()
-	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("failed handoff = %v, %v; want Unavailable", ev, err)
-	}
-}
-
-func TestApprovalParkJoinedRunFailure(t *testing.T) {
-	server := harnesswire.NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
-		_, parked := sink.ToolCall(ctx, gateCall)
-		return errors.Join(parked, status.Error(codes.Unavailable, "distinct unwind failure"))
-	}})
-	stream := openGate(t, approvalClient(t, server), "session")
-	if err := stream.Send(parkFrame()); err != nil {
-		t.Fatal(err)
-	}
-	ev, err := stream.Recv()
-	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("joined unwind failure = %v, %v; want Unavailable, no parked success", ev, err)
-	}
-}
-
-func TestApprovalClientRefusesMissingGateNamespaceBeforeHostCall(t *testing.T) {
-	for _, emptyCall := range []bool{false, true} {
-		t.Run(fmt.Sprint("empty call=", emptyCall), func(t *testing.T) {
-			session := ""
-			if emptyCall {
-				session = "session"
+	for _, joined := range []bool{false, true} {
+		t.Run(fmt.Sprint("joined=", joined), func(t *testing.T) {
+			server := NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
+				_, parked := sink.ToolCall(ctx, gateCall)
+				failure := status.Error(codes.Unavailable, "harness unwind failed")
+				if joined {
+					return errors.Join(parked, failure)
+				}
+				return failure
+			}})
+			stream := openGate(t, approvalClient(t, server), "session")
+			if err := stream.Send(parkFrame()); err != nil {
+				t.Fatal(err)
 			}
+			if ev, err := stream.Recv(); status.Code(err) != codes.Unavailable {
+				t.Fatalf("failed handoff = %v, %v; want Unavailable, no parked success", ev, err)
+			}
+		})
+	}
+}
+
+func TestApprovalServerRejectsMalformedFrames(t *testing.T) {
+	// Each row owns fresh frames; receipt rows retain the approval-first barrier.
+	parkWith := func(change func(*v1.ControllerFrame)) []*v1.ControllerFrame {
+		frame := parkFrame()
+		change(frame)
+		return []*v1.ControllerFrame{frame}
+	}
+	approvalWith := func(change func(*v1.ControllerFrame)) []*v1.ControllerFrame {
+		frame := decisionFrame(true)
+		change(frame)
+		return []*v1.ControllerFrame{frame}
+	}
+	receiptWith := func(change func(*v1.ControllerFrame)) []*v1.ControllerFrame {
+		frame := receiptFrame()
+		change(frame)
+		return []*v1.ControllerFrame{decisionFrame(true), frame}
+	}
+	tests := []struct {
+		name    string
+		session string
+		frames  []*v1.ControllerFrame
+		want    string
+	}{
+		{"wrong park session", "session", parkWith(func(p *v1.ControllerFrame) { p.Session = "foreign" }), "session"},
+		{"empty park session", "session", parkWith(func(p *v1.ControllerFrame) { p.Session = "" }), "session"},
+		{"wrong park envelope execution", "session", parkWith(func(p *v1.ControllerFrame) { p.ExecutionId = "foreign" }), "execution_id"},
+		{"wrong park body execution", "session", parkWith(func(p *v1.ControllerFrame) { p.GetPark().ExecutionId = "foreign" }), "park"},
+		{"wrong park call", "session", parkWith(func(p *v1.ControllerFrame) { p.GetPark().ToolCallId = "foreign" }), "park"},
+		{"zero park request", "session", parkWith(func(p *v1.ControllerFrame) { p.GetPark().RequestSeq = 0 }), "park"},
+		{"bare park", "session", parkWith(func(p *v1.ControllerFrame) { p.Frame = &v1.ControllerFrame_Park{} }), "park"},
+		{"tool before approval", "session", []*v1.ControllerFrame{receiptFrame()}, "approval"},
+		{"wrong approval session", "session", approvalWith(func(p *v1.ControllerFrame) { p.Session = "foreign" }), "session"},
+		{"wrong approval call", "session", approvalWith(func(p *v1.ControllerFrame) { p.GetApproval().ToolCallId = "foreign" }), "approval"},
+		{"zero approval request", "session", approvalWith(func(p *v1.ControllerFrame) { p.GetApproval().RequestSeq = 0 }), "approval"},
+		{"bare approval", "session", approvalWith(func(p *v1.ControllerFrame) { p.Frame = &v1.ControllerFrame_Approval{} }), "approval"},
+		{"duplicate approval", "session", []*v1.ControllerFrame{decisionFrame(true), decisionFrame(true)}, "ToolResult"},
+		{"conflicting approval", "session", []*v1.ControllerFrame{decisionFrame(true), decisionFrame(false)}, "ToolResult"},
+		{"park after approval", "session", []*v1.ControllerFrame{decisionFrame(true), parkFrame()}, "ToolResult"},
+		{"wrong receipt session", "session", receiptWith(func(p *v1.ControllerFrame) { p.Session = "foreign" }), "session"},
+		{"wrong receipt execution", "session", receiptWith(func(p *v1.ControllerFrame) { p.ExecutionId = "foreign" }), "execution_id"},
+		{"wrong receipt call", "session", receiptWith(func(p *v1.ControllerFrame) { p.GetTool().Id = "foreign" }), "correlation"},
+		{"wrong receipt request", "session", receiptWith(func(p *v1.ControllerFrame) { p.GetTool().ApprovalRequestSeq = 18 }), "receipt"},
+		{"zero receipt decision", "session", receiptWith(func(p *v1.ControllerFrame) { p.GetTool().ApprovalDecisionSeq = 0 }), "receipt"},
+		{"denied success", "session", []*v1.ControllerFrame{decisionFrame(false), receiptFrame()}, "status"},
+		{"approved denial", "session", receiptWith(func(p *v1.ControllerFrame) {
+			p.GetTool().Code = v1.ToolResult_APPROVAL_DENIED
+			p.GetTool().IsError = true
+		}), "status"},
+		{"approved unclassified error", "session", receiptWith(func(p *v1.ControllerFrame) { p.GetTool().IsError = true }), "status"},
+		{"executor code without error", "session", receiptWith(func(p *v1.ControllerFrame) { p.GetTool().Code = v1.ToolResult_EXECUTOR_ERROR }), "status"},
+		{"unknown receipt code", "session", receiptWith(func(p *v1.ControllerFrame) { p.GetTool().Code = v1.ToolResult_Code(99) }), "status"},
+		{"closure between frames", "session", []*v1.ControllerFrame{decisionFrame(true)}, "EOF"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			observed := make(chan error, 1)
+			server := NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
+				_, err := sink.ToolCall(ctx, gateCall)
+				observed <- err
+				return err
+			}})
+			stream := openGate(t, approvalClient(t, server), test.session)
+			for _, frame := range test.frames {
+				if err := stream.Send(frame); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stream.CloseSend()
+			// A failure END may carry diagnostics, but no parked or completed reply is legal.
+			for {
+				ev, err := stream.Recv()
+				if err != nil {
+					break
+				}
+				if ev.GetKind() == v1.EventKind_EVENT_PARKED || ev.GetKind() == v1.EventKind_EVENT_END && ev.GetEnd().GetState() == "COMPLETED" {
+					t.Fatalf("invalid control accepted: %v", ev)
+				}
+			}
+			err := <-observed
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("ToolCall = %v, want %s refusal", err, test.want)
+			}
+		})
+	}
+}
+
+func TestApprovalReportAcceptsExecutorError(t *testing.T) {
+	server := NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
+		return sink.Report(ctx, api.ToolResult{ID: "ordinary", Code: api.ToolResultCodeExecutorError, IsError: true})
+	}})
+	host := &gateHost{}
+	if err := NewClientHarness(approvalClient(t, server)).Run(approvalContext(t), &api.Start{SessionUID: "session", ExecutionID: "exec"}, host); err != nil {
+		t.Fatal(err)
+	}
+	if host.reports != 1 {
+		t.Fatalf("reports = %d, want 1", host.reports)
+	}
+}
+
+func TestApprovalClientRejectsHostAuthorityForgery(t *testing.T) {
+	tests := map[string]*v1.Event{
+		"request":          {Kind: v1.EventKind_EVENT_APPROVAL_REQUEST, Body: &v1.Event_Approval{Approval: &v1.ApprovalRequest{ToolCallId: "call"}}},
+		"decision":         {Kind: v1.EventKind_EVENT_APPROVAL_RESULT, Body: &v1.Event_ApprovalResult{ApprovalResult: &v1.ApprovalResult{ToolCallId: "call", RequestSeq: 17, Approved: true}}},
+		"execution start":  {Kind: v1.EventKind_EVENT_EXECUTION_START},
+		"unsolicited park": {Kind: v1.EventKind_EVENT_PARKED},
+		"request receipt":  {Kind: v1.EventKind_EVENT_TOOL_RESULT, Body: &v1.Event_Result{Result: &v1.ToolResult{Id: "call", ApprovalRequestSeq: 17}}},
+		"decision receipt": {Kind: v1.EventKind_EVENT_TOOL_RESULT, Body: &v1.Event_Result{Result: &v1.ToolResult{Id: "call", ApprovalDecisionSeq: 19}}},
+		"denial receipt":   {Kind: v1.EventKind_EVENT_TOOL_RESULT, Body: &v1.Event_Result{Result: &v1.ToolResult{Id: "call", Code: v1.ToolResult_APPROVAL_DENIED, IsError: true}}},
+		"unknown code":     {Kind: v1.EventKind_EVENT_TOOL_RESULT, Body: &v1.Event_Result{Result: &v1.ToolResult{Id: "call", Code: v1.ToolResult_Code(7)}}},
+	}
+	for name, event := range tests {
+		t.Run(name, func(t *testing.T) {
+			event.ExecutionId = "exec"
 			peer := connectPeer{run: func(s v1.Harness_ConnectServer) error {
 				if _, err := s.Recv(); err != nil {
 					return err
 				}
-				ev := gateToolEvent()
-				if emptyCall {
-					ev.GetTool().Id = ""
-				}
-				if err := s.Send(ev); err != nil {
+				if err := s.Send(event); err != nil {
 					return err
 				}
-				_, err := s.Recv()
-				return err
+				return s.Send(&v1.Event{ExecutionId: "exec", Kind: v1.EventKind_EVENT_END, Body: &v1.Event_End{End: &v1.HarnessEnd{State: "COMPLETED"}}})
 			}}
-			host := &gateHost{result: api.ToolResult{ID: "call", ApprovalRequestSeq: 17, ApprovalDecisionSeq: 19, Approval: &api.ApprovalResult{ToolCallID: "call", RequestSeq: 17, Approved: true}}}
-			err := harnesswire.NewClientHarness(approvalClient(t, peer)).Run(approvalContext(t), &api.Start{SessionUID: session, ExecutionID: "exec"}, host)
-			if err == nil || !strings.Contains(err.Error(), "requires session and call id") {
-				t.Fatalf("missing gate namespace = %v", err)
+			host := &gateHost{}
+			err := NewClientHarness(approvalClient(t, peer)).Run(approvalContext(t), &api.Start{SessionUID: "session", ExecutionID: "exec"}, host)
+			if err == nil || !strings.Contains(err.Error(), "host-owned") {
+				t.Fatalf("forgery = %v, want host-owned refusal", err)
 			}
-			if host.calls != 0 {
-				t.Fatalf("invalid gate namespace reached host/executor: %d calls", host.calls)
+			if host.reports != 0 || host.calls != 0 {
+				t.Fatalf("forgery reached host sink: %#v", host)
 			}
 		})
+	}
+}
+
+type hostSink struct{}
+
+func (*hostSink) Model(context.Context, api.ModelRequest) (api.ModelResponse, error) {
+	return api.ModelResponse{}, nil
+}
+func (*hostSink) Output(context.Context, string) error { return nil }
+func (*hostSink) ToolCall(context.Context, api.ToolCall) (api.ToolResult, error) {
+	return api.ToolResult{}, nil
+}
+func (*hostSink) Report(context.Context, api.ToolResult) error { return nil }
+func (*hostSink) Usage(context.Context, api.Usage) error       { return nil }
+
+// Controlled Recv avoids goroutine-count heuristics: the second frame is known
+// to be forwarded against a full result queue, and pump return is observable.
+type pumpStream struct {
+	v1.Harness_ConnectServer
+	ctx      context.Context
+	frames   chan *v1.ControllerFrame
+	received chan struct{}
+}
+
+func (s *pumpStream) Context() context.Context { return s.ctx }
+func (s *pumpStream) Recv() (*v1.ControllerFrame, error) {
+	select {
+	case frame, ok := <-s.frames:
+		if !ok {
+			return nil, io.EOF
+		}
+		s.received <- struct{}{}
+		return frame, nil
+	case <-s.ctx.Done():
+		return nil, s.ctx.Err()
+	}
+}
+
+func TestReceivePumpBackpressureShutdown(t *testing.T) {
+	for _, mode := range []string{"handler return", "context canceled", "blocked Recv canceled"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			stream := &pumpStream{ctx: ctx, frames: make(chan *v1.ControllerFrame, 2), received: make(chan struct{}, 2)}
+			results := make(chan *v1.ControllerFrame, 1)
+			done, stopped := make(chan struct{}), make(chan struct{})
+			if mode != "blocked Recv canceled" {
+				stream.frames <- &v1.ControllerFrame{ExecutionId: "one"}
+				stream.frames <- &v1.ControllerFrame{ExecutionId: "two"}
+			}
+			go func() { receiveFrames(stream, results, done); close(stopped) }()
+			if mode != "blocked Recv canceled" {
+				for range 2 {
+					select {
+					case <-stream.received:
+					case <-time.After(time.Second):
+						t.Fatal("pump did not receive the backpressured frame")
+					}
+				}
+			}
+			if mode == "handler return" {
+				close(done)
+			} else {
+				cancel() // gRPC owns this cancellation when Connect returns.
+			}
+			select {
+			case <-stopped:
+			case <-time.After(time.Second):
+				t.Fatal("receive pump leaked")
+			}
+		})
+	}
+}
+
+// Ready frames must not beat cancellation or closure; cancellation retains priority.
+func TestAwaitResultCanceledWithReadyFrame(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		canceled, closed bool
+		want             error
+	}{
+		{"canceled with ready frame", true, false, context.Canceled},
+		{"closed with ready frame", false, true, errSinkClosed},
+		{"canceled and closed", true, true, context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if test.canceled {
+				cancel()
+			}
+			done := make(chan struct{})
+			if test.closed {
+				close(done)
+			}
+			for range 100 {
+				results := make(chan *v1.ControllerFrame, 1)
+				results <- receiptFrame()
+				s := &streamSink{results: results, executionID: "exec", done: done}
+				if _, err := s.awaitResult(ctx); !errors.Is(err, test.want) {
+					t.Fatalf("await = %v, want %v", err, test.want)
+				}
+			}
+		})
+	}
+}
+
+func TestStreamSinkOperativeFailuresStaySticky(t *testing.T) {
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded, io.EOF, errors.New("invalid control frame"), errors.Join(errSinkClosed, context.Canceled)} {
+		s := &streamSink{}
+		if err := s.fail(cause); !errors.Is(err, cause) || !errors.Is(s.failure, cause) {
+			t.Fatalf("operative failure = %v, sticky cause = %v, want %v", err, s.failure, cause)
+		}
+		if err := s.check(t.Context()); !errors.Is(err, cause) {
+			t.Fatalf("later effect refusal = %v, want original %v", err, cause)
+		}
+	}
+}
+func TestStreamSinkInvalidApprovalStaysSealed(t *testing.T) {
+	foreign := parkFrame()
+	foreign.Session = "foreign"
+	for _, test := range []struct {
+		name, session, callID string
+		reply                 *v1.ControllerFrame
+		wantSent              int
+	}{
+		{"foreign park session", "session", "call", foreign, 1},
+		{"empty session before send", "", "call", parkFrame(), 0},
+		{"empty call before send", "session", "", parkFrame(), 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			results := make(chan *v1.ControllerFrame, 1)
+			results <- test.reply
+			server := &fakeConnectServer{}
+			sink := &streamSink{stream: server, results: results, executionID: "exec", session: test.session}
+			_, err := sink.ToolCall(t.Context(), api.ToolCall{ID: test.callID, Mediation: api.MediationRequiresApproval})
+			if err == nil {
+				t.Fatal("invalid approval accepted")
+			}
+			if lateErr := sink.Output(t.Context(), "late"); lateErr != err {
+				t.Fatalf("sticky refusal = %v, want %v", lateErr, err)
+			}
+			if len(server.sent) != test.wantSent || test.wantSent == 1 && server.sent[0].GetKind() != v1.EventKind_EVENT_TOOL_CALL {
+				t.Fatalf("unexpected or late effect: %v", server.sent)
+			}
+		})
+	}
+}
+
+type parkSendFailure struct {
+	v1.Harness_ConnectClient
+	cause error
+}
+
+func (s parkSendFailure) Send(*v1.ControllerFrame) error { return s.cause }
+func (parkSendFailure) Recv() (*v1.Event, error)         { panic("Recv after failed park Send") }
+
+func TestParkExchangePreservesSendFailure(t *testing.T) {
+	cause := errors.New("transport write failed")
+	err := exchangePark(t.Context(), parkSendFailure{cause: cause}, &api.Start{SessionUID: "session", ExecutionID: "exec"}, api.ApprovalRef{ExecutionID: "exec", ToolCallID: "call", RequestSeq: 17})
+	if !errors.Is(err, cause) || errors.Is(err, api.ErrApprovalParked) {
+		t.Fatalf("failed park Send = %v, want original transport cause", err)
 	}
 }
 
@@ -318,7 +546,7 @@ func TestApprovalParkClientRequiresAckAndClosure(t *testing.T) {
 				ctx, cancel = context.WithTimeout(ctx, time.Second)
 				defer cancel()
 			}
-			err := harnesswire.NewClientHarness(approvalClient(t, peer)).Run(ctx, &api.Start{SessionUID: "session", ExecutionID: "exec"}, &gateHost{err: &api.ApprovalParkedError{Ref: gateRef}})
+			err := NewClientHarness(approvalClient(t, peer)).Run(ctx, &api.Start{SessionUID: "session", ExecutionID: "exec"}, &gateHost{err: &api.ApprovalParkedError{Ref: gateRef}})
 			if err == nil || errors.Is(err, api.ErrApprovalParked) {
 				t.Fatalf("Run = %v; invalid handoff cannot be parked success", err)
 			}
@@ -340,247 +568,43 @@ func TestApprovalParkClientRequiresAckAndClosure(t *testing.T) {
 	}
 }
 
-func TestApprovalReplyRoundTrip(t *testing.T) {
-	for _, shape := range []struct {
-		name     string
-		approved bool
-		code     api.ToolResultCode
-		isError  bool
-	}{
-		{"success", true, api.ToolResultCodeUnspecified, false},
-		{"executor error", true, api.ToolResultCodeExecutorError, true},
-		{"denied", false, api.ToolResultCodeApprovalDenied, true},
-	} {
-		t.Run(shape.name, func(t *testing.T) {
-			got := make(chan api.ToolResult, 1)
-			server := harnesswire.NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
-				res, err := sink.ToolCall(ctx, gateCall)
-				if err != nil {
-					return err
-				}
-				got <- res
-				return sink.Output(ctx, "continued")
-			}})
-			decision := &api.ApprovalResult{ToolCallID: "call", RequestSeq: 17, Approved: shape.approved, Reason: "reviewed"}
-			result := api.ToolResult{ID: "call", Code: shape.code, IsError: shape.isError, ApprovalRequestSeq: 17, ApprovalDecisionSeq: 19, Approval: decision}
-			host := &gateHost{result: result}
-			err := harnesswire.NewClientHarness(approvalClient(t, server)).Run(approvalContext(t), &api.Start{SessionUID: "session", ExecutionID: "exec"}, host)
-			if err != nil {
-				t.Fatalf("Run = %v", err)
-			}
-			res := <-got
-			if !reflect.DeepEqual(res.Approval, decision) || res.ApprovalDecisionSeq != 19 || res.Code != shape.code || res.IsError != shape.isError {
-				t.Fatalf("Go reply = %#v", res)
-			}
-			if !reflect.DeepEqual(host.outputs, []string{"continued"}) {
-				t.Fatalf("continuation = %v", host.outputs)
-			}
-		})
-	}
-}
-
-func TestApprovalClientFrameOrder(t *testing.T) {
-	observed := make(chan []*v1.ControllerFrame, 1)
-	peer := connectPeer{run: func(s v1.Harness_ConnectServer) error {
-		start, err := s.Recv()
-		if err != nil {
-			return err
-		}
-		if err := s.Send(gateToolEvent()); err != nil {
-			return err
-		}
-		decision, err := s.Recv()
-		if err != nil {
-			return err
-		}
-		receipt, err := s.Recv()
-		if err != nil {
-			return err
-		}
-		observed <- []*v1.ControllerFrame{start, decision, receipt}
-		return s.Send(&v1.Event{ExecutionId: "exec", Kind: v1.EventKind_EVENT_END, Body: &v1.Event_End{End: &v1.HarnessEnd{State: "COMPLETED"}}})
-	}}
-	host := &gateHost{result: api.ToolResult{ID: "call", ApprovalRequestSeq: 17, ApprovalDecisionSeq: 19, Approval: &api.ApprovalResult{ToolCallID: "call", RequestSeq: 17, Approved: true}}}
-	err := harnesswire.NewClientHarness(approvalClient(t, peer)).Run(approvalContext(t), &api.Start{SessionUID: "session", ExecutionID: "exec"}, host)
-	if err != nil {
-		t.Fatal(err)
-	}
-	frames := <-observed
-	for _, f := range frames {
-		if f.GetSession() != "session" || f.GetExecutionId() != "exec" {
-			t.Fatalf("envelope = %v", f)
-		}
-	}
-	if frames[1].GetApproval() == nil || frames[1].GetApproval().GetRequestSeq() != 17 || frames[2].GetTool() == nil || frames[2].GetTool().GetApprovalDecisionSeq() != 19 {
-		t.Fatalf("approval-before-tool pair = %v", frames)
-	}
-}
-
-func TestApprovalServerRejectsMalformedFrames(t *testing.T) {
-	tests := []struct {
-		name    string
-		session string
-		frames  func() []*v1.ControllerFrame
-		want    string
-	}{
-		{"empty start session", "", func() []*v1.ControllerFrame { return []*v1.ControllerFrame{parkFrame()} }, "session"},
-		{"wrong park session", "session", func() []*v1.ControllerFrame { p := parkFrame(); p.Session = "foreign"; return []*v1.ControllerFrame{p} }, "session"},
-		{"empty park session", "session", func() []*v1.ControllerFrame { p := parkFrame(); p.Session = ""; return []*v1.ControllerFrame{p} }, "session"},
-		{"wrong park envelope execution", "session", func() []*v1.ControllerFrame {
-			p := parkFrame()
-			p.ExecutionId = "foreign"
-			return []*v1.ControllerFrame{p}
-		}, "execution_id"},
-		{"wrong park body execution", "session", func() []*v1.ControllerFrame {
-			p := parkFrame()
-			p.GetPark().ExecutionId = "foreign"
-			return []*v1.ControllerFrame{p}
-		}, "park"},
-		{"wrong park call", "session", func() []*v1.ControllerFrame {
-			p := parkFrame()
-			p.GetPark().ToolCallId = "foreign"
-			return []*v1.ControllerFrame{p}
-		}, "park"},
-		{"zero park request", "session", func() []*v1.ControllerFrame {
-			p := parkFrame()
-			p.GetPark().RequestSeq = 0
-			return []*v1.ControllerFrame{p}
-		}, "park"},
-		{"bare park", "session", func() []*v1.ControllerFrame {
-			p := parkFrame()
-			p.Frame = &v1.ControllerFrame_Park{}
-			return []*v1.ControllerFrame{p}
-		}, "park"},
-		{"tool before approval", "session", func() []*v1.ControllerFrame { return []*v1.ControllerFrame{receiptFrame()} }, "approval"},
-		{"wrong approval session", "session", func() []*v1.ControllerFrame {
-			p := decisionFrame(true)
-			p.Session = "foreign"
-			return []*v1.ControllerFrame{p}
-		}, "session"},
-		{"wrong approval call", "session", func() []*v1.ControllerFrame {
-			p := decisionFrame(true)
-			p.GetApproval().ToolCallId = "foreign"
-			return []*v1.ControllerFrame{p}
-		}, "approval"},
-		{"zero approval request", "session", func() []*v1.ControllerFrame {
-			p := decisionFrame(true)
-			p.GetApproval().RequestSeq = 0
-			return []*v1.ControllerFrame{p}
-		}, "approval"},
-		{"bare approval", "session", func() []*v1.ControllerFrame {
-			p := decisionFrame(true)
-			p.Frame = &v1.ControllerFrame_Approval{}
-			return []*v1.ControllerFrame{p}
-		}, "approval"},
-		{"duplicate approval", "session", func() []*v1.ControllerFrame { return []*v1.ControllerFrame{decisionFrame(true), decisionFrame(true)} }, "ToolResult"},
-		{"conflicting approval", "session", func() []*v1.ControllerFrame { return []*v1.ControllerFrame{decisionFrame(true), decisionFrame(false)} }, "ToolResult"},
-		{"park after approval", "session", func() []*v1.ControllerFrame { return []*v1.ControllerFrame{decisionFrame(true), parkFrame()} }, "ToolResult"},
-		{"wrong receipt session", "session", func() []*v1.ControllerFrame {
-			p := receiptFrame()
-			p.Session = "foreign"
-			return []*v1.ControllerFrame{decisionFrame(true), p}
-		}, "session"},
-		{"wrong receipt execution", "session", func() []*v1.ControllerFrame {
-			p := receiptFrame()
-			p.ExecutionId = "foreign"
-			return []*v1.ControllerFrame{decisionFrame(true), p}
-		}, "execution_id"},
-		{"wrong receipt call", "session", func() []*v1.ControllerFrame {
-			p := receiptFrame()
-			p.GetTool().Id = "foreign"
-			return []*v1.ControllerFrame{decisionFrame(true), p}
-		}, "correlation"},
-		{"wrong receipt request", "session", func() []*v1.ControllerFrame {
-			p := receiptFrame()
-			p.GetTool().ApprovalRequestSeq = 18
-			return []*v1.ControllerFrame{decisionFrame(true), p}
-		}, "receipt"},
-		{"zero receipt decision", "session", func() []*v1.ControllerFrame {
-			p := receiptFrame()
-			p.GetTool().ApprovalDecisionSeq = 0
-			return []*v1.ControllerFrame{decisionFrame(true), p}
-		}, "receipt"},
-		{"denied success", "session", func() []*v1.ControllerFrame { return []*v1.ControllerFrame{decisionFrame(false), receiptFrame()} }, "status"},
-		{"approved denial", "session", func() []*v1.ControllerFrame {
-			p := receiptFrame()
-			p.GetTool().Code = v1.ToolResult_APPROVAL_DENIED
-			p.GetTool().IsError = true
-			return []*v1.ControllerFrame{decisionFrame(true), p}
-		}, "status"},
-		{"approved unclassified error", "session", func() []*v1.ControllerFrame {
-			p := receiptFrame()
-			p.GetTool().IsError = true
-			return []*v1.ControllerFrame{decisionFrame(true), p}
-		}, "status"},
-		{"executor code without error", "session", func() []*v1.ControllerFrame {
-			p := receiptFrame()
-			p.GetTool().Code = v1.ToolResult_EXECUTOR_ERROR
-			return []*v1.ControllerFrame{decisionFrame(true), p}
-		}, "status"},
-		{"unknown receipt code", "session", func() []*v1.ControllerFrame {
-			p := receiptFrame()
-			p.GetTool().Code = v1.ToolResult_Code(99)
-			return []*v1.ControllerFrame{decisionFrame(true), p}
-		}, "status"},
-		{"closure between frames", "session", func() []*v1.ControllerFrame { return []*v1.ControllerFrame{decisionFrame(true)} }, "EOF"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			observed := make(chan error, 1)
-			server := harnesswire.NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
-				_, err := sink.ToolCall(ctx, gateCall)
-				observed <- err
-				return err
-			}})
-			stream := openGate(t, approvalClient(t, server), test.session)
-			for _, frame := range test.frames() {
-				if err := stream.Send(frame); err != nil {
-					t.Fatal(err)
-				}
-			}
-			stream.CloseSend()
-			// A failure END may carry diagnostics, but no parked or completed reply is legal.
-			for {
-				ev, err := stream.Recv()
-				if err != nil {
-					break
-				}
-				if ev.GetKind() == v1.EventKind_EVENT_PARKED || ev.GetKind() == v1.EventKind_EVENT_END && ev.GetEnd().GetState() == "COMPLETED" {
-					t.Fatalf("invalid control accepted: %v", ev)
-				}
-			}
-			err := <-observed
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("ToolCall = %v, want %s refusal", err, test.want)
-			}
-		})
-	}
-}
-
 func TestApprovalClientRejectsInvalidHostReplies(t *testing.T) {
 	tests := []struct {
 		name   string
-		mutate func(*api.ToolResult)
+		mutate func(*gateHost)
 		want   string
 	}{
-		{"missing decision", func(r *api.ToolResult) { r.Approval = nil }, "approval"},
-		{"foreign decision call", func(r *api.ToolResult) { r.Approval.ToolCallID = "foreign" }, "correlation"},
-		{"zero decision request", func(r *api.ToolResult) { r.Approval.RequestSeq = 0 }, "approval"},
-		{"foreign receipt call", func(r *api.ToolResult) { r.ID = "foreign" }, "correlation"},
-		{"foreign receipt request", func(r *api.ToolResult) { r.ApprovalRequestSeq = 18 }, "receipt"},
-		{"negative receipt request", func(r *api.ToolResult) { r.ApprovalRequestSeq = -1 }, "receipt"},
-		{"zero receipt decision", func(r *api.ToolResult) { r.ApprovalDecisionSeq = 0 }, "receipt"},
-		{"negative receipt decision", func(r *api.ToolResult) { r.ApprovalDecisionSeq = -1 }, "receipt"},
-		{"denied success", func(r *api.ToolResult) { r.Approval.Approved = false }, "status"},
-		{"denied executor error", func(r *api.ToolResult) {
-			r.Approval.Approved = false
-			r.Code = api.ToolResultCodeExecutorError
-			r.IsError = true
+		{"missing decision", func(h *gateHost) { h.result.Approval = nil }, "approval"},
+		{"foreign decision call", func(h *gateHost) { h.result.Approval.ToolCallID = "foreign" }, "correlation"},
+		{"zero decision request", func(h *gateHost) { h.result.Approval.RequestSeq = 0 }, "approval"},
+		{"foreign receipt call", func(h *gateHost) { h.result.ID = "foreign" }, "correlation"},
+		{"foreign receipt request", func(h *gateHost) { h.result.ApprovalRequestSeq = 18 }, "receipt"},
+		{"negative receipt request", func(h *gateHost) { h.result.ApprovalRequestSeq = -1 }, "receipt"},
+		{"zero receipt decision", func(h *gateHost) { h.result.ApprovalDecisionSeq = 0 }, "receipt"},
+		{"negative receipt decision", func(h *gateHost) { h.result.ApprovalDecisionSeq = -1 }, "receipt"},
+		{"denied success", func(h *gateHost) { h.result.Approval.Approved = false }, "status"},
+		{"denied executor error", func(h *gateHost) {
+			h.result.Approval.Approved = false
+			h.result.Code = api.ToolResultCodeExecutorError
+			h.result.IsError = true
 		}, "status"},
-		{"approved denial", func(r *api.ToolResult) { r.Code = api.ToolResultCodeApprovalDenied; r.IsError = true }, "status"},
-		{"approved legacy error", func(r *api.ToolResult) { r.IsError = true }, "status"},
-		{"executor code without error", func(r *api.ToolResult) { r.Code = api.ToolResultCodeExecutorError }, "status"},
-		{"unknown code", func(r *api.ToolResult) { r.Code = api.ToolResultCode(99) }, "status"},
+		{"approved denial", func(h *gateHost) { h.result.Code = api.ToolResultCodeApprovalDenied; h.result.IsError = true }, "status"},
+		{"approved legacy error", func(h *gateHost) { h.result.IsError = true }, "status"},
+		{"executor code without error", func(h *gateHost) { h.result.Code = api.ToolResultCodeExecutorError }, "status"},
+		{"unknown code", func(h *gateHost) { h.result.Code = api.ToolResultCode(99) }, "status"},
+		{"bare park sentinel", func(h *gateHost) { h.err = api.ErrApprovalParked }, "park"},
+		{"foreign park execution", func(h *gateHost) {
+			h.err = &api.ApprovalParkedError{Ref: api.ApprovalRef{ExecutionID: "foreign", ToolCallID: "call", RequestSeq: 17}}
+		}, "park"},
+		{"foreign park call", func(h *gateHost) {
+			h.err = &api.ApprovalParkedError{Ref: api.ApprovalRef{ExecutionID: "exec", ToolCallID: "foreign", RequestSeq: 17}}
+		}, "park"},
+		{"zero park request", func(h *gateHost) {
+			h.err = &api.ApprovalParkedError{Ref: api.ApprovalRef{ExecutionID: "exec", ToolCallID: "call"}}
+		}, "park"},
+		{"negative park request", func(h *gateHost) {
+			h.err = &api.ApprovalParkedError{Ref: api.ApprovalRef{ExecutionID: "exec", ToolCallID: "call", RequestSeq: -1}}
+		}, "park"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -596,10 +620,10 @@ func TestApprovalClientRejectsInvalidHostReplies(t *testing.T) {
 				frames <- f
 				return err
 			}}
-			result := api.ToolResult{ID: "call", ApprovalRequestSeq: 17, ApprovalDecisionSeq: 19, Approval: &api.ApprovalResult{ToolCallID: "call", RequestSeq: 17, Approved: true}}
-			test.mutate(&result)
-			err := harnesswire.NewClientHarness(approvalClient(t, peer)).Run(approvalContext(t), &api.Start{SessionUID: "session", ExecutionID: "exec"}, &gateHost{result: result})
-			if err == nil || !strings.Contains(err.Error(), test.want) {
+			host := &gateHost{result: api.ToolResult{ID: "call", ApprovalRequestSeq: 17, ApprovalDecisionSeq: 19, Approval: &api.ApprovalResult{ToolCallID: "call", RequestSeq: 17, Approved: true}}}
+			test.mutate(host)
+			err := NewClientHarness(approvalClient(t, peer)).Run(approvalContext(t), &api.Start{SessionUID: "session", ExecutionID: "exec"}, host)
+			if err == nil || errors.Is(err, api.ErrApprovalParked) || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("host reply = %v, want %s refusal", err, test.want)
 			}
 			select {
@@ -609,36 +633,6 @@ func TestApprovalClientRejectsInvalidHostReplies(t *testing.T) {
 				}
 			case <-time.After(time.Second):
 				t.Fatal("peer receive did not drain")
-			}
-		})
-	}
-}
-
-func TestApprovalClientRejectsInvalidHostPark(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		err  error
-	}{
-		{"bare sentinel", api.ErrApprovalParked},
-		{"foreign execution", &api.ApprovalParkedError{Ref: api.ApprovalRef{ExecutionID: "foreign", ToolCallID: "call", RequestSeq: 17}}},
-		{"foreign call", &api.ApprovalParkedError{Ref: api.ApprovalRef{ExecutionID: "exec", ToolCallID: "foreign", RequestSeq: 17}}},
-		{"zero request", &api.ApprovalParkedError{Ref: api.ApprovalRef{ExecutionID: "exec", ToolCallID: "call"}}},
-		{"negative request", &api.ApprovalParkedError{Ref: api.ApprovalRef{ExecutionID: "exec", ToolCallID: "call", RequestSeq: -1}}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			peer := connectPeer{run: func(s v1.Harness_ConnectServer) error {
-				if _, err := s.Recv(); err != nil {
-					return err
-				}
-				if err := s.Send(gateToolEvent()); err != nil {
-					return err
-				}
-				_, err := s.Recv()
-				return err
-			}}
-			err := harnesswire.NewClientHarness(approvalClient(t, peer)).Run(approvalContext(t), &api.Start{SessionUID: "session", ExecutionID: "exec"}, &gateHost{err: test.err})
-			if err == nil || errors.Is(err, api.ErrApprovalParked) || !strings.Contains(err.Error(), "park") {
-				t.Fatalf("invalid host park = %v", err)
 			}
 		})
 	}
@@ -657,12 +651,12 @@ func TestApprovalServerReportForgeryIsSticky(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			observed := make(chan []error, 1)
-			server := harnesswire.NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
+			server := NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
 				observed <- []error{sink.Report(ctx, test.result), sink.Output(ctx, "forged continuation")}
 				return nil
 			}})
 			host := &gateHost{}
-			err := harnesswire.NewClientHarness(approvalClient(t, server)).Run(approvalContext(t), &api.Start{SessionUID: "session", ExecutionID: "exec"}, host)
+			err := NewClientHarness(approvalClient(t, server)).Run(approvalContext(t), &api.Start{SessionUID: "session", ExecutionID: "exec"}, host)
 			if err == nil || !strings.Contains(err.Error(), "host-owned") {
 				t.Fatalf("swallowed forged Report = %v", err)
 			}
@@ -673,230 +667,6 @@ func TestApprovalServerReportForgeryIsSticky(t *testing.T) {
 			}
 			if host.reports != 0 || len(host.outputs) != 0 {
 				t.Fatalf("forged receipt/effect reached host: %#v", host)
-			}
-		})
-	}
-}
-
-func TestApprovalServerRejectsParkOnOrdinaryTool(t *testing.T) {
-	observed := make(chan error, 1)
-	server := harnesswire.NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
-		call := gateCall
-		call.Mediation = api.MediationControllerMediated
-		_, err := sink.ToolCall(ctx, call)
-		observed <- err
-		return nil
-	}})
-	stream := openGate(t, approvalClient(t, server), "session")
-	if err := stream.Send(parkFrame()); err != nil {
-		t.Fatal(err)
-	}
-	ev, err := stream.Recv()
-	if err != nil || ev.GetKind() != v1.EventKind_EVENT_END || ev.GetEnd().GetState() != "FAILED" {
-		t.Fatalf("ordinary park response = %v, %v", ev, err)
-	}
-	if err := <-observed; err == nil || !strings.Contains(err.Error(), "ToolResult") {
-		t.Fatalf("ordinary park = %v", err)
-	}
-}
-
-func TestApprovalServerCanceledBetweenFrames(t *testing.T) {
-	observed := make(chan error, 1)
-	server := harnesswire.NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
-		_, err := sink.ToolCall(ctx, gateCall)
-		observed <- err
-		return err
-	}})
-	ctx, cancel := context.WithCancel(approvalContext(t))
-	stream, err := approvalClient(t, server).Connect(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := stream.Send(&v1.ControllerFrame{Session: "session", ExecutionId: "exec", Frame: &v1.ControllerFrame_Start{Start: &v1.Start{}}}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := stream.Recv(); err != nil {
-		t.Fatal(err)
-	}
-	if err := stream.Send(decisionFrame(true)); err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-	select {
-	case err := <-observed:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("canceled awaiting receipt = %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("canceled ToolCall did not drain")
-	}
-}
-
-func TestApprovalServerConcurrentParkSealsEffects(t *testing.T) {
-	release := make(chan struct{})
-	observed := make(chan error, 1)
-	server := harnesswire.NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
-		toolErr := make(chan error, 1)
-		go func() { _, err := sink.ToolCall(ctx, gateCall); toolErr <- err }()
-		<-release // the peer has received TOOL_CALL: ToolCall owns the effect lock
-		outputErr := make(chan error, 1)
-		go func() { outputErr <- sink.Output(ctx, "concurrent late effect") }()
-		if err := <-toolErr; !errors.Is(err, api.ErrApprovalParked) {
-			return err
-		}
-		observed <- <-outputErr
-		return nil
-	}})
-	stream := openGate(t, approvalClient(t, server), "session")
-	close(release)
-	if err := stream.Send(parkFrame()); err != nil {
-		t.Fatal(err)
-	}
-	ev, err := stream.Recv()
-	if err != nil || ev.GetKind() != v1.EventKind_EVENT_PARKED {
-		t.Fatalf("park = %v, %v", ev, err)
-	}
-	if ev, err := stream.Recv(); err != io.EOF {
-		t.Fatalf("concurrent park closure = %v, %v", ev, err)
-	}
-	if err := <-observed; !errors.Is(err, api.ErrApprovalParked) {
-		t.Fatalf("concurrent effect = %v", err)
-	}
-}
-
-func TestServerNormalClosureInterruptsConcurrentAwait(t *testing.T) {
-	for _, operation := range []struct {
-		name string
-		kind v1.EventKind
-		call func(api.EventSink) error
-	}{
-		{"model", v1.EventKind_EVENT_MODEL_CALL, func(sink api.EventSink) error {
-			_, err := sink.Model(context.Background(), api.ModelRequest{Model: "m"})
-			return err
-		}},
-		{"ordinary tool", v1.EventKind_EVENT_TOOL_CALL, func(sink api.EventSink) error {
-			call := gateCall
-			call.Mediation = api.MediationControllerMediated
-			_, err := sink.ToolCall(context.Background(), call)
-			return err
-		}},
-		{"approval tool", v1.EventKind_EVENT_TOOL_CALL, func(sink api.EventSink) error {
-			_, err := sink.ToolCall(context.Background(), gateCall)
-			return err
-		}},
-	} {
-		for _, failed := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/failed=%t", operation.name, failed), func(t *testing.T) {
-				var runErr error
-				if failed {
-					runErr = status.Error(codes.Unavailable, "actual unwind failure")
-				}
-				release := make(chan struct{})
-				observed := make(chan error, 1)
-				server := harnesswire.NewServer(gateHarness{run: func(_ context.Context, _ *api.Start, sink api.EventSink) error {
-					go func() { observed <- operation.call(sink) }()
-					<-release
-					return runErr
-				}})
-				stream, err := approvalClient(t, server).Connect(approvalContext(t))
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := stream.Send(&v1.ControllerFrame{Session: "session", ExecutionId: "exec", Frame: &v1.ControllerFrame_Start{Start: &v1.Start{}}}); err != nil {
-					t.Fatal(err)
-				}
-				ev, err := stream.Recv()
-				if err != nil || ev.GetKind() != operation.kind {
-					t.Fatalf("concurrent request = %v, %v", ev, err)
-				}
-				close(release) // Run returns while the operation awaits a reply the peer never sends.
-				ev, err = stream.Recv()
-				if err != nil || ev.GetKind() != v1.EventKind_EVENT_END {
-					t.Fatalf("Run closure = %v, %v", ev, err)
-				}
-				if failed {
-					if ev.GetEnd().GetState() != "FAILED" || ev.GetEnd().GetError().GetDescription() != runErr.Error() {
-						t.Fatalf("failed END = %v, want actual unwind failure diagnostics", ev)
-					}
-					if ev, err := stream.Recv(); status.Code(err) != codes.Unavailable {
-						t.Fatalf("Run failure status = %v, %v; want Unavailable", ev, err)
-					}
-				} else {
-					if ev.GetEnd().GetState() != "COMPLETED" || ev.GetEnd().GetError() != nil {
-						t.Fatalf("successful END = %v, want COMPLETED without shutdown failure", ev)
-					}
-					if ev, err := stream.Recv(); err != io.EOF {
-						t.Fatalf("normal closure = %v, %v", ev, err)
-					}
-				}
-				if err := <-observed; err == nil || !strings.Contains(err.Error(), "sink closed") {
-					t.Fatalf("concurrent await = %v, want rejection by sink closure", err)
-				}
-			})
-		}
-	}
-}
-
-func TestServerNormalClosureSealsRetainedSink(t *testing.T) {
-	captured := make(chan api.EventSink, 1)
-	server := harnesswire.NewServer(gateHarness{run: func(_ context.Context, _ *api.Start, sink api.EventSink) error { captured <- sink; return nil }})
-	host := &gateHost{}
-	if err := harnesswire.NewClientHarness(approvalClient(t, server)).Run(approvalContext(t), &api.Start{ExecutionID: "exec"}, host); err != nil {
-		t.Fatal(err)
-	}
-	sink := <-captured
-	_, modelErr := sink.Model(t.Context(), api.ModelRequest{Model: "m"})
-	_, toolErr := sink.ToolCall(t.Context(), gateCall)
-	for _, err := range []error{modelErr, toolErr, sink.Output(t.Context(), "late"), sink.Report(t.Context(), api.ToolResult{ID: "ordinary"}), sink.Usage(t.Context(), api.Usage{})} {
-		if err == nil || !strings.Contains(err.Error(), "sink closed") {
-			t.Fatalf("late sink operation = %v", err)
-		}
-	}
-}
-
-func TestApprovalReportAcceptsExecutorError(t *testing.T) {
-	server := harnesswire.NewServer(gateHarness{run: func(ctx context.Context, _ *api.Start, sink api.EventSink) error {
-		return sink.Report(ctx, api.ToolResult{ID: "ordinary", Code: api.ToolResultCodeExecutorError, IsError: true})
-	}})
-	host := &gateHost{}
-	if err := harnesswire.NewClientHarness(approvalClient(t, server)).Run(approvalContext(t), &api.Start{SessionUID: "session", ExecutionID: "exec"}, host); err != nil {
-		t.Fatal(err)
-	}
-	if host.reports != 1 {
-		t.Fatalf("reports = %d, want 1", host.reports)
-	}
-}
-
-func TestApprovalClientRejectsHostAuthorityForgery(t *testing.T) {
-	tests := map[string]*v1.Event{
-		"request":          {Kind: v1.EventKind_EVENT_APPROVAL_REQUEST, Body: &v1.Event_Approval{Approval: &v1.ApprovalRequest{ToolCallId: "call"}}},
-		"decision":         {Kind: v1.EventKind_EVENT_APPROVAL_RESULT, Body: &v1.Event_ApprovalResult{ApprovalResult: &v1.ApprovalResult{ToolCallId: "call", RequestSeq: 17, Approved: true}}},
-		"execution start":  {Kind: v1.EventKind_EVENT_EXECUTION_START},
-		"unsolicited park": {Kind: v1.EventKind_EVENT_PARKED},
-		"request receipt":  {Kind: v1.EventKind_EVENT_TOOL_RESULT, Body: &v1.Event_Result{Result: &v1.ToolResult{Id: "call", ApprovalRequestSeq: 17}}},
-		"decision receipt": {Kind: v1.EventKind_EVENT_TOOL_RESULT, Body: &v1.Event_Result{Result: &v1.ToolResult{Id: "call", ApprovalDecisionSeq: 19}}},
-		"denial receipt":   {Kind: v1.EventKind_EVENT_TOOL_RESULT, Body: &v1.Event_Result{Result: &v1.ToolResult{Id: "call", Code: v1.ToolResult_APPROVAL_DENIED, IsError: true}}},
-		"unknown code":     {Kind: v1.EventKind_EVENT_TOOL_RESULT, Body: &v1.Event_Result{Result: &v1.ToolResult{Id: "call", Code: v1.ToolResult_Code(7)}}},
-	}
-	for name, event := range tests {
-		t.Run(name, func(t *testing.T) {
-			event.ExecutionId = "exec"
-			peer := connectPeer{run: func(s v1.Harness_ConnectServer) error {
-				if _, err := s.Recv(); err != nil {
-					return err
-				}
-				if err := s.Send(event); err != nil {
-					return err
-				}
-				return s.Send(&v1.Event{ExecutionId: "exec", Kind: v1.EventKind_EVENT_END, Body: &v1.Event_End{End: &v1.HarnessEnd{State: "COMPLETED"}}})
-			}}
-			host := &gateHost{}
-			err := harnesswire.NewClientHarness(approvalClient(t, peer)).Run(approvalContext(t), &api.Start{SessionUID: "session", ExecutionID: "exec"}, host)
-			if err == nil || !strings.Contains(err.Error(), "host-owned") {
-				t.Fatalf("forgery = %v, want host-owned refusal", err)
-			}
-			if host.reports != 0 || host.calls != 0 {
-				t.Fatalf("forgery reached host sink: %#v", host)
 			}
 		})
 	}

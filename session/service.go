@@ -289,8 +289,8 @@ func (s *Service) ListSessions(ctx context.Context, req *v1.ListSessionsRequest)
 // FailedPrecondition when either one is registered: an override onto a registered harness would
 // let any session run turns on it, retired or not, and a session created on a registration keeps
 // its turns on that registration. Between harnesses that are not registered, the documented
-// per-turn override is unchanged.
-func (s *Service) placerFor(uid, override string, read func() error) (placer *placement.Placer, harness string, err error) {
+// per-turn override is unchanged except that a memory-tier session cannot use a stateless override.
+func (s *Service) placerFor(ctx context.Context, uid, override string, read func() error) (placer *placement.Placer, harness string, err error) {
 	if uid == "" {
 		return nil, "", status.Error(codes.InvalidArgument, "session is required")
 	}
@@ -300,7 +300,7 @@ func (s *Service) placerFor(uid, override string, read func() error) (placer *pl
 	// after this phase and recheck writable status.
 	err = s.registry.WithSessionRead(uid, func() error {
 		var resolveErr error
-		placer, harness, resolveErr = s.resolvePlacer(uid, override)
+		placer, harness, resolveErr = s.resolvePlacer(ctx, uid, override)
 		if resolveErr != nil {
 			return resolveErr
 		}
@@ -316,7 +316,7 @@ func (s *Service) placerFor(uid, override string, read func() error) (placer *pl
 }
 
 // resolvePlacer runs only inside placerFor's guarded SQL phase.
-func (s *Service) resolvePlacer(uid, override string) (*placement.Placer, string, error) {
+func (s *Service) resolvePlacer(ctx context.Context, uid, override string) (*placement.Placer, string, error) {
 	info, err := s.store.SessionInfo(uid)
 	if err != nil {
 		if override != "" && errors.Is(err, sqlitelog.ErrSessionNotFound) {
@@ -370,6 +370,9 @@ func (s *Service) resolvePlacer(uid, override string) (*placement.Placer, string
 		if err := s.checkStatic(override); err != nil {
 			return nil, "", err
 		}
+		if err := s.checkMemoryOverride(ctx, uid, harness, override); err != nil {
+			return nil, "", err
+		}
 		harness = override
 	}
 	p, err := s.registry.For(harness)
@@ -377,6 +380,54 @@ func (s *Service) resolvePlacer(uid, override string) (*placement.Placer, string
 		return nil, "", harnessError(err)
 	}
 	return p, harness, nil
+}
+
+// checkMemoryOverride refuses a stateless override of a memory-tier session before Exec or Resume
+// can change compute, mint a fence or write records. Parking only the override would leave the
+// stored harness's memory live while SUSPEND reports the whole session cold and routes later
+// Suspend calls away.
+func (s *Service) checkMemoryOverride(ctx context.Context, uid, stored, override string) error {
+	// Older rows may name an unserved built-in; retain their existing explicit-override path.
+	if !s.registry.Has(stored) {
+		return nil
+	}
+	p, err := s.registry.For(stored)
+	if err != nil {
+		return harnessError(err)
+	}
+	// A runtime that cannot hold memory cannot have placed a memory-tier harness. In
+	// particular, a down remote stored harness must not block a stateless override.
+	if !p.RuntimeCapabilities().MemorySnapshot {
+		return nil
+	}
+	describe := func(name string) (api.Descriptor, error) {
+		p, err := s.registry.For(name)
+		if err != nil {
+			return api.Descriptor{}, harnessError(err)
+		}
+		dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		desc, err := p.Describe(dctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return api.Descriptor{}, status.FromContextError(ctx.Err()).Err()
+			}
+			return api.Descriptor{}, status.Errorf(codes.Unavailable, "describe harness %q before override: %v", name, err)
+		}
+		return desc, nil
+	}
+	desc, err := describe(stored)
+	if err != nil || desc.Capabilities.Resumability != api.ResumabilityRequiresMemorySnapshot {
+		return err
+	}
+	desc, err = describe(override)
+	if err != nil {
+		return err
+	}
+	if desc.Capabilities.Resumability == api.ResumabilityStatelessReplay {
+		return status.Errorf(codes.FailedPrecondition, "session %q requires memory snapshots on harness %q; a stateless turn cannot override it with %q", uid, stored, override)
+	}
+	return nil
 }
 
 // checkResumedHarness applies the routing rules to the harness Resume resolved for a session whose
@@ -553,7 +604,7 @@ func (s *Service) Exec(req *v1.ExecRequest, stream v1.Sessions_ExecServer) (err 
 		}
 		if recoveryInfo == nil {
 			var err error
-			placer, harness, err = s.resolvePlacer(uid, req.GetHarness())
+			placer, harness, err = s.resolvePlacer(ctx, uid, req.GetHarness())
 			if err != nil {
 				return err
 			}
@@ -667,6 +718,9 @@ func (s *Service) Exec(req *v1.ExecRequest, stream v1.Sessions_ExecServer) (err 
 			if refused == nil {
 				refused = s.checkResumedHarness(uid, stored, name)
 			}
+			if refused == nil && name != stored {
+				refused = s.checkMemoryOverride(ctx, uid, stored, name)
+			}
 			return refused
 		}
 		operationErr = s.registry.Resume(ctx, log, uid, recoveryInfo.Harness,
@@ -776,7 +830,7 @@ func (s *Service) Fork(ctx context.Context, req *v1.ForkRequest) (response *v1.F
 
 	parent := s.store.Session(req.GetSession())
 	atSeq := req.GetAtSeq()
-	placer, _, err := s.placerFor(req.GetSession(), "", func() error {
+	placer, _, err := s.placerFor(ctx, req.GetSession(), "", func() error {
 		if atSeq <= 0 {
 			h, err := parent.Head()
 			if err != nil {
@@ -966,10 +1020,13 @@ func (s *Service) Resume(ctx context.Context, req *v1.ResumeRequest) (session *v
 	}
 	// The registry resolves the pending turn's recorded harness, which can differ from the
 	// session's. Whichever name it picked gets the static-name collision rule, and a name that
-	// differs from the session's gets the pin rule Exec applies to an override.
+	// differs from the session's gets the pin and memory-tier rules Exec applies to an override.
 	var refused error
 	check := func(name string) error {
 		refused = s.checkResumedHarness(uid, stored, name)
+		if refused == nil && name != stored {
+			refused = s.checkMemoryOverride(ctx, uid, stored, name)
+		}
 		return refused
 	}
 	err = s.registry.Resume(ctx, log, uid, info.Harness, placement.WithResolvedHarnessCheck(check))

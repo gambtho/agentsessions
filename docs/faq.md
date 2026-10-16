@@ -45,10 +45,14 @@ swap on append is what makes "single writer" enforceable rather than a hope.
 
 ## Can Exec, Fork, Delete, Suspend, and Resume overlap?
 
-Across all Placers in one Registry, overlapping calls for one session return gRPC `ABORTED` without
-changing compute or the journal. Suspend will not interrupt a running turn. Retry after the active call
-finishes, using the current cursor for Exec. Other sessions remain independent. A standalone Placer
-has its own guard; separate Registries or hosts are not fenced by this local guard.
+Across all Placers in one Registry, Exec, Suspend and Resume refuse conflicting operations for one
+session with gRPC `ABORTED`, without changing compute or the journal. Suspend will not interrupt a
+running turn. Delete also refuses overlap with those operations or a fork's fan-out and rollback.
+Fork holds shared deletion admission instead of the exclusive turn guard: a stateful fork can
+supersede a running turn, and its checkpoint mark remains held through the last child clone.
+Retry refused calls after the holder finishes, using the current cursor for Exec. Other sessions
+remain independent. A standalone Placer has its own guard; separate Registries or hosts are not
+fenced by this local guard.
 
 ## Does deleting a session stop its actor or erase its history?
 

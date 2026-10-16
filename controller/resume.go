@@ -98,22 +98,8 @@ func (c *Controller) Resume(ctx context.Context, har api.Harness) (resumed bool,
 		return false, err
 	}
 	legacy := execution.legacyEnd > 0
-	// Missing-request repair and pending queries do not need a harness, model, or executor.
-	if state := scan.selected; state != nil && state.ExecutionID == execution.id && state.Receipt == nil {
-		if state.Inherited {
-			return false, ErrInheritedToolIntent
-		}
-		if state.Request == nil {
-			record, err := c.log.Append(scan.head, c.fence, api.Event{ExecutionID: state.ExecutionID, Kind: api.EventApprovalRequest, Approval: &api.ApprovalRequest{ToolCallID: state.Call.ID}})
-			if err != nil {
-				return true, err
-			}
-			c.observe(record)
-			state.Request = &record
-		}
-		if state.Decision == nil {
-			return true, approvalPark(state)
-		}
+	if parked, err := c.pendingApproval(scan, execution.id); parked || err != nil {
+		return parked, err
 	}
 	// An inherited intent belongs to the parent's dedup namespace, not this controller's UID.
 	// Scan to the end: legacy child recovery may have recorded the result after the fork marker.
@@ -269,7 +255,13 @@ func (s *resumeSink) Model(ctx context.Context, req api.ModelRequest) (api.Model
 		if out.Message != nil {
 			msg = *out.Message
 		}
-		return api.ModelResponse{Message: msg}, nil // served — model NOT re-invoked
+		// served — model NOT re-invoked. The recorded usage rides along as it does on replay;
+		// v0.1.2 did not serve usage, so a legacy recovery serves none.
+		var usage api.Usage
+		if !s.live.legacyRecovery {
+			usage = usageAt(s.stream, s.i)
+		}
+		return api.ModelResponse{Message: msg, Usage: usage}, nil
 	}
 	return s.live.model(ctx, req) // past the crash point: first-ever execution
 }

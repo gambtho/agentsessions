@@ -225,14 +225,17 @@ func TestRecoveryRejectsInvalidRecordedToolIntent(t *testing.T) {
 		{"empty key", func(c *api.ToolCall) { c.IdempotencyKey = "" }, controller.ErrMissingIdempotencyKey},
 		{"unmediated", func(c *api.ToolCall) { c.Mediation = api.MediationInHarnessReported }, controller.ErrUnmediatedToolCall},
 		{"unspecified", func(c *api.ToolCall) { c.Mediation = "" }, controller.ErrUnmediatedToolCall},
-		// Approval call-only cuts are now repairable; approval-specific malformed receipt
-		// coverage lives in TestApprovalIncompleteReceiptEvidenceFailsClosed.
+		// A gated emission must not consume an ordinary recorded call with the same identity.
+		{"approval", func(c *api.ToolCall) { c.Mediation = api.MediationRequiresApproval }, controller.ErrReplayDiverged},
 	} {
 		for _, path := range []string{"replay", "resume result", "resume intent"} {
 			t.Run(path+"/"+change.name, func(t *testing.T) {
 				log := memStore(t)
 				call := recordedToolCall()
 				change.change(&call)
+				if change.name == "approval" {
+					call.Mediation = api.MediationControllerMediated
+				}
 				events := []api.Event{{Kind: api.EventToolCall, ToolCall: &call}}
 				if path != "resume intent" {
 					events = append(events, api.Event{Kind: api.EventToolResult, Result: &api.ToolResult{ID: call.ID}})
@@ -250,6 +253,9 @@ func TestRecoveryRejectsInvalidRecordedToolIntent(t *testing.T) {
 				// key here so recovery must inspect (and reject) the invalid recorded intent.
 				if call.IdempotencyKey == "" {
 					call.IdempotencyKey = "key-1"
+				}
+				if change.name == "approval" {
+					call.Mediation = api.MediationRequiresApproval
 				}
 				h := &callHarness{calls: []api.ToolCall{call}}
 				if path == "replay" {
@@ -953,7 +959,7 @@ type handlesMediationRejectionHarness struct {
 
 func (*handlesMediationRejectionHarness) Describe(ctx context.Context) (api.Descriptor, error) {
 	desc, err := (&callHarness{}).Describe(ctx)
-	// Exercise a live pre-intent refusal now that stateless keyed approval calls can park.
+	// Unsupported approval is still a handleable pre-intent refusal.
 	desc.Capabilities.Resumability = api.ResumabilityRequiresMemorySnapshot
 	return desc, err
 }
@@ -1090,7 +1096,6 @@ type mediationFallbackHarness struct {
 
 func (*mediationFallbackHarness) Describe(ctx context.Context) (api.Descriptor, error) {
 	desc, err := (&callHarness{}).Describe(ctx)
-	// Preserve refusal/fallback coverage without asking a supported live gate to reject.
 	desc.Capabilities.Resumability = api.ResumabilityRequiresMemorySnapshot
 	return desc, err
 }
