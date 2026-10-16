@@ -2,14 +2,17 @@ package main
 
 import (
 	"net"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	v1 "github.com/aramase/agentsessions/api/genpb"
-	"github.com/aramase/agentsessions/wire"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
+	"github.com/agent-primitives/sessions/sqlitelog"
+	"github.com/agent-primitives/sessions/wire"
 )
 
 func TestExecHarnessFlag(t *testing.T) {
@@ -82,4 +85,63 @@ func (s *execRecorder) Exec(req *v1.ExecRequest, stream v1.Sessions_ExecServer) 
 		Metadata: &v1.ResourceMetadata{Uid: "session-uid"},
 		Harness:  req.GetHarness(),
 	}}})
+}
+
+// Embedded mode refuses a journal in which another host registered the harness name it serves, and
+// opens one whose registrations use other names.
+func TestEmbeddedRefusesRegistrationCollision(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		wantErr bool
+	}{
+		{name: "echo", wantErr: true},
+		{name: "suite-agent"},
+	} {
+		journal := filepath.Join(t.TempDir(), "journal.db")
+		store, err := sqlitelog.Open(journal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.RegisterHarness(sqlitelog.HarnessRecord{Name: tc.name, UID: "u", Spec: "{}", SpecDigest: "d"}); err != nil {
+			t.Fatal(err)
+		}
+		_ = store.Close()
+		err = cmdList([]string{"--journal", journal})
+		if tc.wantErr {
+			if err == nil || !strings.Contains(err.Error(), "collides with a static harness name") {
+				t.Errorf("registration %q: got %v, want a collision error", tc.name, err)
+			}
+		} else if err != nil {
+			t.Errorf("registration %q: %v", tc.name, err)
+		}
+	}
+}
+
+// replay -v prints each record's chain links and the model call and usage fields, so the journal's
+// digests and token counts can be read without a client of the API.
+func TestFormatRecordVerbose(t *testing.T) {
+	for _, tt := range []struct {
+		r    *v1.LogRecord
+		want string
+	}{{
+		r: &v1.LogRecord{Seq: 1, ContentHash: "sha256:0123456789abcdef0123", Event: &v1.Event{
+			Kind: v1.EventKind_EVENT_INPUT, ExecutionId: "e1",
+			Body: &v1.Event_Message{Message: &v1.Message{Role: "user", Parts: []*v1.Part{{Part: &v1.Part_Text{Text: &v1.TextPart{Text: "hi"}}}}}},
+		}},
+		want: "seq=1   EVENT_INPUT          hash=0123456789abcdef prev=- exec=e1  user: hi",
+	}, {
+		r: &v1.LogRecord{Seq: 2, ContentHash: "abc", PrevHash: "sha256:0123456789abcdef0123", Event: &v1.Event{
+			Kind: v1.EventKind_EVENT_MODEL_CALL, Body: &v1.Event_Model{Model: &v1.ModelCall{Model: "gpt", InputHash: "sha256:fedcba98765432100000"}},
+		}},
+		want: "seq=2   EVENT_MODEL_CALL     hash=abc prev=0123456789abcdef  model=gpt input_hash=fedcba9876543210",
+	}, {
+		r: &v1.LogRecord{Seq: 3, ContentHash: "def", PrevHash: "abc", Event: &v1.Event{
+			Kind: v1.EventKind_EVENT_USAGE, Body: &v1.Event_Usage{Usage: &v1.Usage{Model: "gpt", InputTokens: 12, OutputTokens: 5, ReasoningTokens: 1}},
+		}},
+		want: "seq=3   EVENT_USAGE          hash=def prev=abc  model=gpt input_tokens=12 output_tokens=5 reasoning_tokens=1",
+	}} {
+		if got := formatRecordVerbose(tt.r); got != tt.want {
+			t.Errorf("got  %q\nwant %q", got, tt.want)
+		}
+	}
 }

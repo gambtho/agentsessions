@@ -2,9 +2,9 @@
 # PersistentVolume. No substrate, no memory snapshots. Sessions survive pod death because the
 # journal does, and the host replays it.
 #
-# This deploys the published image as-is, which runs the local runtime and the reference harnesses
-# compiled into it: echo always, plus chat once a model is configured. To serve your own harness you
-# build your own binary, because harnesses are registered at build time.
+# This pins the v0.1.2 image: it serves echo (and chat when a model is configured). Newer
+# registry-capable builds can attach remote harnesses using --harness name=address at startup or
+# through the optional loopback operator listener. This pinned image does not support those flags.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -68,6 +68,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: agentsessionsd
+          # v0.1.x images stay at ghcr.io/aramase/agentsessions; releases from v0.2.0 publish to
+          # ghcr.io/agent-primitives/sessions.
           image: ghcr.io/aramase/agentsessions/agentsessionsd:v0.1.2
           args:
             # Must bind 0.0.0.0: the default is 127.0.0.1, which accepts nothing from outside

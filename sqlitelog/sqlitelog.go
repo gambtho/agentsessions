@@ -9,6 +9,7 @@
 package sqlitelog
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -18,11 +19,11 @@ import (
 	"google.golang.org/protobuf/proto"
 	sqlite "modernc.org/sqlite"
 
-	"github.com/aramase/agentsessions/api"
-	v1 "github.com/aramase/agentsessions/api/genpb"
-	"github.com/aramase/agentsessions/canon"
-	"github.com/aramase/agentsessions/eventlog"
-	"github.com/aramase/agentsessions/wire"
+	"github.com/agent-primitives/sessions/api"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
+	"github.com/agent-primitives/sessions/canon"
+	"github.com/agent-primitives/sessions/eventlog"
+	"github.com/agent-primitives/sessions/wire"
 )
 
 // ErrTampered indicates the stored hash-chain failed verification: a prev_hash link or a
@@ -30,6 +31,8 @@ import (
 // canonicalize/decode failure (a bug or storage corruption), which is returned wrapped and does
 // NOT satisfy errors.Is(err, ErrTampered) — different severities, per the integrity contract.
 var ErrTampered = errors.New("sqlitelog: hash-chain verification failed (tamper-evident)")
+
+var errReservedDelete = errors.New("sqlitelog: DELETE is reserved for atomic DeleteSession")
 
 // sqliteConstraint is SQLITE_CONSTRAINT — the primary result code (low byte) for any constraint
 // violation. Extended codes such as SQLITE_CONSTRAINT_PRIMARYKEY (1555) share this low byte.
@@ -41,6 +44,9 @@ func isConstraint(err error) bool {
 	return errors.As(err, &serr) && serr.Code()&0xff == sqliteConstraint
 }
 
+// schema is the version 1 shape, exactly as v0.1.x created it. It is frozen: a later shape is a
+// rung in migrations, never an edit here, so every database reaches the current shape by the same
+// steps whether it was created by v0.1.0 or a moment ago.
 const schema = `
 CREATE TABLE IF NOT EXISTS sessions (
   session       TEXT PRIMARY KEY,
@@ -75,44 +81,181 @@ CREATE INDEX IF NOT EXISTS sessions_project_created
   ON sessions(project, created_at DESC, session);`
 
 // SchemaVersion is the schema shape this build writes, stamped into PRAGMA user_version so a
-// later build can identify a database without inspecting its columns.
-//
-// It stays at 1 through the first release: version 1 is whatever v0.1.0 ships with. A database
-// written by an earlier development build is not migrated, because none exists outside a scratch
-// directory; delete it and start again.
-//
-// There is no migration ladder. Migration runs BETWEEN releases, and this is the first one, so
-// there is no earlier shape to migrate from and a ladder would have no rungs. The first schema
-// change after release adds one, and the stamp is what lets it know where to start.
-const SchemaVersion = 1
+// build can identify a database without inspecting its columns. Version 1 is what v0.1.0 through
+// v0.1.2 shipped. Version 2 adds the harness registry; version 3 adds approval reporting;
+// version 4 adds permanent deletion intent.
+const SchemaVersion = 4
+
+// migrations[i] moves a database from version i+1 to i+2, inside the migration transaction. The
+// array length is tied to SchemaVersion, so bumping one without the other does not compile.
+var migrations = [SchemaVersion - 1]func(*sql.Tx) error{
+	migrateV1ToV2,
+	migrateV2ToV3,
+	migrateV3ToV4,
+}
+
+func migrateV3ToV4(tx *sql.Tx) error {
+	_, err := tx.Exec(`ALTER TABLE sessions ADD COLUMN deletion_state TEXT NOT NULL DEFAULT 'ACTIVE';
+		ALTER TABLE sessions ADD COLUMN deletion_requested_at INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE sessions ADD COLUMN deletion_completed_at INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE sessions ADD COLUMN deletion_seq INTEGER NOT NULL DEFAULT 0;`)
+	return err
+}
+
+// v1ToV2 is the SQL half of the 1 -> 2 rung: harnesses registered through the HarnessRegistry API.
+// Static harnesses (built in, or configured when the host starts) are never stored here. A row is
+// immutable except for state and the retire fields. reserved_harness_names holds every name a host
+// sharing the database serves, or may serve, as a static harness; a name in it can never be
+// registered. The sessions(harness) index serves the per-harness session lookups a registry needs,
+// and is what a later delete checks before removing a row.
+const v1ToV2 = `CREATE TABLE IF NOT EXISTS harnesses (
+  name          TEXT    PRIMARY KEY,
+  uid           TEXT    NOT NULL,
+  spec          TEXT    NOT NULL, -- canonical proto3-JSON of HarnessSpec
+  spec_digest   TEXT    NOT NULL,
+  state         TEXT    NOT NULL, -- 'active' | 'retired'
+  retire_reason TEXT    NOT NULL DEFAULT '',
+  retired_at    INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reserved_harness_names (
+  name          TEXT    PRIMARY KEY,
+  reserved_at   INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO reserved_harness_names(name, reserved_at)
+  SELECT DISTINCT harness, CAST(strftime('%s', 'now') AS INTEGER) * 1000000000
+  FROM sessions WHERE harness != '';
+CREATE INDEX IF NOT EXISTS sessions_harness ON sessions(harness);`
+
+// migrateV1ToV2 creates the registry tables and reserves every harness name a version 1 journal
+// uses. Version 1 had no registry, so each of those names was static on some host. A session's
+// stored harness is one such name; the harness recorded on an EXECUTION_START marker is another,
+// because a turn may override the session's harness and Resume re-runs a pending turn on the name
+// it recorded. Both are reserved before the transaction that creates the table commits, so no
+// registration can take over a harness an old session or turn ran on, even one made by a host that
+// does not serve it. A marker that does not decode fails the rung: the journal cannot be shown safe
+// to register against, and the database stays at version 1.
+func migrateV1ToV2(tx *sql.Tx) error {
+	if _, err := tx.Exec(v1ToV2); err != nil {
+		return err
+	}
+	// Collect first and insert after: the read cursor is closed before the transaction writes.
+	rows, err := tx.Query(`SELECT session, seq, event FROM events ORDER BY session, seq`)
+	if err != nil {
+		return err
+	}
+	names := map[string]struct{}{}
+	for rows.Next() {
+		var (
+			session string
+			seq     int64
+			blob    []byte
+		)
+		if err := rows.Scan(&session, &seq, &blob); err != nil {
+			rows.Close()
+			return err
+		}
+		ev, err := decode(blob)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("decode session %s seq %d: %w", session, seq, err)
+		}
+		if ev.Kind == api.EventExecutionStart && ev.ExecutionStart != nil && ev.ExecutionStart.Harness != "" {
+			names[ev.ExecutionStart.Harness] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	now := time.Now().UnixNano()
+	for name := range names {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO reserved_harness_names(name, reserved_at) VALUES(?, ?)`, name, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // ErrUnsupportedSchema reports a database written by a build with a newer schema.
 var ErrUnsupportedSchema = errors.New("sqlitelog: unsupported database schema")
 
-// stampSchemaVersion records SchemaVersion on a database that carries no stamp, and refuses one
-// stamped newer than this build understands.
+// migrate brings the database to SchemaVersion, or refuses it.
 //
-// Refusing is the point of reading it back. A newer database may have columns or invariants this
-// build does not know about, and appending to a hash-chained log under those conditions risks
-// corrupting the chain. Failing closed at Open is cheap; a partially-understood journal is not.
-func stampSchemaVersion(db *sql.DB) error {
+// A database stamped newer than this build is refused before anything is written to it. It may
+// have tables or invariants this build does not know about, and appending to a hash-chained log
+// under those conditions risks corrupting the chain. The same rule is what makes a downgrade fail
+// closed: v0.1.x refuses a version 2 database, which is the point, because a downgraded host would
+// otherwise silently forget which harnesses were retired.
+//
+// Zero means unstamped: a fresh database, or one written before the stamp existed. Both get the
+// version 1 schema and then every rung. The schema, the rungs and the new stamp commit in one
+// transaction, so a crash leaves the database at its old version rather than half migrated, and an
+// opener racing another one re-reads the stamp under the write lock and finds nothing left to do.
+func migrate(db *sql.DB) error {
+	v, err := userVersion(db)
+	if err != nil {
+		return err
+	}
+	if err := checkVersion(v); err != nil || v == SchemaVersion {
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("sqlitelog: migrate: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if v, err = userVersion(tx); err != nil {
+		return err
+	}
+	if err := checkVersion(v); err != nil || v == SchemaVersion {
+		return err
+	}
+	if v == 0 {
+		if _, err := tx.Exec(schema); err != nil {
+			return fmt.Errorf("sqlitelog: schema: %w", err)
+		}
+		v = 1
+	}
+	for ; v < SchemaVersion; v++ {
+		if err := migrations[v-1](tx); err != nil {
+			return fmt.Errorf("sqlitelog: migrate v%d to v%d: %w", v, v+1, err)
+		}
+	}
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {
+		return fmt.Errorf("sqlitelog: stamp schema version: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlitelog: migrate: %w", err)
+	}
+	return nil
+}
+
+func checkVersion(v int) error {
+	if v < 0 {
+		// No build stamps a negative version, so the database was not written by one.
+		return fmt.Errorf("%w: database is stamped v%d", ErrUnsupportedSchema, v)
+	}
+	if v > SchemaVersion {
+		return fmt.Errorf("%w: database is v%d, this build understands v%d", ErrUnsupportedSchema, v, SchemaVersion)
+	}
+	return nil
+}
+
+type queryRower interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func userVersion(db queryRower) (int, error) {
 	var v int
 	if err := db.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
-		return fmt.Errorf("sqlitelog: read schema version: %w", err)
+		return 0, fmt.Errorf("sqlitelog: read schema version: %w", err)
 	}
-	switch {
-	case v == SchemaVersion:
-		return nil
-	case v > SchemaVersion:
-		return fmt.Errorf("%w: database is v%d, this build understands v%d", ErrUnsupportedSchema, v, SchemaVersion)
-	default:
-		// Zero means unstamped: a fresh database, or one written before the stamp existed. The
-		// schema above is applied unconditionally, so either way it now has the current shape.
-		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {
-			return fmt.Errorf("sqlitelog: stamp schema version: %w", err)
-		}
-		return nil
-	}
+	return v, nil
 }
 
 // DefaultProject is the tenant a session lands in when none is supplied. A session is never stored
@@ -140,7 +283,7 @@ type Store struct {
 	defaultProject string
 }
 
-// Open opens (creating if needed) the sqlite database at path and applies the schema. Use
+// Open opens (creating if needed) the sqlite database at path and migrates it to SchemaVersion. Use
 // ":memory:" for an ephemeral store. For a file-backed store it uses BEGIN IMMEDIATE (via the
 // _txlock DSN) so cross-process writers take the write lock upfront and serialize cleanly instead
 // of deadlocking on a lock upgrade (SQLITE_BUSY), and synchronous=FULL so every committed
@@ -177,11 +320,7 @@ func Open(path string, opts ...Option) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("sqlitelog: %q: %w", "PRAGMA synchronous=FULL", err)
 	}
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("sqlitelog: schema: %w", err)
-	}
-	if err := stampSchemaVersion(db); err != nil {
+	if err := migrate(db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -271,8 +410,12 @@ func (l *Log) NewFence() (int64, error) {
 		   project    = CASE WHEN sessions.project = '' THEN excluded.project ELSE sessions.project END,
 		   created_at = CASE WHEN sessions.created_at = 0 THEN excluded.created_at ELSE sessions.created_at END,
 		   updated_at = excluded.updated_at
+		 WHERE sessions.deletion_state = 'ACTIVE'
 		 RETURNING fence`, l.session, l.store.defaultProject, now, now,
 	).Scan(&fence)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("sqlitelog: new fence session %q: %w", l.session, eventlog.ErrDeleted)
+	}
 	return fence, err
 }
 
@@ -280,11 +423,20 @@ func (l *Log) NewFence() (int64, error) {
 // is current, inside one transaction. It assigns seq, computes content_hash once via canon, and
 // stores it alongside the wire-encoded event.
 func (l *Log) Append(expectedLastSeq, fence int64, ev api.Event) (eventlog.Record, error) {
+	if ev.Kind == api.EventParked {
+		return eventlog.Record{}, errors.New("sqlitelog: PARKED is transport-only")
+	}
 	tx, err := l.store.db.Begin()
 	if err != nil {
 		return eventlog.Record{}, err
 	}
 	defer tx.Rollback()
+	if err := checkWritable(tx, l.session); err != nil {
+		return eventlog.Record{}, err
+	}
+	if ev.Kind == api.EventLifecycle && ev.Lifecycle != nil && ev.Lifecycle.Kind == api.LifecycleDelete {
+		return eventlog.Record{}, errReservedDelete
+	}
 
 	var head int64
 	if err := tx.QueryRow(
@@ -306,27 +458,8 @@ func (l *Log) Append(expectedLastSeq, fence int64, ev api.Event) (eventlog.Recor
 		return eventlog.Record{}, eventlog.ErrFenced
 	}
 
-	prev := ""
-	if head > 0 {
-		if err := tx.QueryRow(
-			`SELECT hash FROM events WHERE session = ? AND seq = ?`, l.session, head,
-		).Scan(&prev); err != nil {
-			return eventlog.Record{}, err
-		}
-	}
-	seq := head + 1
-	hash, err := canon.HashRecord(prev, seq, ev)
+	record, pb, err := appendRecord(context.Background(), tx, l.session, head, fence, ev)
 	if err != nil {
-		return eventlog.Record{}, fmt.Errorf("sqlitelog: canonicalize seq %d: %w", seq, err)
-	}
-	blob, err := proto.Marshal(wire.EventToProto(ev))
-	if err != nil {
-		return eventlog.Record{}, fmt.Errorf("sqlitelog: marshal seq %d: %w", seq, err)
-	}
-	if _, err := tx.Exec(
-		`INSERT INTO events(session, seq, prev_hash, hash, fence, event) VALUES(?,?,?,?,?,?)`,
-		l.session, seq, prev, hash, fence, blob,
-	); err != nil {
 		// A PRIMARY KEY(session, seq) violation means another writer already committed this seq —
 		// it advanced the log out from under us. That is exactly a single-writer CAS conflict, so
 		// map it. Defense-in-depth for the cross-process race that MaxOpenConns cannot serialize
@@ -339,10 +472,41 @@ func (l *Log) Append(expectedLastSeq, fence int64, ev api.Event) (eventlog.Recor
 	if err := touchSession(tx, l.session, l.store.defaultProject, ev); err != nil {
 		return eventlog.Record{}, err
 	}
+	// Report only the selected wire body and normalized enums that strict journal reads see.
+	if err := projectApproval(tx, l.session, record.Seq, wire.EventFromProto(pb)); err != nil {
+		return eventlog.Record{}, fmt.Errorf("sqlitelog: project approval seq %d: %w", record.Seq, err)
+	}
 	if err := tx.Commit(); err != nil {
 		return eventlog.Record{}, err
 	}
-	return eventlog.Record{Seq: seq, PrevHash: prev, Hash: hash, Fence: fence, Event: ev}, nil
+	return record, nil
+}
+
+// appendRecord shares canonical encoding with atomic deletion but does not publish metadata or
+// commit. It returns the persisted proto so projection uses the same normalized body as reads.
+// Only the transaction owner may admit a write and decide its lifecycle projection.
+func appendRecord(ctx context.Context, tx *sql.Tx, session string, head, fence int64, ev api.Event) (eventlog.Record, *v1.Event, error) {
+	prev := ""
+	if head > 0 {
+		if err := tx.QueryRowContext(ctx, `SELECT hash FROM events WHERE session = ? AND seq = ?`, session, head).Scan(&prev); err != nil {
+			return eventlog.Record{}, nil, err
+		}
+	}
+	seq := head + 1
+	hash, err := canon.HashRecord(prev, seq, ev)
+	if err != nil {
+		return eventlog.Record{}, nil, fmt.Errorf("sqlitelog: canonicalize seq %d: %w", seq, err)
+	}
+	pb := wire.EventToProto(ev)
+	blob, err := proto.Marshal(pb)
+	if err != nil {
+		return eventlog.Record{}, nil, fmt.Errorf("sqlitelog: marshal seq %d: %w", seq, err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO events(session, seq, prev_hash, hash, fence, event) VALUES(?,?,?,?,?,?)`,
+		session, seq, prev, hash, fence, blob); err != nil {
+		return eventlog.Record{}, nil, err
+	}
+	return eventlog.Record{Seq: seq, PrevHash: prev, Hash: hash, Fence: fence, Event: ev}, pb, nil
 }
 
 // touchSession keeps the session's metadata row in step with its log, inside Append's transaction.

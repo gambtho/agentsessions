@@ -16,8 +16,8 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/aramase/agentsessions/api"
-	"github.com/aramase/agentsessions/canon"
+	"github.com/agent-primitives/sessions/api"
+	"github.com/agent-primitives/sessions/canon"
 )
 
 // ErrConflict is returned when Append's expectedLastSeq does not equal the log head
@@ -27,6 +27,9 @@ var ErrConflict = errors.New("eventlog: seq conflict (single-writer compare-and-
 // ErrFenced is returned when Append is called with a fencing token older than the
 // current one — a superseded (zombie) incarnation trying to write.
 var ErrFenced = errors.New("eventlog: stale fencing token (incarnation superseded)")
+
+// ErrDeleted refuses writes to a permanently tombstoned session, independent of its fence or head.
+var ErrDeleted = errors.New("eventlog: session is permanently deleted")
 
 // Record is one committed log entry: the payload plus ordering, integrity, and fencing
 // metadata. Hash = SHA-256(prevHash || canonical(payload)); a fork sets a child's first

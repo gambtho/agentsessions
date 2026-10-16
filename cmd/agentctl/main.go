@@ -11,6 +11,11 @@
 //	agentctl fork    --session <uid> --at N    # branch into a child session
 //	agentctl suspend --session <uid>
 //	agentctl resume  --session <uid>
+//	agentctl delete  --session <uid>          # permanent intent only; compute/pins retained
+//	agentctl approve <uid>                  # commit approval, then Resume
+//	agentctl deny    <uid> --reason "no"    # commit denial, then Resume
+//	agentctl harness register --server 127.0.0.1:8081 --name mine --spec spec.json
+//	agentctl harness get|list|retire --server 127.0.0.1:8081 [flags]
 package main
 
 import (
@@ -24,15 +29,15 @@ import (
 
 	"google.golang.org/grpc"
 
-	v1 "github.com/aramase/agentsessions/api/genpb"
-	"github.com/aramase/agentsessions/client"
-	"github.com/aramase/agentsessions/harness/echoagent"
-	"github.com/aramase/agentsessions/internal/version"
-	"github.com/aramase/agentsessions/observability"
-	"github.com/aramase/agentsessions/placement"
-	"github.com/aramase/agentsessions/runtime/local"
-	"github.com/aramase/agentsessions/session"
-	"github.com/aramase/agentsessions/sqlitelog"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
+	"github.com/agent-primitives/sessions/client"
+	"github.com/agent-primitives/sessions/harness/echoagent"
+	"github.com/agent-primitives/sessions/internal/version"
+	"github.com/agent-primitives/sessions/observability"
+	"github.com/agent-primitives/sessions/placement"
+	"github.com/agent-primitives/sessions/runtime/local"
+	"github.com/agent-primitives/sessions/session"
+	"github.com/agent-primitives/sessions/sqlitelog"
 )
 
 func main() {
@@ -44,12 +49,16 @@ func main() {
 		"create":  cmdCreate,
 		"list":    cmdList,
 		"get":     cmdGet,
+		"delete":  cmdDelete,
 		"exec":    cmdExec,
 		"replay":  cmdReplay,
 		"fork":    cmdFork,
 		"suspend": cmdSuspend,
 		"resume":  cmdResume,
+		"approve": cmdApprove,
+		"deny":    cmdDeny,
 		"version": cmdVersion,
+		"harness": cmdHarness,
 	}
 	run, ok := cmds[os.Args[1]]
 	if !ok {
@@ -63,7 +72,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: agentctl <create|list|get|exec|replay|fork|suspend|resume|version> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: agentctl <create|list|get|delete|exec|replay|fork|suspend|resume|approve|deny|harness|version> [flags]")
 }
 
 type config struct {
@@ -104,6 +113,14 @@ func dial(cfg *config) (*client.Client, func(), error) {
 		_ = backend.Close()
 		_ = store.Close()
 		return nil, nil, err
+	}
+	// The journal may be shared with a host that registers harnesses. Reserving the names this
+	// embedded server runs refuses a journal where one is already registered, and stops one being
+	// registered later.
+	if err := session.ReserveStaticHarnessNames(store, registry); err != nil {
+		_ = backend.Close()
+		_ = store.Close()
+		return nil, nil, fmt.Errorf("journal %s: %w", cfg.journal, err)
 	}
 	svc := session.NewService(store, registry,
 		session.WithLogger(logger), session.WithDefaultProject(cfg.project))
@@ -227,13 +244,14 @@ func cmdGet(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("session %s project=%s name=%s harness=%s last_seq=%d compute=%s\n",
+	fmt.Printf("session %s project=%s name=%s harness=%s last_seq=%d compute=%s %s\n",
 		sess.GetMetadata().GetUid(),
 		sess.GetMetadata().GetProject(),
 		sess.GetMetadata().GetName(),
 		sess.GetHarness(),
 		sess.GetLastSeq(),
 		strings.TrimPrefix(sess.GetComputeState().String(), "COMPUTE_"),
+		deletionFields(sess),
 	)
 	return nil
 }
@@ -281,8 +299,10 @@ func cmdReplay(args []string) error {
 	cfg := commonFlags(fs)
 	var sess string
 	var from int64
+	var verbose bool
 	fs.StringVar(&sess, "session", "", "session UID")
 	fs.Int64Var(&from, "from", 1, "replay from this seq")
+	fs.BoolVar(&verbose, "v", false, "also print each record's hash and previous hash, a model call's model and input hash, and token usage")
 	_ = fs.Parse(args)
 	c, cleanup, err := dial(cfg)
 	if err != nil {
@@ -294,7 +314,11 @@ func cmdReplay(args []string) error {
 		return err
 	}
 	for _, r := range records {
-		printRecord(r)
+		if verbose {
+			fmt.Println(formatRecordVerbose(r))
+		} else {
+			printRecord(r)
+		}
 	}
 	return nil
 }
@@ -367,6 +391,41 @@ func printRecord(r *v1.LogRecord) {
 		line += "  " + partsText(msg)
 	}
 	fmt.Println(line)
+}
+
+// formatRecordVerbose is printRecord's line plus the record's chain links (content_hash and
+// prev_hash, shortened to 16 hex) and the body fields replay checks: a model call's model and input
+// hash, and a usage record's tokens.
+func formatRecordVerbose(r *v1.LogRecord) string {
+	ev := r.GetEvent()
+	line := fmt.Sprintf("seq=%-3d %-20s hash=%s prev=%s", r.GetSeq(), ev.GetKind(), short(r.GetContentHash()), short(r.GetPrevHash()))
+	if exec := ev.GetExecutionId(); exec != "" {
+		line += " exec=" + exec
+	}
+	if m := ev.GetModel(); m != nil {
+		line += fmt.Sprintf("  model=%s input_hash=%s", m.GetModel(), short(m.GetInputHash()))
+	}
+	if u := ev.GetUsage(); u != nil {
+		line += fmt.Sprintf("  model=%s input_tokens=%d output_tokens=%d reasoning_tokens=%d",
+			u.GetModel(), u.GetInputTokens(), u.GetOutputTokens(), u.GetReasoningTokens())
+	}
+	if msg := ev.GetMessage(); msg != nil {
+		line += "  " + partsText(msg)
+	}
+	return line
+}
+
+// short keeps a hash readable in a line: its first 16 characters after any "sha256:" prefix, or "-"
+// when it is empty (the first record has no previous hash).
+func short(h string) string {
+	h = strings.TrimPrefix(h, "sha256:")
+	if h == "" {
+		return "-"
+	}
+	if len(h) > 16 {
+		return h[:16]
+	}
+	return h
 }
 
 func partsText(m *v1.Message) string {

@@ -24,9 +24,10 @@ import (
 
 	"github.com/gowebpki/jcs"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/aramase/agentsessions/api"
-	"github.com/aramase/agentsessions/wire"
+	"github.com/agent-primitives/sessions/api"
+	"github.com/agent-primitives/sessions/wire"
 )
 
 // marshalOpts pins the proto3-JSON emission so the canonical form is identical across
@@ -49,6 +50,17 @@ func Event(ev api.Event) ([]byte, error) {
 		return nil, err
 	}
 	return jcs.Transform(ej)
+}
+
+// Proto returns the canonical bytes of any message: JCS applied to its proto3-JSON form under the
+// same pinned options the journal uses. A digest over these bytes can be recomputed by any
+// implementation, which is why the harness registry's spec_digest is defined over them.
+func Proto(m proto.Message) ([]byte, error) {
+	j, err := marshalOpts.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	return jcs.Transform(j)
 }
 
 // Record returns the canonical bytes that content_hash is computed over: the event plus the

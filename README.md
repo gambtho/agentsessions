@@ -29,7 +29,7 @@ target — plus a reference implementation that proves the contract holds.
 ## The three contracts
 
 - **Sessions** (`api/session.proto`) — client-facing lifecycle: create / list / exec / suspend / resume
-  / fork / replay.
+  / fork / replay / approve.
 - **Harness** (`api/harness.proto`) — Bring-Your-Own-Harness: the host drives one execution; the harness
   streams typed events over the `Harness.Connect` gRPC stream. Implement it directly, or adapt an agent
   framework with a thin shim.
@@ -54,12 +54,12 @@ determinism guarantees are exercised by a replay-conformance suite (`conformance
   (`harnesswire/`); the host mediates the model over the wire, so the determinism guarantees hold across
   the process boundary and a harness never touches a provider SDK on the replay path.
 - **Runs on real agent-substrate — both capability tiers, green in CI.** The conformance suite runs
-  against a real `ate-system` in kind (not a mock). `STATELESS_REPLAY` on gVisor: byte-identical
-  replay. `REQUIRES_MEMORY_SNAPSHOT` on a micro-VM: drive → suspend (memory snapshot) → restore → the
-  in-RAM state **continues**, with the chain verifying across the snapshot boundary — what a plain pod
-  structurally cannot do. Fork fans a stateful session out to k children from one checkpoint and each
-  continues independently. `CanPlace` gates the tiers, and the neutral core imports **zero** substrate
-  code (a CI gate asserts it). See
+  against a real `ate-system` in kind (not a mock), with both tiers on a micro-VM.
+  `STATELESS_REPLAY`: byte-identical replay. `REQUIRES_MEMORY_SNAPSHOT`: drive → suspend (memory
+  snapshot) → restore → the in-RAM state **continues**, with the chain verifying across the snapshot
+  boundary — what a plain pod structurally cannot do. Fork fans a stateful session out to k children
+  from one checkpoint and each continues independently. `CanPlace` gates the tiers, and the neutral
+  core imports **zero** substrate code (a CI gate asserts it). See
   [`docs/substrate-conformance.md`](docs/substrate-conformance.md).
 
 ## How it behaves
@@ -72,13 +72,30 @@ determinism guarantees are exercised by a replay-conformance suite (`conformance
   resuming wrong.
 - **Tool calls** default to `IN_HARNESS_REPORTED` (fast path, reported for audit); sensitive tools opt
   into host-mediated execution (`CONTROLLER_MEDIATED`), with crash-mid-tool at-most-once re-drive. A
-  `REQUIRES_APPROVAL` tier is declared; the approval gate is a tracked follow-up.
-- **Recovery:** an `Exec` with no inputs re-drives the last interrupted execution from history.
+  `REQUIRES_APPROVAL` parks a `STATELESS_REPLAY` execution at a durable host-owned request. RPC/SDK
+  `Approve` commits a decision only; call `Resume` separately. CLI `approve` and `deny` do both.
+  Executors still need durable deduplication on session UID plus idempotency key; approval is not
+  authorization and has no policy hook, timeout or expiry.
+- **Recovery:** `Resume` re-drives interrupted executions. An existing current approval-bearing
+  execution also recovers through no-input `Exec`, using its recorded inputs/config/harness rather
+  than request overrides. Other inputless Exec calls keep ordinary new-turn behavior.
+- **Approval status:** Get/List and final paused Exec frames expose `pending_approval` at their
+  captured `last_seq`. Decisions clear that reference, but new inputs stay blocked until a receipt
+  commits. Execution and compute axes remain independent. Retained snapshots and unresolved requests
+  have no expiry; `Cancel` returns `UNIMPLEMENTED`. See
+  [approval recovery](docs/interaction-model.md#approval-decisions-and-recovery) for SDK/CLI examples.
+- **Permanent soft deletion:** `DeleteSession` / `agentctl delete --session <uid>` hides the UID
+  from List and refuses Exec, Fork (including historical forks), Resume, Suspend and Approve
+  (including exact retries). Get and raw Replay remain audit reads; UID, metadata and journal
+  are retained forever, without cascade or erasure. `PENDING` acknowledges durable intent only:
+  actors, snapshots and fork-child pins remain retained indefinitely. No Stop or cleanup is
+  attempted; ownership and reclamation belong to #88. See [deletion semantics and admission
+  limits](docs/concepts.md#permanent-soft-deletion).
 
 ## Documentation
 
 The same docs are published, rendered and searchable, at
-**[anishram.com/agentsessions](https://anishram.com/agentsessions/)**, along with a walkthrough of
+**[sessions.agent-primitives.dev](https://sessions.agent-primitives.dev/)**, along with a walkthrough of
 how a turn runs and a recording of the full lifecycle on a real cluster.
 
 The sources live in [`docs/`](docs/README.md):
@@ -107,13 +124,13 @@ The sources live in [`docs/`](docs/README.md):
 | `observability/` | Structured operation logging and gRPC request-correlation helpers. |
 | `harnesswire/` | Bridges the in-process `api.Harness` SPI and the out-of-process `Harness.Connect` gRPC stream. |
 | `placement/` | The `Placer`: wires Sessions to the `Runtime` SPI, mints/binds fences, gates via `CanPlace`. The `Registry` routes a session to the harness it names. |
-| `runtime/local`, `runtime/substrate` | `Runtime` backends: a filesystem-only local backend, and agent-substrate. |
+| `runtime/local`, `runtime/remote`, `runtime/substrate` | `Runtime` backends: a filesystem-only local backend, an attach-by-address backend for a harness you run yourself, and agent-substrate. |
 | `harness/echoagent`, `harness/counteragent`, `harness/chatagent` | Reference harnesses: `STATELESS_REPLAY` echo, `REQUIRES_MEMORY_SNAPSHOT` counter, and a history-aware chat harness. |
 | `model/openai` | Model provider for OpenAI-compatible endpoints; no vendor SDK, so any compatible service works. |
 | `session/` | The `Sessions` gRPC service: the client-facing seam over the log and the Placer. |
 | `client/` | Go client SDK: dialing, the session frame, pagination, and stream draining. |
 | `cmd/agentsessionsd` | The Sessions server: a TCP entry point over the journal and the harness registry. |
-| `cmd/agentctl` | Client CLI (create / exec / replay / fork / suspend / resume). |
+| `cmd/agentctl` | Client CLI (create / list / get / exec / replay / fork / suspend / resume / approve / deny / delete). |
 | `conformance/` | The replay-conformance suite (the neutral determinism checks). |
 | `integrations/substrate/` | The substrate `ControlClient` adapter — a **separate module** so the core stays substrate-free. |
 | `deploy/substrate/`, `.github/workflows/substrate-e2e.yml` | Manifests + CI for the real-substrate conformance. |
@@ -125,6 +142,9 @@ ghcr.io/aramase/agentsessions/agentsessionsd:v0.1.2
 ghcr.io/aramase/agentsessions/harnessnode:v0.1.2
 ```
 
+v0.1.x images stay at `ghcr.io/aramase/agentsessions`; releases from v0.2.0 publish to
+`ghcr.io/agent-primitives/sessions`.
+
 Multi-arch, built from the tagged source with no Dockerfile. `agentsessionsd` is the Sessions
 server; `harnessnode` is the in-sandbox harness the substrate manifests in `deploy/substrate/`
 reference. The server runs as uid 65532, so mount its journal path writable.
@@ -132,12 +152,15 @@ reference. The server runs as uid 65532, so mount its journal path writable.
 ## Install
 
 ```bash
-go install github.com/aramase/agentsessions/cmd/agentctl@latest
-go install github.com/aramase/agentsessions/cmd/agentsessionsd@latest
+go install github.com/aramase/agentsessions/cmd/agentctl@v0.1.2
+go install github.com/aramase/agentsessions/cmd/agentsessionsd@v0.1.2
 ```
 
+v0.1.x is published under the module path `github.com/aramase/agentsessions`; the
+`github.com/agent-primitives/sessions` path applies from v0.2.0.
+
 Signed archives for linux/darwin on amd64/arm64, with checksums and SBOMs, are on the
-[latest release](https://github.com/aramase/agentsessions/releases/latest).
+[latest release](https://github.com/agent-primitives/sessions/releases/latest).
 
 ## Try it
 
@@ -192,9 +215,11 @@ it can break between releases; what the gate buys you is that it cannot break si
 Working reference implementation (Go 1.26). The Sessions API, the single-writer event-sourced controller,
 the durable hash-chained log, BYOH over `Harness.Connect`, the `Runtime` SPI with local + substrate
 backends, the replay-conformance suite, and real-substrate conformance across both capability tiers
-all run today. Session-level suspend and resume run through the `Placer` for stateless-replay
-harnesses; a memory-snapshot harness still suspends through the raw `Runtime` SPI, because
-`Placer.Suspend` stops the incarnation after snapshotting and a memory suspend must not.
+all run today. Session-level suspend and resume use the `Placer` for both resumability tiers.
+`Snapshot(EXTERNAL)` makes compute cold while retaining the handle needed to restore it;
+`Stop` remains destructive teardown, not part of suspension. The conformance suite exercises
+both Placer roundtrips; see the [Substrate test coverage](docs/substrate-conformance.md#the-suite-integrationssubstratee2e)
+for the live tests and verification boundaries.
 
 Not built: authentication, authorization, and transport security; a managed control plane;
 enterprise identity and provenance; and confidential or GPU snapshots.

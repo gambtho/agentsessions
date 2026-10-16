@@ -5,7 +5,7 @@
 // /readyz on :8081 lets ResumeActor block until the harness is live (ActorTemplate readyz probe).
 //
 // This is the substrate realization of the harness half of the step-6 dial path: the transport moves
-// from a unix socket to the actor's mesh DNS; the harnesswire server is unchanged.
+// from a unix socket to atenet-router, which forwards to this port; the harnesswire server is unchanged.
 package main
 
 import (
@@ -17,18 +17,19 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"google.golang.org/grpc"
 
-	"github.com/aramase/agentsessions/api"
-	v1 "github.com/aramase/agentsessions/api/genpb"
-	"github.com/aramase/agentsessions/harness/chatagent"
-	"github.com/aramase/agentsessions/harness/counteragent"
-	"github.com/aramase/agentsessions/harness/echoagent"
-	"github.com/aramase/agentsessions/harnesswire"
-	"github.com/aramase/agentsessions/observability"
-	"github.com/aramase/agentsessions/runtime/substrate"
+	"github.com/agent-primitives/sessions/api"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
+	"github.com/agent-primitives/sessions/harness/chatagent"
+	"github.com/agent-primitives/sessions/harness/counteragent"
+	"github.com/agent-primitives/sessions/harness/echoagent"
+	"github.com/agent-primitives/sessions/harnesswire"
+	"github.com/agent-primitives/sessions/observability"
+	"github.com/agent-primitives/sessions/runtime/substrate"
 )
 
 func env(key, def string) string {
@@ -43,15 +44,26 @@ func main() {
 	if err != nil {
 		log.Fatalf("harnessnode: configure harness: %v", err)
 	}
-	grpcAddr := env("HARNESS_ADDR", ":"+substrate.HarnessPort) // harnesswire gRPC; the driver dials PodIP here
-	readyzAddr := env("HARNESS_READYZ", ":8081")               // HTTP readyz for the ActorTemplate probe
+	grpcAddr := env("HARNESS_ADDR", ":"+substrate.HarnessPort) // harnesswire gRPC; atenet-router forwards here
+	readyzAddr := env("HARNESS_READYZ", ":8081")               // HTTP readyz for the ActorTemplate wakeup probe
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	// harnesswire gRPC server (h2c: plain TCP, no TLS — the mesh terminates/originates HTTP/2).
-	lis, err := net.Listen("tcp", grpcAddr)
-	if err != nil {
+	// HARNESS_ADDR=unix:///path serves on a unix socket instead, for a host that registers this
+	// harness by address on the same machine (agentsessionsd -harness name=unix:///path).
+	var lis net.Listener
+	if sock, ok := strings.CutPrefix(grpcAddr, "unix://"); ok {
+		ulis, lock, err := listenUnix(sock)
+		if err != nil {
+			log.Fatalf("harnessnode: listen %s: %v", grpcAddr, err)
+		}
+		// Held until the process exits, however it exits: the kernel drops the lock, and the next
+		// harnessnode on this address can then reclaim the socket file.
+		defer func() { _ = lock.Close() }()
+		lis = ulis
+	} else if lis, err = net.Listen("tcp", grpcAddr); err != nil {
 		log.Fatalf("harnessnode: listen %s: %v", grpcAddr, err)
 	}
 	srv := grpc.NewServer(

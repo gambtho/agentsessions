@@ -17,12 +17,12 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/aramase/agentsessions/api"
-	"github.com/aramase/agentsessions/controller"
-	"github.com/aramase/agentsessions/eventlog"
-	"github.com/aramase/agentsessions/harness/echoagent"
-	"github.com/aramase/agentsessions/model/openai"
-	"github.com/aramase/agentsessions/sqlitelog"
+	"github.com/agent-primitives/sessions/api"
+	"github.com/agent-primitives/sessions/controller"
+	"github.com/agent-primitives/sessions/eventlog"
+	"github.com/agent-primitives/sessions/harness/echoagent"
+	"github.com/agent-primitives/sessions/model/openai"
+	"github.com/agent-primitives/sessions/sqlitelog"
 )
 
 // countModel is a genuinely NONDETERMINISTIC model: every invocation returns a different answer
@@ -157,8 +157,8 @@ func TestCrashMidTurnRedriveAtMostOnce(t *testing.T) {
 	recorded, _ := c1.Outputs()
 	s.Close()
 
-	// Simulate a crash that lost only the END record (INPUT, MODEL_CALL, OUTPUT are durable).
-	truncateFrom(t, path, "s", 4)
+	// Simulate a crash that lost only END (EXECUTION_START, INPUT, MODEL_CALL, OUTPUT are durable).
+	truncateFrom(t, path, "s", 5)
 
 	s2, err := sqlitelog.Open(path)
 	if err != nil {
@@ -246,8 +246,8 @@ func TestCrashAfterUsageDoesNotDuplicateAccounting(t *testing.T) {
 	}
 	s.Close()
 
-	// INPUT, MODEL_CALL, OUTPUT, and USAGE are durable; only END was lost.
-	truncateFrom(t, path, "s", 5)
+	// EXECUTION_START, INPUT, MODEL_CALL, OUTPUT, and USAGE are durable; only END was lost.
+	truncateFrom(t, path, "s", 6)
 
 	s2, err := sqlitelog.Open(path)
 	if err != nil {
@@ -299,6 +299,168 @@ func TestCrashAfterUsageDoesNotDuplicateAccounting(t *testing.T) {
 	}
 	if replay.ModelInvocations() != 0 {
 		t.Fatalf("replay invoked the model %d times", replay.ModelInvocations())
+	}
+}
+
+// providerUsageHarness reports the usage the model call returned, as a harness wrapping a real
+// provider does. Replay and Resume must serve that usage back with the recorded completion, or the
+// harness reports zero and the recorded USAGE no longer matches. By default it skips a zero usage;
+// with always set it reports whatever it was given, as api.EventSink.Usage's doc asks.
+type providerUsageHarness struct{ always bool }
+
+func (providerUsageHarness) Describe(context.Context) (api.Descriptor, error) {
+	return api.Descriptor{
+		ID:           "provider-usage",
+		Capabilities: api.Capabilities{Resumability: api.ResumabilityStatelessReplay},
+	}, nil
+}
+
+func (h providerUsageHarness) Run(ctx context.Context, start *api.Start, sink api.EventSink) error {
+	resp, err := sink.Model(ctx, api.ModelRequest{Model: "usage", Messages: start.Inputs})
+	if err != nil {
+		return err
+	}
+	if resp.Usage == (api.Usage{}) && !h.always {
+		return nil
+	}
+	return sink.Usage(ctx, resp.Usage)
+}
+
+func TestReplayServesRecordedProviderUsage(t *testing.T) {
+	s, path := openFile(t)
+	usage := api.Usage{Model: "usage", InputTokens: 11, OutputTokens: 7, ReasoningTokens: 3}
+	model := func(_ context.Context, _ api.ModelRequest) (api.ModelResponse, error) {
+		return api.ModelResponse{Message: *api.TextMessage("assistant", "ok"), Usage: usage}, nil
+	}
+	c, err := controller.New(s.Session("s"), model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Exec(context.Background(), providerUsageHarness{}, []api.Message{*api.TextMessage("user", "hi")}, 0); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	// EXECUTION_START, INPUT, MODEL_CALL, OUTPUT, USAGE survive; END is lost.
+	truncateFrom(t, path, "s", 6)
+
+	s2, err := sqlitelog.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	log := s2.Session("s")
+	c2, err := controller.New(log, (&countModel{}).call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := c2.Resume(context.Background(), providerUsageHarness{})
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if !resumed || c2.ModelInvocations() != 0 {
+		t.Fatalf("resume: resumed=%v model invocations=%d, want true and 0", resumed, c2.ModelInvocations())
+	}
+	records, err := log.Read(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recorded []api.Usage
+	for _, record := range records {
+		if record.Event.Kind == api.EventUsage && record.Event.Usage != nil {
+			recorded = append(recorded, *record.Event.Usage)
+		}
+	}
+	if !reflect.DeepEqual(recorded, []api.Usage{usage}) {
+		t.Fatalf("recorded usage = %+v, want exactly %+v", recorded, usage)
+	}
+
+	replay, err := controller.New(log, (&countModel{}).call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := replay.Replay(context.Background(), providerUsageHarness{}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if replay.ModelInvocations() != 0 {
+		t.Fatalf("replay invoked the model %d times", replay.ModelInvocations())
+	}
+}
+
+// A turn cut between its OUTPUT and its USAGE has no recorded usage to serve, so Resume serves the
+// completion with zero usage and does not re-invoke the model. The call's usage is then journaled
+// as zero by a harness that always reports what it was given, or not at all by one that skips a
+// zero usage; either way the provider's real usage is lost, and the result replays.
+func TestResumeCutBeforeUsageJournalsZeroOrNoUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		h    providerUsageHarness
+		want []api.Usage
+	}{
+		{name: "always reports", h: providerUsageHarness{always: true}, want: []api.Usage{{}}},
+		{name: "skips zero", h: providerUsageHarness{}, want: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, path := openFile(t)
+			usage := api.Usage{Model: "usage", InputTokens: 11, OutputTokens: 7}
+			model := func(_ context.Context, _ api.ModelRequest) (api.ModelResponse, error) {
+				return api.ModelResponse{Message: *api.TextMessage("assistant", "ok"), Usage: usage}, nil
+			}
+			c, err := controller.New(s.Session("s"), model)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Exec(context.Background(), tc.h, []api.Message{*api.TextMessage("user", "hi")}, 0); err != nil {
+				t.Fatal(err)
+			}
+			s.Close()
+			// EXECUTION_START, INPUT, MODEL_CALL, OUTPUT survive; USAGE and END are lost.
+			truncateFrom(t, path, "s", 5)
+
+			s2, err := sqlitelog.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s2.Close()
+			log := s2.Session("s")
+			c2, err := controller.New(log, (&countModel{}).call)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resumed, err := c2.Resume(context.Background(), tc.h)
+			if err != nil {
+				t.Fatalf("resume: %v", err)
+			}
+			if !resumed || c2.ModelInvocations() != 0 {
+				t.Fatalf("resume: resumed=%v model invocations=%d, want true and 0", resumed, c2.ModelInvocations())
+			}
+			records, err := log.Read(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var recorded []api.Usage
+			for _, record := range records {
+				if record.Event.Kind == api.EventUsage && record.Event.Usage != nil {
+					recorded = append(recorded, *record.Event.Usage)
+				}
+			}
+			if !reflect.DeepEqual(recorded, tc.want) {
+				t.Fatalf("recorded usage = %+v, want %+v", recorded, tc.want)
+			}
+			if records[len(records)-1].Event.Kind != api.EventEnd {
+				t.Fatal("resume did not append END")
+			}
+
+			replay, err := controller.New(log, (&countModel{}).call)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := replay.Replay(context.Background(), tc.h); err != nil {
+				t.Fatalf("replay: %v", err)
+			}
+			if replay.ModelInvocations() != 0 {
+				t.Fatalf("replay invoked the model %d times", replay.ModelInvocations())
+			}
+		})
 	}
 }
 
@@ -391,26 +553,29 @@ func TestIntegrityGoldenVectorCrossImpl(t *testing.T) {
 	}
 }
 
+type toolKey struct{ sessionUID, key string }
+
 // idempotentTool models an external side-effecting tool with tool-side dedup: it counts real
-// effects per idempotency key and returns the cached result for a repeated key. Its state stands in
-// for the tool's OWN durable dedup (e.g. a payment API keyed on the idempotency key), so — like the
+// effects per session and idempotency key and returns the cached result for a repeated pair. Its
+// state stands in for the tool's OWN durable dedup keyed on that pair, so — like the
 // external effect — it survives the simulated controller crash.
 type idempotentTool struct {
-	effects map[string]int
-	results map[string]api.ToolResult
+	effects map[toolKey]int
+	results map[toolKey]api.ToolResult
 }
 
 func newIdempotentTool() *idempotentTool {
-	return &idempotentTool{effects: map[string]int{}, results: map[string]api.ToolResult{}}
+	return &idempotentTool{effects: map[toolKey]int{}, results: map[toolKey]api.ToolResult{}}
 }
 
-func (t *idempotentTool) exec(_ context.Context, tc api.ToolCall) (api.ToolResult, error) {
-	if r, ok := t.results[tc.IdempotencyKey]; ok {
+func (t *idempotentTool) exec(_ context.Context, scope controller.ToolCallContext, tc api.ToolCall) (api.ToolResult, error) {
+	key := toolKey{scope.SessionUID, tc.IdempotencyKey}
+	if r, ok := t.results[key]; ok {
 		return r, nil // deduped: the effect already ran under this key
 	}
-	t.effects[tc.IdempotencyKey]++
+	t.effects[key]++
 	r := api.ToolResult{ID: tc.ID, Output: map[string]any{"ran": true}}
-	t.results[tc.IdempotencyKey] = r
+	t.results[key] = r
 	return r, nil
 }
 
@@ -439,22 +604,23 @@ func (h toolHarness) Run(ctx context.Context, _ *api.Start, sink api.EventSink) 
 func TestCrashMidToolCallAtMostOnce(t *testing.T) {
 	s, path := openFile(t)
 	tool := newIdempotentTool()
-	c1, err := controller.New(s.Session("s"), (&countModel{}).call, controller.WithToolExecutor(tool.exec))
+	c1, err := controller.New(s.Session("s"), (&countModel{}).call, controller.WithSessionUID("s"), controller.WithToolExecutor(tool.exec))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := c1.Exec(context.Background(), toolHarness{key: "k1"}, []api.Message{*api.TextMessage("user", "go")}, 0); err != nil {
 		t.Fatal(err)
 	}
-	// Journal now: INPUT(1) TOOL_CALL(2) TOOL_RESULT(3) END(4); the effect ran exactly once.
-	if tool.effects["k1"] != 1 {
-		t.Fatalf("live: effect ran %d times, want 1", tool.effects["k1"])
+	// Journal now: EXECUTION_START(1) INPUT(2) TOOL_CALL(3) TOOL_RESULT(4) END(5).
+	// The effect ran exactly once.
+	if tool.effects[toolKey{"s", "k1"}] != 1 {
+		t.Fatalf("live: effect ran %d times, want 1", tool.effects[toolKey{"s", "k1"}])
 	}
 	s.Close()
 
-	// Crash lost the TOOL_RESULT and END: the intent (TOOL_CALL, seq 2) is durable, the result is
+	// Crash lost the TOOL_RESULT and END: the intent (TOOL_CALL, seq 3) is durable, the result is
 	// not — the exact window §3 protects against.
-	truncateFrom(t, path, "s", 3)
+	truncateFrom(t, path, "s", 4)
 
 	s2, err := sqlitelog.Open(path)
 	if err != nil {
@@ -464,7 +630,7 @@ func TestCrashMidToolCallAtMostOnce(t *testing.T) {
 	log := s2.Session("s")
 	// Same tool instance: its dedup state is the external tool's, which the controller crash does
 	// not erase.
-	c2, err := controller.New(log, (&countModel{}).call, controller.WithToolExecutor(tool.exec))
+	c2, err := controller.New(log, (&countModel{}).call, controller.WithSessionUID("s"), controller.WithToolExecutor(tool.exec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,8 +643,8 @@ func TestCrashMidToolCallAtMostOnce(t *testing.T) {
 	}
 	// The executor is CALLED again on re-drive, but the same key dedups it — the external effect
 	// fired exactly once across the crash (at-most-once / I3).
-	if tool.effects["k1"] != 1 {
-		t.Fatalf("resume re-ran the side effect: %d times, want 1 (I3 violated)", tool.effects["k1"])
+	if tool.effects[toolKey{"s", "k1"}] != 1 {
+		t.Fatalf("resume re-ran the side effect: %d times, want 1 (I3 violated)", tool.effects[toolKey{"s", "k1"}])
 	}
 	recs, _ := log.Read(1)
 	if recs[len(recs)-1].Event.Kind != api.EventEnd {
@@ -505,7 +671,7 @@ func TestControllerMediatedToolRequiresKey(t *testing.T) {
 	s, _ := openFile(t)
 	defer s.Close()
 	log := s.Session("s")
-	c, err := controller.New(log, (&countModel{}).call, controller.WithToolExecutor(newIdempotentTool().exec))
+	c, err := controller.New(log, (&countModel{}).call, controller.WithSessionUID("s"), controller.WithToolExecutor(newIdempotentTool().exec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,7 +710,7 @@ func TestUnmediatedToolCallRejected(t *testing.T) {
 	s, _ := openFile(t)
 	defer s.Close()
 	log := s.Session("s")
-	c, err := controller.New(log, (&countModel{}).call, controller.WithToolExecutor(newIdempotentTool().exec))
+	c, err := controller.New(log, (&countModel{}).call, controller.WithSessionUID("s"), controller.WithToolExecutor(newIdempotentTool().exec))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -38,24 +38,76 @@ GOLDEN_EVENT = {
 }
 GOLDEN_EXPECTED = "551bd146050c8d630b0c3b999a4445f3792a470db9bca443d8d4a67706283fcc"
 
+# Additional Go/Python interop vectors cover starts with opaque config and default invocations.
+START_GOLDENS = [
+    ({"execution_id": "exec-config", "kind": "EVENT_EXECUTION_START",
+      "execution_start": {"config": "AP8gCgk=", "input_count": "2",
+                          "resume_from_seq": "9007199254740993"}},
+     "aa1f42a26b7a227836d32d31608ebb69c59f3b1c57eadd8537b6faf88a01c790"),
+    ({"execution_id": "exec-default", "kind": "EVENT_EXECUTION_START",
+      "execution_start": {"input_count": "0"}},
+     "b09cbff45d5a30990c3b72be8b06af6bc509d5a29a849aab5fd42153ef10ec65"),
+    ({"execution_id": "exec-default", "kind": "EVENT_EXECUTION_START",
+      "execution_start": {"input_count": "2"}},
+     "f06c25ee5b3673ee23b8f91883c7f1c6c5682d94986caf5bc067908a61b2ac4f"),
+]
+
+# An OUTPUT whose assistant message carries a tool_call part (canon.toolCallGoldenEvent). Its
+# arguments are a google.protobuf.Struct, so this pins how numbers, booleans, nested objects and lists
+# in a Struct canonicalize: proto3-JSON writes them as plain JSON values.
+TOOL_CALL_GOLDEN = (
+    {"execution_id": "exec-tool", "schema_version": 1, "ts": "2023-11-14T22:13:20Z",
+     "kind": "EVENT_OUTPUT",
+     "message": {"role": "assistant", "parts": [
+         {"text": {"text": "checking"}},
+         {"tool_call": {"id": "call-1", "tool": "get_weather", "args": {
+             "city": "Paris", "days": 2, "detail": True, "ratio": 1.5,
+             "units": {"temp": "C"}, "tags": ["a", "b"]}}},
+     ]},
+     "actor": {"principal": "agent://a", "issuer": "entra", "subject": "sub-1"}},
+    "e8911826d1370b0b96f3d3a1efaf63bc20f3808cdc189d937b5155ac3f8d509c",
+)
+
+# Session-scoped DELETE intent (canon.TestLifecycleDeleteCanonicalVector). Enum names and an
+# exact nanosecond timestamp must bind to the same hash without a Go serializer or execution ID.
+DELETE_GOLDEN = (
+    {"schema_version": 1, "ts": "2023-11-14T22:13:20.123456789Z",
+     "kind": "EVENT_LIFECYCLE", "lifecycle": {"kind": "LIFECYCLE_DELETE"}},
+    "bfbda987672b922ac194edadeec95fad94093740ab2a6bf9786f09c4a56d3d90",
+)
+
+# Independently specified canonical bytes for the DELETE record above, matching the Go literal.
+DELETE_CANONICAL = (
+    b'{"event":{"kind":"EVENT_LIFECYCLE","lifecycle":{"kind":"LIFECYCLE_DELETE"},'
+    b'"schema_version":1,"ts":"2023-11-14T22:13:20.123456789Z"},"prev_hash":"","seq":"1"}'
+)
+
 EVENT_TYPE = "agentsessions.v1.Event"
 
 
 def _stdlib_jcs(value):
-    # RFC 8785 JCS reduces to this for our golden value set (ASCII strings, a small int, ASCII keys):
-    # recursively sorted keys, compact separators, no ASCII escaping.
+    # RFC 8785 JCS reduces to this for our golden value set (ASCII strings, small ints, a float with
+    # an exact short decimal form, booleans, ASCII keys): recursively sorted keys, compact separators,
+    # no ASCII escaping.
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 def golden_check():
-    record = {"event": GOLDEN_EVENT, "prev_hash": "", "seq": "1"}
-    digest = hashlib.sha256(_stdlib_jcs(record)).hexdigest()
-    print("computed:", digest)
-    print("expected:", GOLDEN_EXPECTED)
-    if digest != GOLDEN_EXPECTED:
-        print("MISMATCH: non-Go verifier did NOT reproduce the golden content_hash", file=sys.stderr)
+    delete_record = {"event": DELETE_GOLDEN[0], "prev_hash": "", "seq": "1"}
+    if _stdlib_jcs(delete_record) != DELETE_CANONICAL:
+        print("MISMATCH: DELETE canonical bytes differ from the independent literal", file=sys.stderr)
         return 1
-    print("OK: non-Go (Python) verifier reproduced the Go golden content_hash (stdlib)")
+    print("DELETE canonical:", DELETE_CANONICAL.decode("utf-8"))
+    vectors = [(GOLDEN_EVENT, GOLDEN_EXPECTED), *START_GOLDENS, TOOL_CALL_GOLDEN, DELETE_GOLDEN]
+    for event, expected in vectors:
+        record = {"event": event, "prev_hash": "", "seq": "1"}
+        digest = hashlib.sha256(_stdlib_jcs(record)).hexdigest()
+        print("computed:", digest)
+        print("expected:", expected)
+        if digest != expected:
+            print("MISMATCH: non-Go verifier did NOT reproduce the golden content_hash", file=sys.stderr)
+            return 1
+    print(f"OK: non-Go (Python) verifier reproduced all {len(vectors)} Go golden content_hash vectors (stdlib)")
     return 0
 
 

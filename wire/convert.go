@@ -4,7 +4,9 @@
 // them from drifting: if a field is added to one side and not the other, the conversion
 // (and its round-trip test) fails to compile or fails the test. The api.Event is the
 // load-bearing type — it crosses both the Harness.Connect stream and Sessions.Exec/Replay,
-// and it is what the event log hash-chains — so its round-trip must be lossless.
+// and it is what the event log hash-chains — so its durable fields must survive a round-trip.
+// ToolResult.Approval is a transient direct-sink decision carrier, intentionally not serialized;
+// EVENT_PARKED is convertible for transport but MUST NOT be journaled.
 //
 // Content constraint: structured content maps (ToolCall.Args, ToolResult.Output, DataPart)
 // MUST hold JSON-shaped values. They cross the wire as a protobuf Struct, whose numbers are
@@ -14,12 +16,13 @@ package wire
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/aramase/agentsessions/api"
-	v1 "github.com/aramase/agentsessions/api/genpb"
+	"github.com/agent-primitives/sessions/api"
+	v1 "github.com/agent-primitives/sessions/api/genpb"
 )
 
 // EventToProto converts a domain Event to its wire form. Ordering/integrity fields are not
@@ -55,6 +58,14 @@ func EventToProto(e api.Event) *v1.Event {
 		out.Body = &v1.Event_End{End: endToProto(e.End)}
 	case e.Err != nil:
 		out.Body = &v1.Event_Error{Error: errorToProto(e.Err)}
+	case e.ExecutionStart != nil:
+		out.Body = &v1.Event_ExecutionStart{ExecutionStart: &v1.ExecutionStart{
+			Config: e.ExecutionStart.Config, ResumeFromSeq: e.ExecutionStart.ResumeFromSeq,
+			InputCount: e.ExecutionStart.InputCount,
+			Harness:    e.ExecutionStart.Harness, HarnessVersion: e.ExecutionStart.HarnessVersion,
+		}}
+	case e.Parked != nil:
+		out.Body = &v1.Event_Parked{Parked: approvalRefToProto(e.Parked)}
 	}
 	return out
 }
@@ -94,6 +105,16 @@ func EventFromProto(p *v1.Event) api.Event {
 		out.End = endFromProto(b.End)
 	case *v1.Event_Error:
 		out.Err = errorFromProto(b.Error)
+	case *v1.Event_ExecutionStart:
+		if b.ExecutionStart != nil {
+			out.ExecutionStart = &api.ExecutionStart{
+				Config: b.ExecutionStart.GetConfig(), ResumeFromSeq: b.ExecutionStart.GetResumeFromSeq(),
+				InputCount: b.ExecutionStart.InputCount,
+				Harness:    b.ExecutionStart.GetHarness(), HarnessVersion: b.ExecutionStart.GetHarnessVersion(),
+			}
+		}
+	case *v1.Event_Parked:
+		out.Parked = approvalRefFromProto(b.Parked)
 	}
 	return out
 }
@@ -113,6 +134,25 @@ func ToolCallToProto(t *api.ToolCall) *v1.ToolCall         { return toolCallToPr
 func ToolCallFromProto(t *v1.ToolCall) *api.ToolCall       { return toolCallFromProto(t) }
 func ToolResultToProto(t *api.ToolResult) *v1.ToolResult   { return toolResultToProto(t) }
 func ToolResultFromProto(t *v1.ToolResult) *api.ToolResult { return toolResultFromProto(t) }
+
+// ToolSpecToProto converts a declared tool to its wire form (exported for the harness wire bridge,
+// which carries a harness's declared tools in its descriptor).
+func ToolSpecToProto(t api.ToolSpec) *v1.ToolSpec {
+	return &v1.ToolSpec{
+		Name:        t.Name,
+		Description: t.Description,
+		Mediation:   mediationToProto(t.Mediation),
+	}
+}
+
+// ToolSpecFromProto converts a wire tool declaration to the domain type. A nil p yields the zero value.
+func ToolSpecFromProto(p *v1.ToolSpec) api.ToolSpec {
+	return api.ToolSpec{
+		Name:        p.GetName(),
+		Description: p.GetDescription(),
+		Mediation:   mediationFromProto(p.GetMediation()),
+	}
+}
 
 func msgToProto(m *api.Message) *v1.Message {
 	if m == nil {
@@ -147,6 +187,10 @@ func partToProto(p api.Part) *v1.Part {
 		out.Part = &v1.Part_Data{Data: &v1.DataPart{Data: toStruct(p.Data)}}
 	case p.Reasoning != nil:
 		out.Part = &v1.Part_Reasoning{Reasoning: reasoningToProto(p.Reasoning)}
+	case p.ToolCall != nil:
+		out.Part = &v1.Part_ToolCall{ToolCall: toolCallToProto(p.ToolCall)}
+	case p.ToolResult != nil:
+		out.Part = &v1.Part_ToolResult{ToolResult: toolResultToProto(p.ToolResult)}
 	}
 	return out
 }
@@ -165,6 +209,32 @@ func partFromProto(p *v1.Part) api.Part {
 		out.Data = fromStruct(b.Data.GetData())
 	case *v1.Part_Reasoning:
 		out.Reasoning = reasoningFromProto(b.Reasoning)
+	case *v1.Part_ToolCall:
+		out.ToolCall = toolCallFromProto(b.ToolCall)
+	case *v1.Part_ToolResult:
+		out.ToolResult = toolResultFromProto(b.ToolResult)
+	}
+	return out
+}
+
+func partsToProto(ps []api.Part) []*v1.Part {
+	if len(ps) == 0 {
+		return nil
+	}
+	out := make([]*v1.Part, len(ps))
+	for i := range ps {
+		out[i] = partToProto(ps[i])
+	}
+	return out
+}
+
+func partsFromProto(ps []*v1.Part) []api.Part {
+	if len(ps) == 0 {
+		return nil
+	}
+	out := make([]api.Part, len(ps))
+	for i, p := range ps {
+		out[i] = partFromProto(p)
 	}
 	return out
 }
@@ -296,12 +366,17 @@ func toolResultToProto(t *api.ToolResult) *v1.ToolResult {
 		return nil
 	}
 	return &v1.ToolResult{
-		Id:           t.ID,
-		Output:       toStruct(t.Output),
-		OutputUri:    t.OutputURI,
-		OutputDigest: t.OutputDigest,
-		IsError:      t.IsError,
-		Error:        t.Error,
+		Id:                  t.ID,
+		Output:              toStruct(t.Output),
+		OutputUri:           t.OutputURI,
+		OutputDigest:        t.OutputDigest,
+		IsError:             t.IsError,
+		Error:               t.Error,
+		Content:             partsToProto(t.Content),
+		Code:                v1.ToolResult_Code(t.Code),
+		ApprovalRequestSeq:  t.ApprovalRequestSeq,
+		ApprovalDecisionSeq: t.ApprovalDecisionSeq,
+		// Approval is transient and deliberately excluded from receipts and nested model history.
 	}
 }
 
@@ -310,13 +385,85 @@ func toolResultFromProto(t *v1.ToolResult) *api.ToolResult {
 		return nil
 	}
 	return &api.ToolResult{
-		ID:           t.GetId(),
-		Output:       fromStruct(t.GetOutput()),
-		OutputURI:    t.GetOutputUri(),
-		OutputDigest: t.GetOutputDigest(),
-		IsError:      t.GetIsError(),
-		Error:        t.GetError(),
+		ID:                  t.GetId(),
+		Output:              fromStruct(t.GetOutput()),
+		OutputURI:           t.GetOutputUri(),
+		OutputDigest:        t.GetOutputDigest(),
+		IsError:             t.GetIsError(),
+		Error:               t.GetError(),
+		Content:             partsFromProto(t.GetContent()),
+		Code:                api.ToolResultCode(t.GetCode()),
+		ApprovalRequestSeq:  t.GetApprovalRequestSeq(),
+		ApprovalDecisionSeq: t.GetApprovalDecisionSeq(),
 	}
+}
+
+// ToolDefinitionsToProto converts the tools offered on a model call. They ride ModelCall on the
+// harness stream only; the recorded MODEL_CALL keeps the input hash that covers them.
+func ToolDefinitionsToProto(ts []api.ToolDefinition) []*v1.ToolDefinition {
+	if len(ts) == 0 {
+		return nil
+	}
+	out := make([]*v1.ToolDefinition, len(ts))
+	for i, t := range ts {
+		out[i] = &v1.ToolDefinition{Name: t.Name, Description: t.Description, InputSchema: toStruct(t.InputSchema)}
+	}
+	return out
+}
+
+// ToolDefinitionsFromProto is the inverse of ToolDefinitionsToProto.
+func ToolDefinitionsFromProto(ps []*v1.ToolDefinition) []api.ToolDefinition {
+	if len(ps) == 0 {
+		return nil
+	}
+	out := make([]api.ToolDefinition, len(ps))
+	for i, p := range ps {
+		out[i] = api.ToolDefinition{Name: p.GetName(), Description: p.GetDescription(), InputSchema: fromStruct(p.GetInputSchema())}
+	}
+	return out
+}
+
+// ToolChoiceToProto converts a tool choice. An unknown mode is an error rather than the provider
+// default: a choice that silently loosened would let the model do what the harness ruled out.
+func ToolChoiceToProto(c *api.ToolChoice) (*v1.ToolChoice, error) {
+	if c == nil {
+		return nil, nil
+	}
+	var mode v1.ToolChoice_Mode
+	switch c.Mode {
+	case "":
+		mode = v1.ToolChoice_MODE_UNSPECIFIED
+	case api.ToolChoiceAuto:
+		mode = v1.ToolChoice_MODE_AUTO
+	case api.ToolChoiceNone:
+		mode = v1.ToolChoice_MODE_NONE
+	case api.ToolChoiceRequired:
+		mode = v1.ToolChoice_MODE_REQUIRED
+	default:
+		return nil, fmt.Errorf("wire: unknown tool choice mode %q", c.Mode)
+	}
+	return &v1.ToolChoice{Mode: mode, Name: c.Name}, nil
+}
+
+// ToolChoiceFromProto is the inverse of ToolChoiceToProto. Proto3 enums are open, so a mode this
+// build does not know (a newer peer's value) is an error rather than the provider default.
+func ToolChoiceFromProto(p *v1.ToolChoice) (*api.ToolChoice, error) {
+	if p == nil {
+		return nil, nil
+	}
+	out := &api.ToolChoice{Name: p.GetName()}
+	switch p.GetMode() {
+	case v1.ToolChoice_MODE_UNSPECIFIED:
+	case v1.ToolChoice_MODE_AUTO:
+		out.Mode = api.ToolChoiceAuto
+	case v1.ToolChoice_MODE_NONE:
+		out.Mode = api.ToolChoiceNone
+	case v1.ToolChoice_MODE_REQUIRED:
+		out.Mode = api.ToolChoiceRequired
+	default:
+		return nil, fmt.Errorf("wire: unknown tool choice mode %d", int32(p.GetMode()))
+	}
+	return out, nil
 }
 
 func approvalReqToProto(a *api.ApprovalRequest) *v1.ApprovalRequest {
@@ -333,18 +480,32 @@ func approvalReqFromProto(a *v1.ApprovalRequest) *api.ApprovalRequest {
 	return &api.ApprovalRequest{ToolCallID: a.GetToolCallId(), Reason: a.GetReason()}
 }
 
+func approvalRefToProto(a *api.ApprovalRef) *v1.ApprovalRef {
+	if a == nil {
+		return nil
+	}
+	return &v1.ApprovalRef{ExecutionId: a.ExecutionID, ToolCallId: a.ToolCallID, RequestSeq: a.RequestSeq}
+}
+
+func approvalRefFromProto(a *v1.ApprovalRef) *api.ApprovalRef {
+	if a == nil {
+		return nil
+	}
+	return &api.ApprovalRef{ExecutionID: a.GetExecutionId(), ToolCallID: a.GetToolCallId(), RequestSeq: a.GetRequestSeq()}
+}
+
 func approvalResToProto(a *api.ApprovalResult) *v1.ApprovalResult {
 	if a == nil {
 		return nil
 	}
-	return &v1.ApprovalResult{ToolCallId: a.ToolCallID, Approved: a.Approved, Reason: a.Reason}
+	return &v1.ApprovalResult{ToolCallId: a.ToolCallID, Approved: a.Approved, Reason: a.Reason, RequestSeq: a.RequestSeq}
 }
 
 func approvalResFromProto(a *v1.ApprovalResult) *api.ApprovalResult {
 	if a == nil {
 		return nil
 	}
-	return &api.ApprovalResult{ToolCallID: a.GetToolCallId(), Approved: a.GetApproved(), Reason: a.GetReason()}
+	return &api.ApprovalResult{ToolCallID: a.GetToolCallId(), Approved: a.GetApproved(), Reason: a.GetReason(), RequestSeq: a.GetRequestSeq()}
 }
 
 // DeltaToProto converts an ephemeral streaming chunk. Deltas are transport only, so unlike Event
@@ -480,6 +641,10 @@ func kindToProto(k api.EventKind) v1.EventKind {
 		return v1.EventKind_EVENT_END
 	case api.EventError:
 		return v1.EventKind_EVENT_ERROR
+	case api.EventExecutionStart:
+		return v1.EventKind_EVENT_EXECUTION_START
+	case api.EventParked:
+		return v1.EventKind_EVENT_PARKED
 	default:
 		return v1.EventKind_EVENT_KIND_UNSPECIFIED
 	}
@@ -509,6 +674,10 @@ func kindFromProto(k v1.EventKind) api.EventKind {
 		return api.EventEnd
 	case v1.EventKind_EVENT_ERROR:
 		return api.EventError
+	case v1.EventKind_EVENT_EXECUTION_START:
+		return api.EventExecutionStart
+	case v1.EventKind_EVENT_PARKED:
+		return api.EventParked
 	default:
 		return ""
 	}
@@ -552,6 +721,8 @@ func lifecycleKindToProto(k api.LifecycleKind) v1.Lifecycle_Kind {
 		return v1.Lifecycle_LIFECYCLE_BASELINE
 	case api.LifecycleCancel:
 		return v1.Lifecycle_LIFECYCLE_CANCEL
+	case api.LifecycleDelete:
+		return v1.Lifecycle_LIFECYCLE_DELETE
 	default:
 		return v1.Lifecycle_LIFECYCLE_UNSPECIFIED
 	}
@@ -569,6 +740,8 @@ func lifecycleKindFromProto(k v1.Lifecycle_Kind) api.LifecycleKind {
 		return api.LifecycleBaseline
 	case v1.Lifecycle_LIFECYCLE_CANCEL:
 		return api.LifecycleCancel
+	case v1.Lifecycle_LIFECYCLE_DELETE:
+		return api.LifecycleDelete
 	default:
 		return ""
 	}

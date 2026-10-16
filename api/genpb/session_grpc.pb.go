@@ -30,6 +30,7 @@ const (
 	Sessions_DeleteSession_FullMethodName = "/agentsessions.v1.Sessions/DeleteSession"
 	Sessions_Exec_FullMethodName          = "/agentsessions.v1.Sessions/Exec"
 	Sessions_Replay_FullMethodName        = "/agentsessions.v1.Sessions/Replay"
+	Sessions_Approve_FullMethodName       = "/agentsessions.v1.Sessions/Approve"
 	Sessions_Cancel_FullMethodName        = "/agentsessions.v1.Sessions/Cancel"
 	Sessions_Suspend_FullMethodName       = "/agentsessions.v1.Sessions/Suspend"
 	Sessions_Resume_FullMethodName        = "/agentsessions.v1.Sessions/Resume"
@@ -41,21 +42,78 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type SessionsClient interface {
 	CreateSession(ctx context.Context, in *CreateSessionRequest, opts ...grpc.CallOption) (*Session, error)
+	// GetSession remains available for audit after deletion, including metadata and deletion intent
+	// time.
 	GetSession(ctx context.Context, in *GetSessionRequest, opts ...grpc.CallOption) (*Session, error)
 	ListSessions(ctx context.Context, in *ListSessionsRequest, opts ...grpc.CallOption) (*ListSessionsResponse, error)
-	// Not implemented: the server returns UNIMPLEMENTED. Declared so the delete path can land
-	// without a breaking change to the service.
+	// DeleteSession commits irreversible soft-deletion intent for a known UID. The host atomically
+	// appends a session-scoped, host-owned LIFECYCLE_DELETE (empty execution_id), advances the writer
+	// fence and marks PENDING. Metadata, the UID and the hash-chained journal are retained forever;
+	// the UID cannot be reused. Children and their copied prefixes are unaffected: no cascade or
+	// data erasure is promised. ListSessions hides the UID; GetSession and raw Sessions.Replay remain
+	// read-only audit access, without reconstructing or running a harness.
+	//
+	// Valid mutation requests against PENDING fail with FAILED_PRECONDITION before routing,
+	// recovery or compute effects: Exec, Fork (including historical at_seq), Resume, Suspend and
+	// Approve are refused, including exact historical decision retries. Pending approval metadata
+	// grants no permission.
+	//
+	// Until ownership and cleanup land (#88), OK + PENDING acknowledges durable intent only. No
+	// Runtime.Stop, actor/pin release, physical snapshot GC or TERMINATED transition is attempted
+	// or promised. Execution and compute reporting stay independent. The retained journal
+	// is audit evidence, not a complete or authoritative cleanup-target inventory; the allocation
+	// ownership and cleanup-target schema belong to #88, not an inferred default harness or owner.
+	// Repeated PENDING deletion returns the identical Session: no timestamp, update_time, journal,
+	// fence or compute-projection changes. Clients must inspect deletion_state, not infer reclamation
+	// from an OK status.
+	//
+	// Empty uid is INVALID_ARGUMENT; an unknown nonempty uid is NOT_FOUND without creating a row.
+	// Overlap with a mutation in the same Registry/host is ABORTED before mutation, without canceling
+	// the holder; retry after it finishes. Storage faults are INTERNAL, cancellation/deadline retain
+	// CANCELLED/DEADLINE_EXCEEDED. An error or lost reply after intent commits cannot undo the hidden
+	// PENDING tombstone or erase its audit evidence: use GetSession or retry to learn the outcome.
+	//
+	// Admission serialization is local to one Registry/host. Durable fences block subsequent writes
+	// from this build's writers; already-open older binaries do not enforce tombstones. A separate
+	// host can provision compute before its first fence; cross-host exclusion of compute effects is
+	// not guaranteed. Operators still need runtime-side resource reconciliation.
 	DeleteSession(ctx context.Context, in *DeleteSessionRequest, opts ...grpc.CallOption) (*Session, error)
 	// Exec runs one execution/turn. The live stream carries committed LogRecords plus
 	// ephemeral Deltas; Replay re-delivers committed records only (read-only).
 	Exec(ctx context.Context, in *ExecRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecUpdate], error)
+	// Raw read-only audit: remains available for tombstoned UIDs, including LIFECYCLE_DELETE records.
+	// Unlike controller replay, this does not reconstruct or run the harness.
 	Replay(ctx context.Context, in *ReplayRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LogRecord], error)
+	// Implemented durable approval decisions for STATELESS_REPLAY executions.
+	// OK commits only a decision; the caller must Resume to continue. An exact retry of the tuple,
+	// approved value, reason and identity returns the existing decision, even after resolution.
+	// A changed decision/reason/identity for that request is FAILED_PRECONDITION, never an overwrite.
+	// INVALID_ARGUMENT: missing session/execution/tool-call tuple, non-positive request_seq, or absent
+	// approved. NOT_FOUND: unknown session. FAILED_PRECONDITION: stale, inherited, or wrong request
+	// tuple, changed decision, or invalid recorded approval evidence. The gate cannot be created
+	// for a non-stateless execution; Approve does not Describe or resolve a harness.
+	// ABORTED: local contention, append-CAS conflict or superseded fence; retry
+	// after reading the session. Identity is provenance only; this method provides no authorization,
+	// policy hook, expiry, implicit Resume, or Cancel behavior.
+	Approve(ctx context.Context, in *ApproveRequest, opts ...grpc.CallOption) (*ApproveResponse, error)
 	// In-flight control: cancel the running execution. Not implemented: the server returns
 	// UNIMPLEMENTED.
 	Cancel(ctx context.Context, in *CancelRequest, opts ...grpc.CallOption) (*Session, error)
 	// Compute-layer durability. There is no warm Pause: no Runtime backend implements a
 	// node-local warm checkpoint, so a session goes straight from live to a cold snapshot.
+	// Suspend routes an owned unreceipted approval to its recorded harness; inherited approvals
+	// and ordinary sessions use their stored default. An unserved recorded name is
+	// FAILED_PRECONDITION, with no fallback.
 	Suspend(ctx context.Context, in *SuspendRequest, opts ...grpc.CallOption) (*Session, error)
+	// A recorded STATELESS_REPLAY override of a stored REQUIRES_MEMORY_SNAPSHOT harness is
+	// FAILED_PRECONDITION before compute changes or journal repair, as for Exec admission.
+	// Otherwise an unresolved owned approval returns its current paused Session without runtime IO.
+	// A call-only cut repairs the request; neither outcome proves cold compute. After a decision,
+	// recovery uses the recorded invocation and SnapshotRef. It may park at another gate (without
+	// RESUME), or finish and commit RESUME. A missing executor is FAILED_PRECONDITION and leaves
+	// the decision recoverable. Approved executor failures are durable EXECUTOR_ERROR receipts,
+	// available to the harness for continuation, not transport failures. Snapshots and unresolved
+	// requests are retained indefinitely; there is no approval expiry or automatic decision.
 	Resume(ctx context.Context, in *ResumeRequest, opts ...grpc.CallOption) (*Session, error)
 	// The differentiator: branch a session at a sequence into one or more children. Forking a
 	// REQUIRES_MEMORY_SNAPSHOT harness first checkpoints the parent (it suspends, and a SUSPEND event
@@ -149,6 +207,16 @@ func (c *sessionsClient) Replay(ctx context.Context, in *ReplayRequest, opts ...
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Sessions_ReplayClient = grpc.ServerStreamingClient[LogRecord]
 
+func (c *sessionsClient) Approve(ctx context.Context, in *ApproveRequest, opts ...grpc.CallOption) (*ApproveResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ApproveResponse)
+	err := c.cc.Invoke(ctx, Sessions_Approve_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *sessionsClient) Cancel(ctx context.Context, in *CancelRequest, opts ...grpc.CallOption) (*Session, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Session)
@@ -194,21 +262,78 @@ func (c *sessionsClient) Fork(ctx context.Context, in *ForkRequest, opts ...grpc
 // for forward compatibility.
 type SessionsServer interface {
 	CreateSession(context.Context, *CreateSessionRequest) (*Session, error)
+	// GetSession remains available for audit after deletion, including metadata and deletion intent
+	// time.
 	GetSession(context.Context, *GetSessionRequest) (*Session, error)
 	ListSessions(context.Context, *ListSessionsRequest) (*ListSessionsResponse, error)
-	// Not implemented: the server returns UNIMPLEMENTED. Declared so the delete path can land
-	// without a breaking change to the service.
+	// DeleteSession commits irreversible soft-deletion intent for a known UID. The host atomically
+	// appends a session-scoped, host-owned LIFECYCLE_DELETE (empty execution_id), advances the writer
+	// fence and marks PENDING. Metadata, the UID and the hash-chained journal are retained forever;
+	// the UID cannot be reused. Children and their copied prefixes are unaffected: no cascade or
+	// data erasure is promised. ListSessions hides the UID; GetSession and raw Sessions.Replay remain
+	// read-only audit access, without reconstructing or running a harness.
+	//
+	// Valid mutation requests against PENDING fail with FAILED_PRECONDITION before routing,
+	// recovery or compute effects: Exec, Fork (including historical at_seq), Resume, Suspend and
+	// Approve are refused, including exact historical decision retries. Pending approval metadata
+	// grants no permission.
+	//
+	// Until ownership and cleanup land (#88), OK + PENDING acknowledges durable intent only. No
+	// Runtime.Stop, actor/pin release, physical snapshot GC or TERMINATED transition is attempted
+	// or promised. Execution and compute reporting stay independent. The retained journal
+	// is audit evidence, not a complete or authoritative cleanup-target inventory; the allocation
+	// ownership and cleanup-target schema belong to #88, not an inferred default harness or owner.
+	// Repeated PENDING deletion returns the identical Session: no timestamp, update_time, journal,
+	// fence or compute-projection changes. Clients must inspect deletion_state, not infer reclamation
+	// from an OK status.
+	//
+	// Empty uid is INVALID_ARGUMENT; an unknown nonempty uid is NOT_FOUND without creating a row.
+	// Overlap with a mutation in the same Registry/host is ABORTED before mutation, without canceling
+	// the holder; retry after it finishes. Storage faults are INTERNAL, cancellation/deadline retain
+	// CANCELLED/DEADLINE_EXCEEDED. An error or lost reply after intent commits cannot undo the hidden
+	// PENDING tombstone or erase its audit evidence: use GetSession or retry to learn the outcome.
+	//
+	// Admission serialization is local to one Registry/host. Durable fences block subsequent writes
+	// from this build's writers; already-open older binaries do not enforce tombstones. A separate
+	// host can provision compute before its first fence; cross-host exclusion of compute effects is
+	// not guaranteed. Operators still need runtime-side resource reconciliation.
 	DeleteSession(context.Context, *DeleteSessionRequest) (*Session, error)
 	// Exec runs one execution/turn. The live stream carries committed LogRecords plus
 	// ephemeral Deltas; Replay re-delivers committed records only (read-only).
 	Exec(*ExecRequest, grpc.ServerStreamingServer[ExecUpdate]) error
+	// Raw read-only audit: remains available for tombstoned UIDs, including LIFECYCLE_DELETE records.
+	// Unlike controller replay, this does not reconstruct or run the harness.
 	Replay(*ReplayRequest, grpc.ServerStreamingServer[LogRecord]) error
+	// Implemented durable approval decisions for STATELESS_REPLAY executions.
+	// OK commits only a decision; the caller must Resume to continue. An exact retry of the tuple,
+	// approved value, reason and identity returns the existing decision, even after resolution.
+	// A changed decision/reason/identity for that request is FAILED_PRECONDITION, never an overwrite.
+	// INVALID_ARGUMENT: missing session/execution/tool-call tuple, non-positive request_seq, or absent
+	// approved. NOT_FOUND: unknown session. FAILED_PRECONDITION: stale, inherited, or wrong request
+	// tuple, changed decision, or invalid recorded approval evidence. The gate cannot be created
+	// for a non-stateless execution; Approve does not Describe or resolve a harness.
+	// ABORTED: local contention, append-CAS conflict or superseded fence; retry
+	// after reading the session. Identity is provenance only; this method provides no authorization,
+	// policy hook, expiry, implicit Resume, or Cancel behavior.
+	Approve(context.Context, *ApproveRequest) (*ApproveResponse, error)
 	// In-flight control: cancel the running execution. Not implemented: the server returns
 	// UNIMPLEMENTED.
 	Cancel(context.Context, *CancelRequest) (*Session, error)
 	// Compute-layer durability. There is no warm Pause: no Runtime backend implements a
 	// node-local warm checkpoint, so a session goes straight from live to a cold snapshot.
+	// Suspend routes an owned unreceipted approval to its recorded harness; inherited approvals
+	// and ordinary sessions use their stored default. An unserved recorded name is
+	// FAILED_PRECONDITION, with no fallback.
 	Suspend(context.Context, *SuspendRequest) (*Session, error)
+	// A recorded STATELESS_REPLAY override of a stored REQUIRES_MEMORY_SNAPSHOT harness is
+	// FAILED_PRECONDITION before compute changes or journal repair, as for Exec admission.
+	// Otherwise an unresolved owned approval returns its current paused Session without runtime IO.
+	// A call-only cut repairs the request; neither outcome proves cold compute. After a decision,
+	// recovery uses the recorded invocation and SnapshotRef. It may park at another gate (without
+	// RESUME), or finish and commit RESUME. A missing executor is FAILED_PRECONDITION and leaves
+	// the decision recoverable. Approved executor failures are durable EXECUTOR_ERROR receipts,
+	// available to the harness for continuation, not transport failures. Snapshots and unresolved
+	// requests are retained indefinitely; there is no approval expiry or automatic decision.
 	Resume(context.Context, *ResumeRequest) (*Session, error)
 	// The differentiator: branch a session at a sequence into one or more children. Forking a
 	// REQUIRES_MEMORY_SNAPSHOT harness first checkpoints the parent (it suspends, and a SUSPEND event
@@ -241,6 +366,9 @@ func (UnimplementedSessionsServer) Exec(*ExecRequest, grpc.ServerStreamingServer
 }
 func (UnimplementedSessionsServer) Replay(*ReplayRequest, grpc.ServerStreamingServer[LogRecord]) error {
 	return status.Errorf(codes.Unimplemented, "method Replay not implemented")
+}
+func (UnimplementedSessionsServer) Approve(context.Context, *ApproveRequest) (*ApproveResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Approve not implemented")
 }
 func (UnimplementedSessionsServer) Cancel(context.Context, *CancelRequest) (*Session, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Cancel not implemented")
@@ -369,6 +497,24 @@ func _Sessions_Replay_Handler(srv interface{}, stream grpc.ServerStream) error {
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Sessions_ReplayServer = grpc.ServerStreamingServer[LogRecord]
 
+func _Sessions_Approve_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ApproveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SessionsServer).Approve(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Sessions_Approve_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SessionsServer).Approve(ctx, req.(*ApproveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Sessions_Cancel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CancelRequest)
 	if err := dec(in); err != nil {
@@ -463,6 +609,10 @@ var Sessions_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteSession",
 			Handler:    _Sessions_DeleteSession_Handler,
+		},
+		{
+			MethodName: "Approve",
+			Handler:    _Sessions_Approve_Handler,
 		},
 		{
 			MethodName: "Cancel",

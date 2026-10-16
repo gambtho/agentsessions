@@ -9,7 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aramase/agentsessions/api"
+	"github.com/agent-primitives/sessions/api"
+	"github.com/agent-primitives/sessions/eventlog"
 )
 
 // ErrSessionNotFound is returned for a session UID with no metadata row. It is distinct from an
@@ -51,12 +52,18 @@ type SessionMeta struct {
 	Identity    string
 }
 
-// SessionInfo is the stored metadata plus the two fields the store derives: the log cursor, and the
-// compute state projected from the session's lifecycle events.
+// SessionInfo captures metadata, cursor and append-transaction projections in one query.
+// PendingApproval is an audit value snapshot, not command authority or a mutable cache.
+// Deletion timestamps are absent (zero time) while ACTIVE.
 type SessionInfo struct {
 	SessionMeta
-	LastSeq      int64
-	ComputeState api.ComputeState
+	LastSeq             int64
+	ComputeState        api.ComputeState
+	DeletionState       api.DeletionState
+	DeletionRequestedAt time.Time
+	DeletionCompletedAt time.Time
+	DeletionSeq         int64 // DELETE anchor; its predecessor is the pre-intent audit head
+	PendingApproval     api.ApprovalRef
 }
 
 // ListOptions bounds one page of ListSessions.
@@ -75,9 +82,10 @@ type SessionPage struct {
 // eventComputeState maps a committed event to the compute state it implies, reporting false for
 // events that say nothing about the incarnation.
 //
-// A non-lifecycle event is evidence that compute was running: only a live incarnation produces a
-// turn's input and output records. This is load-bearing rather than incidental. Placer.Exec appends
-// no lifecycle marker of its own — RESUME is written only by Placer.Resume (placement.go:304) — so
+// Except for host-only approval request/decision writes, a non-lifecycle event is evidence that
+// compute was running: a live incarnation produces a turn's input and output records. Host repair
+// and decision writes may happen while compute is cold. This is load-bearing rather than incidental.
+// Placer.Exec appends no lifecycle marker of its own — RESUME is written only by Placer.Resume — so
 // a session that has only ever been Exec'd, which is every session before its first suspend, would
 // otherwise sit at NONE forever and never look live to a caller.
 //
@@ -87,6 +95,9 @@ type SessionPage struct {
 // truthful state: a child begins from its parent's fork-point snapshot with no compute of its own,
 // and is placed on its first Exec.
 func eventComputeState(ev api.Event) (api.ComputeState, bool) {
+	if ev.Kind == api.EventApprovalRequest || ev.Kind == api.EventApprovalResult {
+		return api.ComputeNone, false
+	}
 	if ev.Kind != api.EventLifecycle {
 		return api.ComputeLive, true
 	}
@@ -105,14 +116,21 @@ func eventComputeState(ev api.Event) (api.ComputeState, bool) {
 
 // PutSession writes a session's metadata, creating the row if the session is new.
 //
-// It deliberately preserves two fields it does not own: `fence` belongs to the incarnation
-// sequence and `compute_state` to the lifecycle projection, so re-registering an existing session
-// updates its metadata without rewinding its identity. This is what lets Fork write child metadata
-// around a controller.Fork that has already fenced and populated the child log.
+// It preserves the incarnation fence and all append-owned projections, so re-registering
+// an active session updates its metadata without rewinding its identity or reporting state.
+// This lets Fork write child metadata around a controller.Fork that already populated the log.
 //
 // `created_at` follows the caller: an explicit CreatedAt is honored, and a zero one means "now on
 // insert, leave alone on update", so a later re-registration does not restamp a session as new.
-func (s *Store) PutSession(m SessionMeta) error {
+func (s *Store) PutSession(m SessionMeta) error { return s.putSession(s.db, m) }
+
+// execer is the part of *sql.DB and *sql.Tx that putSession needs, so the same upsert runs alone
+// or inside a transaction that first checks the session's harness.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func (s *Store) putSession(db execer, m SessionMeta) error {
 	if m.UID == "" {
 		return errors.New("sqlitelog: session metadata requires a uid")
 	}
@@ -128,7 +146,7 @@ func (s *Store) PutSession(m SessionMeta) error {
 	if !explicitCreated {
 		created = now
 	}
-	_, err := s.db.Exec(
+	result, err := db.Exec(
 		`INSERT INTO sessions(session, fence, project, name, harness, model,
 		                      parent_uid, fork_seq, compute_state, created_at, updated_at,
 		                      labels, annotations, origin, identity)
@@ -146,7 +164,8 @@ func (s *Store) PutSession(m SessionMeta) error {
 		   identity    = excluded.identity,
 		   created_at  = CASE WHEN ? OR sessions.created_at = 0
 		                     THEN excluded.created_at ELSE sessions.created_at END,
-		   updated_at  = excluded.updated_at`,
+		   updated_at  = excluded.updated_at
+		 WHERE sessions.deletion_state = 'ACTIVE'`,
 		m.UID, m.Project, m.Name, m.Harness, m.Model,
 		m.ParentUID, m.ForkSeq, string(api.ComputeNone), created.UnixNano(), now.UnixNano(),
 		m.Labels, m.Annotations, m.Origin, m.Identity,
@@ -155,24 +174,42 @@ func (s *Store) PutSession(m SessionMeta) error {
 	if err != nil {
 		return fmt.Errorf("sqlitelog: put session %q: %w", m.UID, err)
 	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("sqlitelog: put session %q: %w", m.UID, err)
+	}
+	if changed == 0 {
+		return fmt.Errorf("sqlitelog: put session %q: %w", m.UID, eventlog.ErrDeleted)
+	}
 	return nil
 }
 
 // sessionSelect is shared by SessionInfo and ListSessions so a single row shape backs both. The
-// LEFT JOIN keeps sessions with no events, which is exactly the population a listing built from the
-// event table alone would drop.
+// LEFT JOIN keeps sessions without executions. The indexed event head remains current even
+// when an older writer skips the projection; a lagging projection cannot report an approval.
+// No rendering query reads event blobs.
 const sessionSelect = `
 SELECT s.session, s.project, s.name, s.harness, s.model, s.parent_uid, s.fork_seq,
        s.compute_state, s.created_at, s.updated_at,
        s.labels, s.annotations, s.origin, s.identity,
-       COALESCE(MAX(e.seq), 0)
-FROM sessions s LEFT JOIN events e ON e.session = s.session`
+       s.deletion_state, s.deletion_requested_at, s.deletion_completed_at, s.deletion_seq,
+       (SELECT COALESCE(MAX(seq), 0) FROM events WHERE session = s.session),
+       CASE WHEN s.last_seq = (SELECT COALESCE(MAX(seq), 0) FROM events WHERE session = s.session)
+                 AND s.approval_corrupt = 0 AND s.invalid_approval_executions = 0 AND a.execution_id != ''
+                 AND a.call_seq > s.reporting_fork_seq AND a.invalid = 0
+                 AND a.completed = 0 AND a.receipt = 0 AND a.request_seq > 0 AND a.decision_seq = 0
+                 AND (a.has_start = 0 OR (a.expected_inputs >= 0
+                      AND a.input_records = a.input_messages AND a.input_records = a.expected_inputs))
+            THEN a.request_seq ELSE 0 END,
+       COALESCE(a.execution_id, ''), COALESCE(a.call_id, '')
+FROM sessions s LEFT JOIN approval_executions a
+  ON a.session = s.session AND a.execution_id = s.latest_execution`
 
 // SessionInfo returns one session's metadata together with its derived log cursor and compute
 // state.
 func (s *Store) SessionInfo(uid string) (SessionInfo, error) {
 	row := s.db.QueryRow(sessionSelect+`
-		WHERE s.session = ? GROUP BY s.session`, uid)
+		WHERE s.session = ?`, uid)
 	info, err := scanSession(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SessionInfo{}, fmt.Errorf("%w: %s", ErrSessionNotFound, uid)
@@ -183,7 +220,8 @@ func (s *Store) SessionInfo(uid string) (SessionInfo, error) {
 	return info, nil
 }
 
-// ListSessions enumerates one project's sessions, newest first.
+// ListSessions enumerates one project's ACTIVE sessions, newest first. Tombstones are filtered
+// before keyset paging and LIMIT so hidden rows cannot consume page slots.
 //
 // Paging is keyset, not offset: the cursor carries the last row's (created_at, uid) and the next
 // page resumes strictly after it. Sessions are created while a client pages through them, and an
@@ -206,7 +244,7 @@ func (s *Store) ListSessions(opts ListOptions) (SessionPage, error) {
 	}
 
 	args := []any{project}
-	where := `WHERE s.project = ?`
+	where := `WHERE s.project = ? AND s.deletion_state = 'ACTIVE'`
 	if opts.PageToken != "" {
 		createdAt, uid, err := decodeCursor(opts.PageToken)
 		if err != nil {
@@ -220,7 +258,6 @@ func (s *Store) ListSessions(opts ListOptions) (SessionPage, error) {
 
 	rows, err := s.db.Query(sessionSelect+`
 		`+where+`
-		GROUP BY s.session
 		ORDER BY s.created_at DESC, s.session ASC
 		LIMIT ?`, args...)
 	if err != nil {
@@ -256,17 +293,31 @@ func scanSession(row scanner) (SessionInfo, error) {
 		info                 SessionInfo
 		state                string
 		createdAt, updatedAt int64
+		deletionState        string
+		requested, completed int64
 	)
 	if err := row.Scan(
 		&info.UID, &info.Project, &info.Name, &info.Harness, &info.Model,
 		&info.ParentUID, &info.ForkSeq, &state, &createdAt, &updatedAt,
 		&info.Labels, &info.Annotations, &info.Origin, &info.Identity,
-		&info.LastSeq,
+		&deletionState, &requested, &completed, &info.DeletionSeq,
+		&info.LastSeq, &info.PendingApproval.RequestSeq,
+		&info.PendingApproval.ExecutionID, &info.PendingApproval.ToolCallID,
 	); err != nil {
 		return SessionInfo{}, err
 	}
+	if info.PendingApproval.RequestSeq == 0 {
+		info.PendingApproval = api.ApprovalRef{}
+	}
 	info.CreatedAt = time.Unix(0, createdAt)
 	info.UpdatedAt = time.Unix(0, updatedAt)
+	info.DeletionState = api.DeletionState(deletionState)
+	if requested != 0 {
+		info.DeletionRequestedAt = time.Unix(0, requested)
+	}
+	if completed != 0 {
+		info.DeletionCompletedAt = time.Unix(0, completed)
+	}
 	info.ComputeState = api.ComputeState(state)
 	if state == "" {
 		info.ComputeState = api.ComputeNone

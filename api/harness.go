@@ -21,6 +21,7 @@ type Harness interface {
 // Descriptor is a harness's static contract.
 type Descriptor struct {
 	ID           string
+	Version      string   // stable author-owned replay version; empty is supported as unknown
 	Models       []string // model-agnostic: supported/required model ids
 	Tools        []ToolSpec
 	Capabilities Capabilities
@@ -62,12 +63,17 @@ type Capabilities struct {
 
 // Start is the per-execution invocation the host sends to the harness.
 type Start struct {
-	ExecutionID   string    // host-assigned identity of this Run; shared by its events and deltas
-	Config        []byte    // opaque per-execution config
+	// ExecutionID identifies this Run on the wire. Modern runs share it with journal events;
+	// legacy runs use a session-scoped legacy- compatibility token that is never journaled.
+	ExecutionID string
+	// SessionUID carries the ControllerFrame session envelope for tool/approval correlation.
+	// Model-only callers that do not use that envelope may leave it empty.
+	SessionUID    string    `json:",omitempty"`
+	Config        []byte    // opaque per-execution config; journaled verbatim and restored on replay/resume
 	History       []Event   // replay context; empty if the sandbox was memory-restored
-	Inputs        []Message // new input(s); empty = resume/re-drive an interrupted execution
+	Inputs        []Message // invocation inputs; originals are restored on controller replay/resume
 	Identity      IdentityContext
-	ResumeFromSeq int64
+	ResumeFromSeq int64 // opaque harness cursor, journaled with Config; distinct from the append CAS cursor
 }
 
 // IdentityContext carries the session principal and, optionally, a minter so the
@@ -106,19 +112,56 @@ type EventSink interface {
 	ToolCall(ctx context.Context, tc ToolCall) (ToolResult, error)
 	// Report records the result of a tool the harness executed itself.
 	Report(ctx context.Context, tr ToolResult) error
-	// Usage records token/cost accounting.
+	// Usage records token/cost accounting. To record a model call's usage, pass the
+	// ModelResponse.Usage that Model returned: Replay and Resume serve the recorded usage with
+	// the recorded completion, so the same call matches the record.
 	Usage(ctx context.Context, u Usage) error
 }
 
 // ModelRequest is a model call: the message context + model selection.
+//
+// The controller hashes the JSON encoding of ModelRequest for the I0 check, so fields added after
+// the first three carry `json:",omitempty"`: a request that does not use them hashes exactly as it
+// did before they existed, and logs recorded earlier keep replaying.
 type ModelRequest struct {
 	Model    string
 	Messages []Message // context (history + new input) sent to the model
 	Params   map[string]string
+	// Tools are the definitions offered to the model on this call. Order is significant.
+	Tools []ToolDefinition `json:",omitempty"`
+	// ToolChoice constrains whether and which tool the model calls. Nil means the provider default.
+	ToolChoice *ToolChoice `json:",omitempty"`
 }
 
-// ModelResponse is the model's completion: an assistant message (which may carry text and
-// opaque reasoning parts) plus usage.
+// ToolDefinition is a tool offered to a model on one call, aligned with an MCP Tool. ToolSpec
+// declares a tool and its default mediation to the host; ToolDefinition is what the model sees.
+type ToolDefinition struct {
+	Name        string
+	Description string
+	InputSchema map[string]any // JSON Schema object; JSON-shaped values only (see package wire)
+}
+
+// ToolChoiceMode constrains whether the model calls a tool.
+type ToolChoiceMode string
+
+const (
+	// ToolChoiceAuto: the model decides whether to call a tool.
+	ToolChoiceAuto ToolChoiceMode = "AUTO"
+	// ToolChoiceNone: the model must not call a tool.
+	ToolChoiceNone ToolChoiceMode = "NONE"
+	// ToolChoiceRequired: the model must call at least one tool.
+	ToolChoiceRequired ToolChoiceMode = "REQUIRED"
+)
+
+// ToolChoice constrains whether and which tool the model calls. An empty Mode is the provider
+// default. Name forces one specific tool and is meaningful only with ToolChoiceRequired.
+type ToolChoice struct {
+	Mode ToolChoiceMode
+	Name string
+}
+
+// ModelResponse is the model's completion: an assistant message (which may carry text, opaque
+// reasoning, and tool call parts) plus usage.
 type ModelResponse struct {
 	Message Message
 	Usage   Usage

@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aramase/agentsessions/api"
-	"github.com/aramase/agentsessions/controller"
-	"github.com/aramase/agentsessions/harness/echoagent"
-	"github.com/aramase/agentsessions/placement"
-	"github.com/aramase/agentsessions/sqlitelog"
+	"github.com/agent-primitives/sessions/api"
+	"github.com/agent-primitives/sessions/controller"
+	"github.com/agent-primitives/sessions/harness/echoagent"
+	"github.com/agent-primitives/sessions/placement"
+	"github.com/agent-primitives/sessions/sqlitelog"
 )
 
 // counterDescriptor is the in-RAM counter: state the journal cannot reconstruct, so it declares
@@ -31,7 +31,7 @@ func TestMemorySnapshotSuspendResume(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 
-	backend := f.backend(counterTemplate, counterDescriptor)
+	backend := f.backend(t, counterTemplateSpec, counterDescriptor)
 	if !controller.CanPlace(counterDescriptor.Capabilities, backend.Capabilities()) {
 		t.Fatal("substrate refused a REQUIRES_MEMORY_SNAPSHOT harness (CanPlace=false)")
 	}
@@ -48,19 +48,16 @@ func TestMemorySnapshotSuspendResume(t *testing.T) {
 	}
 	t.Logf("drove %d turns; count=%s lives in guest RAM", turns, lastOutput(t, log))
 
-	// Suspend through the Runtime SPI rather than Placer.Suspend, which also Stops (deletes) the
-	// actor — correct for a stateless session, fatal for one whose RAM we intend to restore.
-	ref, err := backend.Snapshot(ctx, api.Incarnation{ID: session}, api.SnapshotExternal)
+	ref, err := p.Suspend(ctx, log, session)
 	if err != nil {
-		t.Fatalf("suspend (snapshot): %v", err)
-	}
-	if err := recordSuspend(log, ref); err != nil {
-		t.Fatalf("record SUSPEND event: %v", err)
+		t.Fatalf("session suspend: %v", err)
 	}
 	t.Logf("suspended: memory snapshot at %s", ref.ExternalURI)
 
-	// One more turn. The actor is SUSPENDED, so placing it restores the snapshot instead of booting
-	// over it, and the counter continues where its RAM left off.
+	if err := p.Resume(ctx, log, session); err != nil {
+		t.Fatalf("session resume: %v", err)
+	}
+	// One more turn after explicit restore: the counter must continue where its RAM left off.
 	driveTurns(ctx, t, p, log, session, 1)
 
 	got := lastOutput(t, log)
@@ -88,22 +85,4 @@ func driveTurns(ctx context.Context, t *testing.T, p *placement.Placer, log *sql
 			t.Fatalf("drive turn %d of %d: %v", i+1, n, err)
 		}
 	}
-}
-
-// recordSuspend appends a SUSPEND lifecycle event carrying the snapshot ref, so the hash chain — and
-// therefore provenance — spans the suspend/restore boundary.
-func recordSuspend(log *sqlitelog.Log, ref api.SnapshotRef) error {
-	head, err := log.Head()
-	if err != nil {
-		return err
-	}
-	fence, err := log.NewFence()
-	if err != nil {
-		return err
-	}
-	_, err = log.Append(head, fence, api.Event{
-		Kind:      api.EventLifecycle,
-		Lifecycle: &api.Lifecycle{Kind: api.LifecycleSuspend, Snapshot: &ref},
-	})
-	return err
 }

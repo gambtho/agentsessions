@@ -19,9 +19,12 @@ Pick one. `agentctl` is the client CLI; `agentsessionsd` is the standalone serve
 
 ```bash
 # Go toolchain
-go install github.com/aramase/agentsessions/cmd/agentctl@latest
-go install github.com/aramase/agentsessions/cmd/agentsessionsd@latest
+go install github.com/aramase/agentsessions/cmd/agentctl@v0.1.2
+go install github.com/aramase/agentsessions/cmd/agentsessionsd@v0.1.2
 ```
+
+v0.1.x is published under the module path `github.com/aramase/agentsessions`; the
+`github.com/agent-primitives/sessions` path applies from v0.2.0.
 
 ```bash
 # Release archive: both binaries, for linux/darwin on amd64/arm64.
@@ -29,7 +32,7 @@ go install github.com/aramase/agentsessions/cmd/agentsessionsd@latest
 VERSION=v0.1.2
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
-curl -sSL "https://github.com/aramase/agentsessions/releases/download/${VERSION}/agentsessions_${VERSION#v}_${OS}_${ARCH}.tar.gz" \
+curl -sSL "https://github.com/agent-primitives/sessions/releases/download/${VERSION}/agentsessions_${VERSION#v}_${OS}_${ARCH}.tar.gz" \
   | tar xz agentctl agentsessionsd
 ```
 
@@ -39,11 +42,14 @@ Container images are published for the server and the harness node:
 docker run --rm ghcr.io/aramase/agentsessions/agentsessionsd:v0.1.2 --help
 ```
 
+v0.1.x images stay at `ghcr.io/aramase/agentsessions`; releases from v0.2.0 publish to
+`ghcr.io/agent-primitives/sessions`.
+
 To build from a checkout instead:
 
 ```bash
-git clone https://github.com/aramase/agentsessions
-cd agentsessions
+git clone https://github.com/agent-primitives/sessions
+cd sessions
 go build -o agentctl ./cmd/agentctl
 go build -o agentsessionsd ./cmd/agentsessionsd
 ```
@@ -236,8 +242,8 @@ closed.
 This one is a script in the repository rather than a shipped binary, so it needs a checkout:
 
 ```bash
-git clone https://github.com/aramase/agentsessions
-cd agentsessions
+git clone https://github.com/agent-primitives/sessions
+cd sessions
 ./hack/verify_chain.sh
 ```
 
@@ -273,8 +279,12 @@ agentctl exec --server 127.0.0.1:8080 --session "$CHAT" --input "name three prim
 The server logs which harnesses it registered at startup (`harnesses="[chat echo]"`).
 
 `--model-base-url` points at any endpoint that accepts the chat-completions request body: a
-gateway, a self-hosted server, or a proxy fronting another provider. Endpoints that differ only in
-the envelope are reached with two more flags, rather than by rebuilding the server:
+gateway, a self-hosted server, or a proxy fronting another provider. With a key set, the server
+refuses to start on a plain `http` URL unless its host is a loopback address, `localhost`, or a
+name ending in `.svc` or `.svc.cluster.local`. That last allowance is a trusted-network exception:
+it checks the name, not where the traffic goes, so the key and prompts still cross the cluster
+network unencrypted. Use `https` unless you trust that network. Endpoints that differ only in the
+envelope are reached with two more flags, rather than by rebuilding the server:
 
 ```bash
 agentsessionsd \
@@ -357,6 +367,38 @@ next, err := c.Exec(ctx, client.ExecOptions{
 
 `ListSessions` walks pagination for you, `Replay` and `Fork` return slices, and `c.Sessions()`
 returns the generated stub for anything the SDK does not model.
+
+## 10. Permanently tombstone a session (no cleanup)
+
+Use a source build containing DeleteSession; the v0.1.2 archive above predates it. This is
+irreversible for the UID. Do it only after completing any desired execution/fork/resume examples.
+
+```bash
+agentctl delete --journal /tmp/qs.db --session "$SID"
+agentctl get    --journal /tmp/qs.db --session "$SID"
+agentctl replay --journal /tmp/qs.db --session "$SID"
+agentctl list   --journal /tmp/qs.db --project default
+```
+
+Delete/Get report `deletion=PENDING` and the committed RFC3339 request time. PENDING means durable
+intent only until #88 supplies ownership and cleanup: actors, snapshots and fork-child pins remain
+retained indefinitely. No Stop or reclamation is attempted. List hides the UID, but Get and raw
+Replay retain metadata and the full audit chain, including DELETE. Retry returns the original
+timestamps; use Get/retry after a lost response. Exec, historical Fork, Resume, Suspend and Approve
+(including exact retries) now return `FAILED_PRECONDITION`. Existing children remain usable. There
+is no cascade, UID reuse or data erasure; UID, metadata and journal remain forever. See [deletion
+and admission limits](concepts.md#permanent-soft-deletion) before sharing a journal between hosts or
+upgrading its schema.
+
+The SDK returns the raw Session; inspect its deletion state rather than interpreting OK as cleanup:
+
+```go
+deleted, err := c.DeleteSession(ctx, turn.Session.GetMetadata().GetUid())
+if err != nil {
+    return err
+}
+fmt.Println(deleted.GetDeletionState(), deleted.GetDeletionRequestedTime())
+```
 
 ## Where next
 

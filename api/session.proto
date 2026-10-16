@@ -6,9 +6,10 @@ syntax = "proto3";
 
 package agentsessions.v1;
 
-option go_package = "github.com/aramase/agentsessions/api/genpb;agentsessionsv1";
+option go_package = "github.com/agent-primitives/sessions/api/genpb;agentsessionsv1";
 
 import "common.proto";
+import "google/protobuf/timestamp.proto";
 
 // ExecState is the execution/turn axis; ComputeState is the incarnation axis. The two are
 // modeled explicitly (§6 of the replay contract) and reported independently: there is no
@@ -30,6 +31,16 @@ enum ComputeState {
   COMPUTE_WARM = 3; // paused: resident, worker held
   COMPUTE_COLD = 4; // suspended: snapshot in storage, worker freed
   COMPUTE_TERMINATED = 5;
+}
+
+// DeletionState is independent of the execution and compute axes. PENDING is a permanent
+// UID tombstone and durable deletion intent, not confirmation that resources were reclaimed.
+// Until ownership and cleanup are implemented (#88), deletion emits PENDING only: actors,
+// fork-child pins and snapshots remain retained, and no Runtime.Stop is attempted.
+enum DeletionState {
+  DELETION_STATE_UNSPECIFIED = 0;
+  DELETION_ACTIVE = 1;
+  DELETION_PENDING = 2;
 }
 
 // SnapshotRef is the session-STATUS ref carried in ComputeRef below. Its shape mirrors the canonical
@@ -71,8 +82,22 @@ message Session {
   string model = 3; // model-agnostic id
 
   reserved 4; // retired: a flattened lifecycle phase, replaced by the two axes below
-  ExecState exec_state = 13;       // execution/turn axis
+  // Every Session reply uses the same append-transaction projection at last_seq: no events
+  // before deletion reports EXEC_PENDING; a valid owned unanswered host approval request in the
+  // latest first-seen execution reports EXEC_AWAITING; other histories retain EXEC_COMPLETED.
+  // DELETE preserves this execution axis but withholds actionable pending_approval.
+  // COMPLETED is a compatibility fallback, not proof of END, a receipt, or admission.
+  ExecState exec_state = 13;
   ComputeState compute_state = 14; // incarnation axis
+  // Set for a valid unanswered host-owned APPROVAL_REQUEST in the latest first-seen execution
+  // at last_seq on an ACTIVE session. Requests/decisions match execution_id, tool_call_id and
+  // request_seq. Calls whose TOOL_CALL precedes the child's latest FORK are excluded. Unset when
+  // deleted, no request is reportable, approval-bearing evidence is invalid, or the projection
+  // lags last_seq.
+  ApprovalRef pending_approval = 15;
+  DeletionState deletion_state = 16; // independent permanent-deletion axis
+  // Absent for ACTIVE; set once when the host commits the durable PENDING tombstone.
+  google.protobuf.Timestamp deletion_requested_time = 17;
   int64 last_seq = 5;              // event-log cursor
 
   string parent_uid = 6; // fork lineage
@@ -92,8 +117,9 @@ message Session {
 message CreateSessionRequest { Session session = 1; }
 message GetSessionRequest { string uid = 1; }
 
-// ListSessions enumerates sessions from the durable store, so it returns sessions that have no
-// events and no live incarnation yet. Paging is keyset over (create_time DESC, uid ASC), which is
+// ListSessions enumerates ACTIVE sessions from the durable store, including sessions that have
+// no events and no live incarnation yet. Permanently tombstoned UIDs are hidden before pagination.
+// Paging is keyset over (create_time DESC, uid ASC), which is
 // stable when a session is created mid-pagination; an offset would skip or repeat rows.
 message ListSessionsRequest {
   string project = 1; // tenant / namespace; exact-match filter, not a prefix or wildcard
@@ -116,15 +142,31 @@ message ExecRequest {
   // or model still calls CreateSession; this exists so the common case is one call rather than
   // three (create, read the cursor, exec).
   string session = 1;
-  // Input messages for this turn. Empty = resume/re-drive the last non-terminal
-  // execution with no new input (recovery after a crash/interruption).
+  // Input messages for a new turn. While this session owns an unreceipted approval call,
+  // new inputs are FAILED_PRECONDITION, including after a decision but before its receipt.
+  // For an existing current approval-bearing, non-terminal execution, empty inputs recover
+  // that recorded invocation via Resume, without a new EXECUTION_START. Recorded inputs,
+  // config, harness, version and resume cursor win over this request's invocation overrides.
+  // Pending requests return a paused Session without runtime IO; a call-only crash cut repairs
+  // the request first. expected_last_seq is checked under the session guard before runtime IO
+  // or repair, and deadline_unix bounds recovery. Other inputless Exec calls retain their
+  // ordinary new-turn behavior; use Resume for general interrupted-turn recovery.
   repeated Message inputs = 2;
   // Cursor handed to the harness as Start.resume_from_seq. The host does not interpret it; only a
   // harness knows what resuming from a sequence means for its own state. To re-read committed
-  // records after a disconnect, use Replay, which is the read path for exactly that.
+  // records after a disconnect, use Replay, which is the read path for exactly that. Non-zero cursors
+  // are journaled in EXECUTION_START and restored during controller replay/interrupted resume.
   int64 resume_from_seq = 3;
-  string harness = 4;        // empty = session default
-  bytes config = 5; // opaque per-execution config, passed through to Start.config
+  // Empty = the session's harness. A different harness runs this turn only, unless either one is
+  // a registered harness (see HarnessRegistry): then the session is pinned and the call is
+  // FAILED_PRECONDITION. A stored REQUIRES_MEMORY_SNAPSHOT harness also refuses a
+  // STATELESS_REPLAY override before any fence or journal write: parking only the override
+  // cannot checkpoint the stored harness's live memory.
+  string harness = 4;
+  // Opaque per-execution config, passed through to Start.config. Non-empty bytes are journaled
+  // verbatim in EXECUTION_START before the harness runs, and restored for controller replay/resume.
+  // Do not put credentials here: config is durable journal content exposed by Replay.
+  bytes config = 5;
   // Single-writer CAS: the host commits this execution's first event only if the log head equals
   // expected_last_seq. A mismatch is ABORTED, meaning another writer advanced the log.
   //
@@ -143,20 +185,65 @@ message ReplayRequest {
   int64 to_seq = 3; // 0 = to head
 }
 
+// Approve supplies an explicit decision for one unresolved request in a stateless execution.
+// All tuple fields are required and request_seq must be positive. A decision resolves only a
+// request owned by this session, not an inherited parent request. Identity is recorded on the
+// decision's Event.actor as provenance, never checked as authorization. No policy hook, expiry,
+// automatic decision, or Cancel semantics are implied by this API.
+message ApproveRequest {
+  string session = 1;
+  string execution_id = 2;
+  string tool_call_id = 3;
+  int64 request_seq = 4;
+  // Required presence: false means deny; absent is INVALID_ARGUMENT. Unlike this request, the
+  // journal's ApprovalResult.approved remains a non-optional bool for compatibility.
+  optional bool approved = 5;
+  string reason = 6;
+  IdentityRef identity = 7;
+}
+
+// A successful Approve commits the decision only, never resumes compute or executes a tool.
+// The caller invokes Resume separately. decision is the committed APPROVAL_RESULT LogRecord;
+// an exact retry returns that same record, not a new decision or receipt.
+message ApproveResponse {
+  Session session = 1;
+  LogRecord decision = 2;
+}
+
 message SuspendRequest { string session = 1; }
 
 message ResumeRequest {
   string session = 1;
-  bool boot = 2; // true = cold-boot + replay instead of snapshot restore
+  // Ignored. The service never reads it; the Runtime backend decides how a resumed session comes
+  // back. On substrate that is the actor's own snapshot, else the template's golden snapshot, else a
+  // cold boot, and substrate has no per-resume boot flag to forward it to. The field stays so
+  // existing clients keep encoding; do not reuse its number.
+  bool boot = 2 [deprecated = true];
+  // Optional recovery precondition: ABORTED with expected/head values on a mismatch.
+  // Checked under the session guard before inspection, after an early fence before restore
+  // or approval repair, and after a restored turn's regular writer fence before Run. A late
+  // mismatch may already have restored compute, but does not run the harness or append records.
+  // These checks catch other hosts' writes committed before each acquired fence. Taking a fence
+  // supersedes older writers even on refusal: their remaining writes fail with ErrFenced, leaving any
+  // unanswered tool intent eligible for retry on a later Resume. Fencing cannot cancel effects
+  // already in flight, and a later writer can still supersede this operation: this is not an
+  // execution lease or exactly-once tool guarantee. Explicit zero requires an empty journal;
+  // absent skips this precondition.
+  optional int64 expected_last_seq = 3;
 }
 
+// Children inherit the parent's annotations and origin.
 message ForkRequest {
   string session = 1;
   // 0 = HEAD. A REQUIRES_MEMORY_SNAPSHOT harness forks by cloning a memory snapshot, which captures
   // RAM as of now, so it accepts only HEAD; a historical seq is FAILED_PRECONDITION.
   int64 at_seq = 2;
   int32 count = 3;          // fan-out N children; must be 1..128, else INVALID_ARGUMENT
-  IdentityRef identity = 4; // optional child principal
+  // Unsupported: per-child principals are not enforced. Any supplied identity, including an empty
+  // message, is INVALID_ARGUMENT before placement or mutation. Leave unset to fork.
+  IdentityRef identity = 4;
+  // Applied to every child instead of the parent's labels; never merged or inherited. Unset or
+  // empty gives children an empty label map. The parent's annotations are inherited unchanged.
   map<string, string> labels = 5;
   // Display names for the children, in the order they are returned. Length must be 0 or exactly
   // count, else INVALID_ARGUMENT.
@@ -185,9 +272,12 @@ message ExecUpdate {
     LogRecord record = 1;
     Delta delta = 2;
     // The session this execution runs against, sent as the FIRST frame of every Exec stream. It is
-    // how a caller learns the uid of a session Exec created for it, and it reports the cursor the
-    // turn started from, so a caller that wants the strict CAS on its next turn has the value
-    // without a separate GetSession.
+    // how a caller learns the uid of a session Exec created for it, and it reports the cursor
+    // the turn started from. A successful approval park or approval-bearing no-input recovery
+    // also sends a FINAL current Session before OK stream closure. That frame carries the latest
+    // cursor and pending approval, when present; use the latest Session and committed record
+    // cursors for the next CAS, not the initial frame alone. A pause is not a terminal END/ERROR,
+    // and a pending query alone is not proof that compute has been made cold.
     //
     // It is sent before the turn runs, so a failed execution still tells the caller which session
     // it was against. A caller therefore sees this frame BEFORE any error, and must read the
@@ -207,16 +297,62 @@ message Delta {
 
 service Sessions {
   rpc CreateSession(CreateSessionRequest) returns (Session);
+  // GetSession remains available for audit after deletion, including metadata and deletion intent
+  // time.
   rpc GetSession(GetSessionRequest) returns (Session);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
-  // Not implemented: the server returns UNIMPLEMENTED. Declared so the delete path can land
-  // without a breaking change to the service.
+  // DeleteSession commits irreversible soft-deletion intent for a known UID. The host atomically
+  // appends a session-scoped, host-owned LIFECYCLE_DELETE (empty execution_id), advances the writer
+  // fence and marks PENDING. Metadata, the UID and the hash-chained journal are retained forever;
+  // the UID cannot be reused. Children and their copied prefixes are unaffected: no cascade or
+  // data erasure is promised. ListSessions hides the UID; GetSession and raw Sessions.Replay remain
+  // read-only audit access, without reconstructing or running a harness.
+  //
+  // Valid mutation requests against PENDING fail with FAILED_PRECONDITION before routing,
+  // recovery or compute effects: Exec, Fork (including historical at_seq), Resume, Suspend and
+  // Approve are refused, including exact historical decision retries. Pending approval metadata
+  // grants no permission.
+  //
+  // Until ownership and cleanup land (#88), OK + PENDING acknowledges durable intent only. No
+  // Runtime.Stop, actor/pin release, physical snapshot GC or TERMINATED transition is attempted
+  // or promised. Execution and compute reporting stay independent. The retained journal
+  // is audit evidence, not a complete or authoritative cleanup-target inventory; the allocation
+  // ownership and cleanup-target schema belong to #88, not an inferred default harness or owner.
+  // Repeated PENDING deletion returns the identical Session: no timestamp, update_time, journal,
+  // fence or compute-projection changes. Clients must inspect deletion_state, not infer reclamation
+  // from an OK status.
+  //
+  // Empty uid is INVALID_ARGUMENT; an unknown nonempty uid is NOT_FOUND without creating a row.
+  // Overlap with a mutation in the same Registry/host is ABORTED before mutation, without canceling
+  // the holder; retry after it finishes. Storage faults are INTERNAL, cancellation/deadline retain
+  // CANCELLED/DEADLINE_EXCEEDED. An error or lost reply after intent commits cannot undo the hidden
+  // PENDING tombstone or erase its audit evidence: use GetSession or retry to learn the outcome.
+  //
+  // Admission serialization is local to one Registry/host. Durable fences block subsequent writes
+  // from this build's writers; already-open older binaries do not enforce tombstones. A separate
+  // host can provision compute before its first fence; cross-host exclusion of compute effects is
+  // not guaranteed. Operators still need runtime-side resource reconciliation.
   rpc DeleteSession(DeleteSessionRequest) returns (Session);
 
   // Exec runs one execution/turn. The live stream carries committed LogRecords plus
   // ephemeral Deltas; Replay re-delivers committed records only (read-only).
   rpc Exec(ExecRequest) returns (stream ExecUpdate);
+  // Raw read-only audit: remains available for tombstoned UIDs, including LIFECYCLE_DELETE records.
+  // Unlike controller replay, this does not reconstruct or run the harness.
   rpc Replay(ReplayRequest) returns (stream LogRecord);
+
+  // Implemented durable approval decisions for STATELESS_REPLAY executions.
+  // OK commits only a decision; the caller must Resume to continue. An exact retry of the tuple,
+  // approved value, reason and identity returns the existing decision, even after resolution.
+  // A changed decision/reason/identity for that request is FAILED_PRECONDITION, never an overwrite.
+  // INVALID_ARGUMENT: missing session/execution/tool-call tuple, non-positive request_seq, or absent
+  // approved. NOT_FOUND: unknown session. FAILED_PRECONDITION: stale, inherited, or wrong request
+  // tuple, changed decision, or invalid recorded approval evidence. The gate cannot be created
+  // for a non-stateless execution; Approve does not Describe or resolve a harness.
+  // ABORTED: local contention, append-CAS conflict or superseded fence; retry
+  // after reading the session. Identity is provenance only; this method provides no authorization,
+  // policy hook, expiry, implicit Resume, or Cancel behavior.
+  rpc Approve(ApproveRequest) returns (ApproveResponse);
 
   // In-flight control: cancel the running execution. Not implemented: the server returns
   // UNIMPLEMENTED.
@@ -224,7 +360,19 @@ service Sessions {
 
   // Compute-layer durability. There is no warm Pause: no Runtime backend implements a
   // node-local warm checkpoint, so a session goes straight from live to a cold snapshot.
+  // Suspend routes an owned unreceipted approval to its recorded harness; inherited approvals
+  // and ordinary sessions use their stored default. An unserved recorded name is
+  // FAILED_PRECONDITION, with no fallback.
   rpc Suspend(SuspendRequest) returns (Session); // cold, free worker
+  // A recorded STATELESS_REPLAY override of a stored REQUIRES_MEMORY_SNAPSHOT harness is
+  // FAILED_PRECONDITION before compute changes or journal repair, as for Exec admission.
+  // Otherwise an unresolved owned approval returns its current paused Session without runtime IO.
+  // A call-only cut repairs the request; neither outcome proves cold compute. After a decision,
+  // recovery uses the recorded invocation and SnapshotRef. It may park at another gate (without
+  // RESUME), or finish and commit RESUME. A missing executor is FAILED_PRECONDITION and leaves
+  // the decision recoverable. Approved executor failures are durable EXECUTOR_ERROR receipts,
+  // available to the harness for continuation, not transport failures. Snapshots and unresolved
+  // requests are retained indefinitely; there is no approval expiry or automatic decision.
   rpc Resume(ResumeRequest) returns (Session);
 
   // The differentiator: branch a session at a sequence into one or more children. Forking a

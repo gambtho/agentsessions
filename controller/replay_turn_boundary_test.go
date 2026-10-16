@@ -6,9 +6,9 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/aramase/agentsessions/api"
-	"github.com/aramase/agentsessions/controller"
-	"github.com/aramase/agentsessions/sqlitelog"
+	"github.com/agent-primitives/sessions/api"
+	"github.com/agent-primitives/sessions/controller"
+	"github.com/agent-primitives/sessions/sqlitelog"
 )
 
 // historyAwareHarness reconstructs model context from completed prior turns, then appends the
@@ -97,7 +97,7 @@ func TestReplayUsesExecutionIDsForTurnBoundaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstID := recordsBeforeReplay[0].Event.ExecutionID
-	secondID := recordsBeforeReplay[5].Event.ExecutionID
+	secondID := recordsBeforeReplay[6].Event.ExecutionID
 	if firstID == "" || secondID == "" || firstID == secondID {
 		t.Fatalf("execution IDs = %q and %q, want distinct nonempty IDs", firstID, secondID)
 	}
@@ -110,7 +110,7 @@ func TestReplayUsesExecutionIDsForTurnBoundaries(t *testing.T) {
 	}
 	for i, record := range recordsBeforeReplay {
 		want := firstID
-		if i >= 5 {
+		if i >= 6 {
 			want = secondID
 		}
 		if record.Event.ExecutionID != want {
@@ -153,6 +153,7 @@ func TestReplayUsesExecutionIDsForTurnBoundaries(t *testing.T) {
 		t.Fatalf("second turn inputs = %v, want [same]", got)
 	}
 	if got := eventKinds(replayStarts[1].History); !reflect.DeepEqual(got, []api.EventKind{
+		api.EventExecutionStart,
 		api.EventInput,
 		api.EventInput,
 		api.EventModelCall,
@@ -221,10 +222,11 @@ func TestReplayIncludesFailedExecutionInLaterHistory(t *testing.T) {
 		t.Fatalf("replayed executions = %d, want 1 completed execution", len(starts))
 	}
 	if got := eventKinds(starts[0].History); !reflect.DeepEqual(got, []api.EventKind{
+		api.EventExecutionStart,
 		api.EventInput,
 		api.EventError,
 	}) {
-		t.Fatalf("successful execution history = %v, want [INPUT ERROR]", got)
+		t.Fatalf("successful execution history = %v, want [EXECUTION_START INPUT ERROR]", got)
 	}
 	if got := messageTexts(starts[0].Inputs); !reflect.DeepEqual(got, []string{"success"}) {
 		t.Fatalf("successful execution inputs = %v, want [success]", got)
@@ -242,9 +244,14 @@ func TestReplayRejectsMissingExecutionID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Once an ID-bearing execution begins, a later unstamped effect cannot be legacy.
 	if _, err := log.Append(0, fence, api.Event{
-		Kind:    api.EventInput,
-		Message: api.TextMessage("user", "unstamped"),
+		ExecutionID: "modern", Kind: api.EventInput, Message: api.TextMessage("user", "hello"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Append(1, fence, api.Event{
+		Kind: api.EventOutput, Message: api.TextMessage("assistant", "unstamped"),
 	}); err != nil {
 		t.Fatal(err)
 	}

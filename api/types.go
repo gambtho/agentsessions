@@ -28,21 +28,36 @@ const (
 	EventLifecycle       EventKind = "LIFECYCLE"
 	EventEnd             EventKind = "END"
 	EventError           EventKind = "ERROR"
+	EventExecutionStart  EventKind = "EXECUTION_START"
+	EventParked          EventKind = "PARKED" // transport-only approval park acknowledgement; never journaled
 )
 
 // Message is a role-tagged sequence of content parts (A2A Message = role + Part[]).
 type Message struct {
-	Role  string // user | assistant (A2A calls this "agent") | tool
+	Role  string // system | user | assistant (A2A calls this "agent") | tool
 	Parts []Part
 }
 
-// Part is one unit of content: text, file (inline or URI), structured data, or an opaque
-// reasoning block. Aligned with A2A Part + MCP content. Exactly one field is set.
+// Part is one unit of content: text, file (inline or URI), structured data, an opaque
+// reasoning block, a model's tool call, or a tool's result. Aligned with A2A Part + MCP
+// content. Exactly one field is set.
+//
+// Fields added after the first four carry `json:",omitempty"`: the controller's model input
+// hash (I0) is computed over the JSON encoding of ModelRequest, so a new field that encoded as
+// null would change the hash of every request recorded before it existed.
 type Part struct {
 	Text      *TextPart
 	File      *FilePart
 	Data      map[string]any
 	Reasoning *ReasoningPart
+	// ToolCall is a model's request to call a tool, carried in an assistant message. Mediation
+	// and IdempotencyKey are unset on a model output. To execute the call, copy it, set them on
+	// the copy, and pass the copy to EventSink.ToolCall: the returned message can share this
+	// pointer with the recorded completion, so changing it in place alters a hashed event.
+	ToolCall *ToolCall `json:",omitempty"`
+	// ToolResult is a tool's result fed back to the model, carried in a message with role
+	// "tool". ToolResult.ID is the ID of the ToolCall it answers.
+	ToolResult *ToolResult `json:",omitempty"`
 }
 
 // TextPart is a text content block.
@@ -113,8 +128,23 @@ type Event struct {
 	Lifecycle      *Lifecycle
 	End            *HarnessEnd
 	Err            *Error
+	ExecutionStart *ExecutionStart
+	Parked         *ApprovalRef `json:",omitempty"` // transport only, excluded from durable history
 
 	Actor IdentityRef // emitter principal -> provenance on every action
+}
+
+// ExecutionStart is host-owned invocation state, recorded before the harness runs. Config is
+// opaque and preserved verbatim; ResumeFromSeq is the harness's cursor, not the log's CAS cursor.
+// InputCount records the expected number of INPUT events; zero explicitly permits inputless turns.
+// A nil count cannot establish completeness and is rejected when reconstructing this invocation.
+// Executions without this event reconstruct with empty config and a zero cursor (legacy defaults).
+type ExecutionStart struct {
+	Config         []byte
+	ResumeFromSeq  int64
+	InputCount     *int64
+	Harness        string // resolved registry name; empty legacy values use the session harness
+	HarnessVersion string // advertised opaque version; empty is unknown and retains legacy behavior
 }
 
 // Lifecycle marks a compute/session transition in the log (§7). Baseline is a replay /
@@ -134,6 +164,7 @@ const (
 	LifecycleFork     LifecycleKind = "FORK"
 	LifecycleBaseline LifecycleKind = "BASELINE"
 	LifecycleCancel   LifecycleKind = "CANCEL"
+	LifecycleDelete   LifecycleKind = "DELETE" // host-owned permanent intent, not compute teardown
 )
 
 // ModelCall records a call to a model (model-agnostic) for audit and cost.
@@ -186,6 +217,16 @@ type ToolCall struct {
 	IdempotencyKey string // dedups a retried side-effecting call tool-side (§3/I3)
 }
 
+// ToolResultCode is the machine-readable receipt status, matching common.proto ToolResult.Code.
+// Zero preserves legacy receipts and also denotes a successful result when IsError is false.
+type ToolResultCode int32
+
+const (
+	ToolResultCodeUnspecified    ToolResultCode = 0
+	ToolResultCodeApprovalDenied ToolResultCode = 1
+	ToolResultCodeExecutorError  ToolResultCode = 2
+)
+
 // ToolResult is the outcome of a ToolCall.
 type ToolResult struct {
 	ID           string
@@ -194,6 +235,18 @@ type ToolResult struct {
 	OutputDigest string // content digest of OutputURI target (hash-chain covers externalized bytes)
 	IsError      bool
 	Error        string
+	// Content is the model-facing result (MCP CallToolResult.content). A harness records on the
+	// TOOL_RESULT event the same ToolResult it feeds back as a tool_result part, so history rebuilt
+	// from the log can give the model what it saw live.
+	Content []Part `json:",omitempty"`
+	// Additive durable receipt fields are omitted at zero to preserve old model-input hashes.
+	Code                ToolResultCode `json:",omitempty"`
+	ApprovalRequestSeq  int64          `json:",omitempty"`
+	ApprovalDecisionSeq int64          `json:",omitempty"`
+	// Approval carries a host decision to a direct sink caller. It is transient: neither Go JSON
+	// nor wire conversion includes it in a receipt or model history. The durable decision is a
+	// separate APPROVAL_RESULT event; the receipt binds it by sequence above.
+	Approval *ApprovalResult `json:"-"`
 }
 
 // ApprovalRequest asks a human or policy engine to allow a tool call.
@@ -207,6 +260,7 @@ type ApprovalResult struct {
 	ToolCallID string
 	Approved   bool
 	Reason     string
+	RequestSeq int64 `json:",omitempty"` // sequence of the host-owned APPROVAL_REQUEST; zero for legacy decisions
 }
 
 // HarnessEnd is the terminal state of one execution.
