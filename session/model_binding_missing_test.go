@@ -85,14 +85,14 @@ func TestMissingModelPolicyAfterEmptySessionReopen(t *testing.T) {
 	}
 }
 
-// Only live opted-in work is refused. Legacy fallback, a configured override, and another
+// Only live opted-in work is refused. Modern unconfigured fallback, a configured override, and another
 // configured session remain available; missing policy must not become a global route block.
 func TestMissingModelPolicyCompatibility(t *testing.T) {
 	for _, tc := range []struct {
 		name, override string
 		enabled        bool
 	}{
-		{"legacy fallback", "", false},
+		{"modern unconfigured fallback", "", false},
 		{"configured override", "other", true},
 		{"unaffected route", "other", false},
 	} {

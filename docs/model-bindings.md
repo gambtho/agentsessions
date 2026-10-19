@@ -73,8 +73,11 @@ A bound remote/extra route needs no global `-model`. An **unbound** remote/extra
 `-model`; a binding for another name does not. Echo remains the default harness. Existing global
 flags keep their behavior for unbound routes. Configuration is loaded on restart, not hot-reloaded.
 
-New sessions on a bound route opt into model admission. Empty `Session.model` selects that route's
-explicit default for a new turn; nonempty values and per-call overrides must be allowed. The
+Every new service-created session is eligible for selected-route model admission, even when its
+creation route is unconfigured. Creation on a bound route also records the separate binding-required
+opt-in. A restricted override cannot inherit an unconfigured-route bypass. Empty `Session.model`
+selects the route's explicit default for a new turn; nonempty values and per-call overrides must be
+allowed. The
 requested metadata stays empty when requested empty. `Start.Model` and `ExecutionStart.model`
 carry the effective default; recorded per-call IDs and hashes are unchanged.
 
@@ -83,7 +86,7 @@ served route has no policy, normal Exec, no-input approval recovery and Resume r
 `FAILED_PRECONDITION` before compute creation/restoration, fencing, repair or journal changes.
 Recovery checks the pending turn's recorded route, which may differ from the metadata route. Idle
 Resume is also refused. Entirely unserved routes keep their normal routing errors. Journal replay
-and reading, Suspend and Fork remain available; fork children inherit the eligibility bit. Legacy
+and reading, Suspend and Fork remain available; fork children inherit both admission flags. Legacy
 sessions keep legacy model semantics, and unaffected routes keep working. Existing prerequisites
 for an unbound remote provider still apply; removing both its binding and global `-model` does not
 make the echo stub a valid fallback.
