@@ -438,9 +438,10 @@ type Session struct {
 	Harness  string                 `protobuf:"bytes,2,opt,name=harness,proto3" json:"harness,omitempty"`
 	// Optional model-agnostic session default. New sessions apply the selected route's host-owned
 	// policy when configured, including overrides from an initially unconfigured route. Empty uses
-	// its explicit default. Without current policy this is metadata; genuine pre-policy sessions
-	// retain legacy behavior even when policy is added later. HarnessDescriptor.models never defines
-	// the default. Policy is host embedder configuration, not Sessions clients or daemon configuration.
+	// its explicit default. Creation-time policy opt-in requires policy for live Exec/Resume even
+	// after restart. Genuine pre-policy sessions retain legacy behavior. Descriptor.models never
+	// defines the default. Host embedder/daemon configuration owns policy and credential references;
+	// Sessions clients cannot supply them. Credentials/references stay host-only.
 	Model string `protobuf:"bytes,3,opt,name=model,proto3" json:"model,omitempty"`
 	// Every Session reply uses the same append-transaction projection at last_seq: no events
 	// before deletion reports EXEC_PENDING; a valid owned unanswered host approval request in the

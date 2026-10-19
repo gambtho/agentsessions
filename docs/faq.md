@@ -48,7 +48,9 @@ live request fails the execution even if caught, calls no provider, records no `
 refuses later effects. Recorded replay/recovery prefixes keep their original default and hashes.
 An unconfigured selected route and genuine pre-policy sessions/journals retain existing behavior;
 legacy sessions are not inferred from creation on an unconfigured route.
-The daemon does not yet expose binding policy configuration. See
+The daemon accepts host-owned [model bindings](model-bindings.md), including typed credential
+references that never enter the API or journal. Losing a binding refuses opted-in live work, not
+legacy sessions or unrelated routes. See
 [model defaults](concepts.md#model-defaults) and [embedder setup](harness-authoring.md#host-owned-model-policy).
 
 ## Why replay instead of always snapshotting memory?

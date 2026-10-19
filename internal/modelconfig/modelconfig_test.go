@@ -78,6 +78,63 @@ func TestNewAppliesExplicitConfig(t *testing.T) {
 	}
 }
 
+func TestNewResponsesAndCredentialedHTTP(t *testing.T) {
+	for _, responses := range []bool{false, true} {
+		cfg := modelconfig.Config{Model: "model", BaseURL: "http://example.test", Path: "/explicit", Credentialed: true}
+		var err error
+		if responses {
+			_, err = modelconfig.NewResponses(cfg)
+		} else {
+			_, err = modelconfig.New(cfg)
+		}
+		if err == nil {
+			t.Fatal("credential reference bypassed keyed HTTP restriction")
+		}
+	}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Errorf("wrong Responses default path: %s", r.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"status":"completed","output":[]}`)
+	}))
+	defer server.Close()
+	c, err := modelconfig.NewResponses(modelconfig.Config{Model: "model", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.Model(t.Context(), api.ModelRequest{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNewResponsesAppliesExplicitConfig(t *testing.T) {
+	for _, header := range []string{"authorization", "api-key"} {
+		t.Run(header, func(t *testing.T) {
+			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.RequestURI() != "/v1/custom?api-version=test" {
+					t.Error("explicit endpoint changed")
+				}
+				want := "test-key"
+				if header == "authorization" {
+					want = "Bearer " + want
+				}
+				if r.Header.Get(header) != want {
+					t.Error("configured credential missing")
+				}
+				_, _ = io.WriteString(w, `{"status":"completed","output":[]}`)
+			}))
+			defer endpoint.Close()
+			c, err := modelconfig.NewResponses(modelconfig.Config{Model: "model", BaseURL: endpoint.URL + "/v1", Path: "/custom?api-version=test", AuthHeader: header, APIKey: "test-key"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = c.Model(t.Context(), api.ModelRequest{}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestNewRequiresModel(t *testing.T) {
 	c, err := modelconfig.New(modelconfig.Config{})
 	if err == nil || c != nil {

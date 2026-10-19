@@ -81,9 +81,10 @@ message Session {
   string harness = 2;
   // Optional model-agnostic session default. New sessions apply the selected route's host-owned
   // policy when configured, including overrides from an initially unconfigured route. Empty uses
-  // its explicit default. Without current policy this is metadata; genuine pre-policy sessions
-  // retain legacy behavior even when policy is added later. HarnessDescriptor.models never defines
-  // the default. Policy is host embedder configuration, not Sessions clients or daemon configuration.
+  // its explicit default. Creation-time policy opt-in requires policy for live Exec/Resume even
+  // after restart. Genuine pre-policy sessions retain legacy behavior. Descriptor.models never
+  // defines the default. Host embedder/daemon configuration owns policy and credential references;
+  // Sessions clients cannot supply them. Credentials/references stay host-only.
   string model = 3;
 
   reserved 4; // retired: a flattened lifecycle phase, replaced by the two axes below

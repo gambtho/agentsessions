@@ -149,8 +149,8 @@ flowchart LR
 ### Model defaults
 
 - `SES-15`: A host MAY configure an explicit default model and allowed model IDs per harness
-  route. The reference host exposes `placement.WithModelPolicy` to Go embedders; daemon binding
-  configuration is not provided. IDs are opaque. The default MUST be nonempty and in the allowed
+  route. The reference host exposes `placement.WithModelPolicy` to Go embedders and
+  `agentsessionsd -model-bindings` for versioned, per-name host configuration. IDs are opaque. The default MUST be nonempty and in the allowed
   set, which MUST NOT contain an empty ID. `Descriptor.models` MUST NOT supply a default.
 - `SES-16`: When policy is configured, registration MUST check that every `Descriptor.models`
   entry belongs to the host's allowed set before making the route usable or persisting a new
@@ -179,6 +179,23 @@ flowchart LR
   No old event or hash is rewritten. Earlier unreleased v6 prototypes cannot read new flag values
   and MUST NOT be mixed with this host; their ambiguous zero rows remain legacy, not inferred modern.
   Unsupported flag bits refuse Get/List reads rather than silently disabling admission.
+- `SES-19`: A policy-enabled session MUST NOT shed admission when its selected route loses model
+  policy, including after restart or through an override. A served route without policy MUST refuse
+  `Exec` and `Resume` with `FAILED_PRECONDITION` before provisioning, restoration, fencing, approval
+  repair or effects. Recovery MUST check the pending turn's recorded route, not only the session's
+  metadata route. This also refuses an idle `Resume`; pure journal reading/replay, `Suspend` and
+  `Fork` remain available. An entirely unserved route retains its existing routing error, never a
+  model fallback. Legacy sessions and unrelated routes MUST retain their existing behavior.
+  Current configuration governs new turns, live effects and unanswered-intent re-drives; recorded
+  defaults and effects govern historical reconstruction. Changing endpoint, protocol, credentials
+  or allowed IDs MUST NOT rewrite history or persist credentials.
+- `SES-20`: Model-binding credential references and values MUST remain host-only: the host MUST NOT
+  serialize them into Sessions or HarnessRegistry replies, events, logs or failure diagnostics.
+  The reference daemon accepts typed `{type, name}` references, implements only `env` by default,
+  and offers an embedder source returning a context-aware credential callback per HTTP attempt.
+  A host can obtain expiring identity tokens without storing keys. Binding construction and request
+  failures MUST discard private source/provider diagnostic payloads; normal successful model content
+  remains model content. See [model bindings](docs/model-bindings.md) for configuration and limits.
 
 ### 5.2 Two-axis state
 

@@ -5,6 +5,7 @@ package modelconfig
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -20,15 +21,37 @@ type Config struct {
 	// credential for any other header name. Empty AuthHeader or APIKey sends no credential.
 	AuthHeader string
 	APIKey     string
+	// Credentialed applies the same HTTP restriction when a host transport attaches credentials.
+	Credentialed bool
+	// HTTPClient supplies a custom transport; the protocol adapter copies it and locks redirects.
+	HTTPClient *http.Client
 }
 
 // New builds a client whose Model and StreamModel methods satisfy the controller's model seams.
 // A model is required; this package neither reads the environment nor selects a fallback model.
 //
-// With an APIKey set, New refuses a plain-http BaseURL unless its host is a loopback address,
-// localhost, or a Kubernetes service name, the last as a trusted-network exception (see
-// checkKeyedHTTP): the key and every prompt would otherwise cross the network unencrypted.
+// With an APIKey set or Credentialed true, New refuses a plain-http BaseURL unless its host is a
+// loopback address, localhost, or a Kubernetes service name, the last as a trusted-network exception
+// (see checkKeyedHTTP): the credential and every prompt would otherwise cross the network unencrypted.
 func New(cfg Config) (*openai.Client, error) {
+	opts, err := clientOptions(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return openai.New(opts...)
+}
+
+// NewResponses explicitly selects the Responses protocol with the same security and transport
+// options as New. An empty Path uses the Responses adapter's default.
+func NewResponses(cfg Config) (*openai.ResponsesClient, error) {
+	opts, err := clientOptions(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return openai.NewResponses(opts...)
+}
+
+func clientOptions(cfg Config) ([]openai.Option, error) {
 	if err := checkKeyedHTTP(cfg); err != nil {
 		return nil, err
 	}
@@ -44,12 +67,16 @@ func New(cfg Config) (*openai.Client, error) {
 			opts = append(opts, openai.WithHeader(cfg.AuthHeader, cfg.APIKey))
 		}
 	}
-	return openai.New(opts...)
+	if cfg.HTTPClient != nil {
+		opts = append(opts, openai.WithHTTPClient(cfg.HTTPClient))
+	}
+	return opts, nil
 }
 
-// checkKeyedHTTP refuses an http BaseURL when an APIKey is set, unless the host (case-insensitive,
-// port ignored) is a loopback IP literal, localhost, or a name ending in .svc or .svc.cluster.local.
-// https, and http with no key, are left alone. Any key counts, whatever AuthHeader says, so a
+// checkKeyedHTTP refuses an http BaseURL when an APIKey is set or Credentialed is true, unless the
+// host (case-insensitive, port ignored) is a loopback IP literal, localhost, or a name ending in .svc
+// or .svc.cluster.local.
+// https, and anonymous http, are left alone. Any credential counts, whatever AuthHeader says, so a
 // configuration that might send one fails closed. A BaseURL that does not parse is left to
 // openai.New. The error names the host only: the key is never printed, and the URL's other parts are
 // the caller's to show.
@@ -60,7 +87,7 @@ func New(cfg Config) (*openai.Client, error) {
 // crosses the pod network in cleartext, readable by anything on that path. An operator who points a
 // keyed client at such a name accepts that network as trusted.
 func checkKeyedHTTP(cfg Config) error {
-	if cfg.APIKey == "" || cfg.BaseURL == "" {
+	if (cfg.APIKey == "" && !cfg.Credentialed) || cfg.BaseURL == "" {
 		return nil
 	}
 	u, err := url.Parse(cfg.BaseURL)

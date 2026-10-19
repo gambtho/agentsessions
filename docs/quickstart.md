@@ -318,6 +318,17 @@ That is the whole point of host-mediated model calls. Because the completion flo
 and lands in the journal, the log is a replayable record of the run rather than a description of
 one.
 
+### Per-harness bindings and identity credentials
+
+For distinct providers or model allowlists, use
+[`--model-bindings /path/models.json`](model-bindings.md). Versioned JSON selects full endpoint URLs,
+explicit Chat Completions/Responses protocols and typed host-only credential references. A `chat`
+binding enables chat without global `--model`. The stock daemon implements environment references;
+repository-owned hosts can supply a context-aware credential source for workload identity tokens.
+Removing a binding refuses opted-in live work rather than falling back to a legacy model; legacy
+sessions and unrelated routes retain their behavior. No credentials or references enter the API,
+journal or binding logs.
+
 ## 9. Drive it from Go
 
 `agentctl` is a thin shell over the same client package your code can use. One call runs a turn,

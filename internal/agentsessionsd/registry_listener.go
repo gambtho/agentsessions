@@ -50,20 +50,28 @@ func checkListenerPorts(sessionsAddr string, registryPort int) error {
 	return nil
 }
 
-// registeredPlacer constructs a backend but does not dial it: the harness may be down at
-// registration or restart, and Describe is deferred until a session needs it.
-func registeredPlacer(model string, modelFn controller.ModelFunc, streamFn controller.StreamFunc, logger *slog.Logger) session.PlacerFactory {
+// registeredPlacer selects the same host binding as static routes. Unbound legacy routes defer
+// Describe until execution; bound routes require the policy's bounded descriptor admission.
+func registeredPlacer(model string, modelFn controller.ModelFunc, streamFn controller.StreamFunc, logger *slog.Logger, bindings modelBindings) session.PlacerFactory {
 	return func(name string, spec *v1.HarnessSpec) (*placement.Placer, func(), error) {
 		switch p := spec.GetPlacement().(type) {
 		case *v1.HarnessSpec_Remote:
 			if err := checkHarnessAddress(p.Remote.GetAddress()); err != nil {
 				return nil, nil, fmt.Errorf("remote harness %q: %w", name, err)
 			}
-			if model == "" {
-				return nil, nil, errors.New("remote registration requires -model: model calls must not fall back to the built-in echo stub")
+			binding, bound := bindings[name]
+			if model == "" && !bound {
+				return nil, nil, errors.New("remote registration requires -model or a named model binding: model calls must not fall back to the built-in echo stub")
 			}
+			fn, stream := modelFn, streamFn
+			opts := []placement.Option{placement.WithLogger(logger), placement.WithDescriptorID(spec.GetDescriptorId())}
+			if bound {
+				fn, stream = binding.model, binding.stream
+				opts = append(opts, placement.WithModelPolicy(binding.policy))
+			}
+			opts = append(opts, placement.WithStreamingModel(stream))
 			backend := remote.New(p.Remote.GetAddress(), remote.WithLogger(logger))
-			placer := placement.New(backend, modelFn, placement.WithLogger(logger), placement.WithStreamingModel(streamFn), placement.WithDescriptorID(spec.GetDescriptorId()))
+			placer := placement.New(backend, fn, opts...)
 			return placer, func() { _ = backend.Close() }, nil
 		case *v1.HarnessSpec_Substrate:
 			return nil, nil, errors.New("substrate placement is not supported by agentsessionsd (no substrate backend configured)")

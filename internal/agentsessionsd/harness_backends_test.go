@@ -122,7 +122,7 @@ func TestRunServesHarnessBackends(t *testing.T) {
 func TestHarnessRegistryServesExtraBackends(t *testing.T) {
 	extra := local.New(replyHarness{})
 	t.Cleanup(func() { _ = extra.Close() })
-	registry, closeBackends, err := harnessRegistry("test-model", remoteHarnesses{"remote": "127.0.0.1:9000"}, echoagent.Model, nil, nil, nil, map[string]placement.Backend{"extra": extra})
+	registry, closeBackends, err := harnessRegistry("test-model", remoteHarnesses{"remote": "127.0.0.1:9000"}, echoagent.Model, nil, nil, nil, map[string]placement.Backend{"extra": extra}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestHarnessRegistryServesExtraBackends(t *testing.T) {
 			if tt.model != "" {
 				remotes = remoteHarnesses{"remote": "127.0.0.1:9000"}
 			}
-			_, closeBackends, err := harnessRegistry(tt.model, remotes, echoagent.Model, nil, nil, nil, map[string]placement.Backend{tt.extra: extra})
+			_, closeBackends, err := harnessRegistry(tt.model, remotes, echoagent.Model, nil, nil, nil, map[string]placement.Backend{tt.extra: extra}, nil)
 			if err == nil {
 				closeBackends()
 				t.Fatalf("harnessRegistry accepted extra harness %q", tt.extra)

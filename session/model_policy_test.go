@@ -234,13 +234,13 @@ func TestSchemaV4FixtureUnderModelPolicy(t *testing.T) {
 func TestExecSessionModelSelectedRoute(t *testing.T) {
 	for _, tc := range []struct {
 		name, model, route, want string
-		refuse                   bool
+		refusal                  codes.Code
 	}{
-		{"explicit", "chosen", "", "chosen", false},
-		{"override_default", "", "other", "other-default", false},
-		{"override_explicit", "chosen", "other", "chosen", false},
-		{"override_refused", "only-a", "other", "", true},
-		{"unconfigured_override", "only-a", "legacy", "legacy", false},
+		{"explicit", "chosen", "", "chosen", codes.OK},
+		{"override_default", "", "other", "other-default", codes.OK},
+		{"override_explicit", "chosen", "other", "chosen", codes.OK},
+		{"override_refused", "only-a", "other", "", codes.InvalidArgument},
+		{"unconfigured_override", "only-a", "legacy", "", codes.FailedPrecondition},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := openStore(t, ":memory:")
@@ -279,13 +279,18 @@ func TestExecSessionModelSelectedRoute(t *testing.T) {
 			if err == nil {
 				err = drainExec(stream)
 			}
-			if tc.refuse {
-				if status.Code(err) != codes.InvalidArgument {
-					t.Fatalf("invalid selected model=%v", err)
+			if tc.refusal != codes.OK {
+				if status.Code(err) != tc.refusal {
+					t.Fatalf("selected route admission=%v, want %v", err, tc.refusal)
 				}
 				head, headErr := store.Session(uid).Head()
-				if headErr != nil || head != 0 || calls.Load() != 0 || backends["other"].creates.Load() != 0 {
-					t.Fatalf("refused turn had effects: head=%d, calls=%d, creates=%d, %v", head, calls.Load(), backends["other"].creates.Load(), headErr)
+				if headErr != nil || head != 0 || calls.Load() != 0 {
+					t.Fatalf("refused turn had effects: head=%d, calls=%d, %v", head, calls.Load(), headErr)
+				}
+				for name, b := range backends {
+					if b.creates.Load() != 0 || b.restores.Load() != 0 {
+						t.Fatalf("refused turn provisioned %s: %v", name, b.ioCounts())
+					}
 				}
 				return
 			}

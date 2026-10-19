@@ -634,6 +634,11 @@ func (s *Service) Exec(req *v1.ExecRequest, stream v1.Sessions_ExecServer) (err 
 		}
 		modelPolicy = info.ModelPolicy
 		modelPolicyEligible = info.ModelPolicyEligible || modelPolicy
+		if recoveryInfo == nil {
+			if err := s.checkSessionModelPolicy(modelPolicy, harness); err != nil {
+				return execError(err)
+			}
+		}
 		if sess == nil {
 			sess, err = sessionProto(info)
 			return err
@@ -739,6 +744,11 @@ func (s *Service) Exec(req *v1.ExecRequest, stream v1.Sessions_ExecServer) (err 
 			}
 			if refused == nil && name != stored {
 				refused = s.checkMemoryOverride(ctx, uid, stored, name)
+			}
+			if refused == nil {
+				if err := s.checkSessionModelPolicy(modelPolicy, name); err != nil {
+					refused = resumeError(err)
+				}
 			}
 			return refused
 		}
@@ -1051,6 +1061,11 @@ func (s *Service) Resume(ctx context.Context, req *v1.ResumeRequest) (session *v
 		if refused == nil && name != stored {
 			refused = s.checkMemoryOverride(ctx, uid, stored, name)
 		}
+		if refused == nil {
+			if err := s.checkSessionModelPolicy(info.ModelPolicy, name); err != nil {
+				refused = resumeError(err)
+			}
+		}
 		return refused
 	}
 	opts := []placement.RegistryResumeOption{placement.WithResolvedHarnessCheck(check)}
@@ -1093,6 +1108,8 @@ func suspendError(err error) error {
 
 func resumeError(err error) error {
 	switch {
+	case errors.Is(err, ErrModelPolicyMissing):
+		return withStatusCause(codes.FailedPrecondition, err)
 	case errors.Is(err, api.ErrModelNotAllowed), errors.Is(err, api.ErrInvalidModelPolicy):
 		return withStatusCause(codes.InvalidArgument, fmt.Errorf("resume: %w", err))
 	case errors.Is(err, eventlog.ErrDeleted):
@@ -1142,6 +1159,8 @@ func admissionInterruptedCode(err error) codes.Code {
 
 func execError(err error) error {
 	switch {
+	case errors.Is(err, ErrModelPolicyMissing):
+		return withStatusCause(codes.FailedPrecondition, err)
 	case errors.Is(err, api.ErrModelNotAllowed), errors.Is(err, api.ErrInvalidModelPolicy):
 		return withStatusCause(codes.InvalidArgument, err)
 	case errors.Is(err, eventlog.ErrDeleted):

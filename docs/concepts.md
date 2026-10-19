@@ -120,8 +120,8 @@ no provider, appends no `MODEL_CALL`, refuses later effects, and ends with best-
 `END`. This prevents a handled but unrecorded refusal from making a successful turn unreplayable.
 Both plain and streaming providers use the same admission. Recorded replay/recovery prefixes use
 their original default and per-call hashes, not today's policy. Only new live effects or an
-unanswered model-intent re-drive check the current allowlist. Removing policy disables membership
-checks but does not erase the invocation's recorded default.
+unanswered model-intent re-drive check the current allowlist. At the Sessions boundary, a missing
+required binding refuses live Exec/Resume; it never erases the recorded default.
 
 An unconfigured route keeps existing model behavior. Genuine pre-policy sessions, including
 zero-event sessions, stay legacy even after policy is configured. SQLite v6 stores independent
@@ -132,8 +132,10 @@ later clone failure cannot expose a legacy child. Unknown flag bits fail Get/Lis
 event or hash changes. Stop all older hosts and embedded CLI readers/writers before upgrading and
 back up for rollback. Earlier unreleased v6 boolean prototypes cannot read the new flags; their
 ambiguous zero rows remain legacy. Older released binaries refuse v6 at open, but already-open old
-writers do not enforce admission. There is no downgrade migration. The reference daemon has no binding
-policy configuration yet; see [embedder composition](harness-authoring.md#host-owned-model-policy).
+writers do not enforce admission. There is no downgrade migration. The reference daemon supports
+[model bindings](model-bindings.md); losing a required binding refuses opted-in live Exec/Resume
+without changing legacy sessions or historical records. See
+[embedder composition](harness-authoring.md#host-owned-model-policy).
 
 ### How exec_state is derived
 

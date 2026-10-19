@@ -3,7 +3,8 @@
 `model/openai.NewResponses` explicitly selects the OpenAI-compatible Responses protocol. It exposes
 `Model` and `StreamModel` for the controller seams, without a vendor SDK. `openai.New` remains the
 Chat Completions constructor; changing its path to `/responses` does not change its request format.
-The daemon and CLI still select Chat Completions. Responses selection in those hosts is not provided.
+Legacy daemon/CLI model flags select Chat Completions. The daemon can explicitly select Responses
+through [per-harness model bindings](model-bindings.md); changing a legacy path alone does not.
 
 ## Construct a client
 

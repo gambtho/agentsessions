@@ -109,7 +109,8 @@ override or later policy activation cannot inherit an unconfigured-route bypass.
 sessions keep legacy behavior; the separate creation-time opt-in flag is not the eligibility test. Direct Placer callers use
 `placement.WithSessionModel(model)` on `Exec` to opt in; omitting it keeps legacy behavior.
 Standalone controllers can use `controller.WithModelPolicy` and `controller.WithModelDefault`.
-The reference daemon does not yet expose binding policy configuration.
+The reference daemon accepts [per-harness model bindings](model-bindings.md). Credentials remain
+host-only; bindings select providers and authoritative model policy, not harness-owned credentials.
 
 Use a nonempty `Start.Model` as your default; empty retains your existing choice. An empty
 `ModelRequest.Model` also resolves to the recorded default for policy-aware turns. Explicit per-call

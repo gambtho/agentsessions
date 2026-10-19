@@ -1,6 +1,7 @@
 // Package agentsessionsd is the agentsessionsd server: it serves the Sessions API over TCP.
 // cmd/agentsessionsd calls Main; an in-tree daemon build that hosts more than the stock daemon
-// calls it with Options: WithToolExecutors for host tool executors, and WithHarnessBackends for
+// calls it with Options: WithToolExecutors for host tool executors, WithCredentialSource for
+// host-owned credential acquisition, and WithHarnessBackends for
 // harnesses served on a backend this module does not link, which keeps that backend's flags and
 // client setup in the build's own module. The package is internal to this module and is not an API
 // for programs outside it. With -registry-addr it also serves HarnessRegistry on a separate
@@ -8,15 +9,17 @@
 // neither listener provides authentication or TLS.
 //
 // This binary serves the reference echo harness by default and adds the conversational chat harness
-// when -model is set, each on its own filesystem-only local backend. -harness name=address registers
-// a STATELESS_REPLAY harness running elsewhere without rebuilding; it requires -model, so a remote
+// when -model or a chat binding is set, each on its own filesystem-only local backend.
+// -harness name=address registers a STATELESS_REPLAY harness running elsewhere without rebuilding;
+// it requires -model or its own binding, so a remote
 // harness's model calls never fall through to the built-in echo stub. A REQUIRES_MEMORY_SNAPSHOT
 // harness needs a backend that owns its sandbox, which a build adds with WithHarnessBackends.
 // Unknown harnesses are refused rather than substituted.
 //
-// With -model set it drives a real OpenAI-compatible endpoint; without one it uses the built-in
-// echo model, so the quickstart runs with no key. The API key comes from the environment rather
-// than a flag, because a flag would put the credential in the process list and shell history.
+// -model selects a legacy global Chat Completions provider; unbound echo uses the built-in model
+// when it is unset, so the quickstart runs with no key. -model-bindings selects explicit per-name
+// providers and policies, with typed host-only credentials. Keys never belong in flags, which would
+// put them in the process list and shell history.
 //
 // Both listeners are plaintext and unauthenticated; project is a filter, not a tenancy boundary.
 // A local or same-pod process can administer the operator listener. Do not expose it to an
@@ -71,8 +74,9 @@ var ErrUsage = errors.New("usage")
 type Option func(*options)
 
 type options struct {
-	executors ToolExecutorFunc
-	backends  HarnessBackends
+	credentialSource CredentialSource
+	executors        ToolExecutorFunc
+	backends         HarnessBackends
 	// output receives command-line errors and the usage; nil is os.Stderr. Tests set it.
 	output io.Writer
 	// ctx, when set, is the parent of Run's signal context, so a test can stop Run; listening is
@@ -120,7 +124,7 @@ func WithToolExecutors(f ToolExecutorFunc) Option {
 // build owns that backend's flags and client setup, so they stay in its own module.
 //
 // Run calls RegisterFlags before it parses the command line and Harnesses after. When Harnesses
-// names any harness, Run checks the names the way it checks -harness ones (each needs -model, and
+// names any harness, Run checks names like -harness ones (each needs -model or its own binding, and
 // none may be a built-in or -harness name), then calls Backends, all before it opens the journal.
 // The harnesses are static entries, reserved in the journal like the built-in ones, and get no host
 // tool executor.
@@ -149,8 +153,8 @@ func CheckDialAddress(addr string) error { return checkHarnessAddress(addr) }
 
 // Run parses args (without the program name) and serves until SIGINT or SIGTERM. -h returns
 // flag.ErrHelp. A flag that does not parse and positional arguments wrap ErrUsage. A configuration
-// check after parsing (a -harness with no -model, a -registry-addr that is not a literal loopback
-// address, a HarnessBackends refusal, and the like) returns a plain error, which Main prints and
+// check after parsing (an unbound -harness with no -model, a nonliteral-loopback -registry-addr,
+// a HarnessBackends refusal, and the like) returns a plain error, which Main prints and
 // reports with status 1.
 func Run(args []string, opts ...Option) error {
 	var o options
@@ -165,6 +169,7 @@ func Run(args []string, opts ...Option) error {
 	registryAddr := fs.String("registry-addr", "", "optional literal loopback IP:port for the plaintext, unauthenticated HarnessRegistry operator API")
 	journal := fs.String("journal", "agentsessions.db", "sqlite journal path")
 	toolConfigPath := fs.String("tool-executors", "", "optional versioned JSON tool executor config; CLI -harness entries only")
+	modelConfigPath := fs.String("model-bindings", "", "optional versioned JSON per-harness model bindings; credentials stay on the host")
 	project := fs.String("project", sqlitelog.DefaultProject, "default project (tenant)")
 	model := fs.String("model", "", "model id for an OpenAI-compatible endpoint; empty uses the built-in echo model")
 	modelBaseURL := fs.String("model-base-url", openai.DefaultBaseURL, "base URL of the OpenAI-compatible endpoint")
@@ -197,7 +202,15 @@ func Run(args []string, opts ...Option) error {
 
 	// Before any side effect: a misconfigured start must not leave a journal behind. Addresses are
 	// already checked by remoteHarnesses.Set during flag parsing.
-	if err := checkRemotes(*model, remotes); err != nil {
+	var bindings modelBindings
+	if *modelConfigPath != "" {
+		var err error
+		bindings, err = loadModelBindings(*modelConfigPath, o.credentialSource)
+		if err != nil {
+			return err
+		}
+	}
+	if err := checkRemotes(*model, remotes, bindings); err != nil {
 		return err
 	}
 	var backendNames []string
@@ -208,7 +221,7 @@ func Run(args []string, opts ...Option) error {
 		}
 		// Sorted, so a startup with two colliding names reports the same one every time.
 		backendNames = slices.Sorted(slices.Values(names))
-		if err := checkBackendHarnesses(*model, remotes, backendNames); err != nil {
+		if err := checkBackendHarnesses(*model, remotes, backendNames, bindings); err != nil {
 			return err
 		}
 	}
@@ -283,21 +296,23 @@ func Run(args []string, opts ...Option) error {
 		extraBackends = backends
 	}
 
+	// Policy admission can Describe a static remote. Refuse it before creating the journal;
+	// the immutable Placer caches that check, so later registration does not probe again.
+	registry, closeBackends, err := harnessRegistry(*model, remotes, modelFn, streamFn, logger, executors, extraBackends, bindings)
+	if err != nil {
+		return err
+	}
+	defer closeBackends()
+
 	store, err := sqlitelog.Open(*journal, sqlitelog.WithDefaultProject(*project))
 	if err != nil {
 		return fmt.Errorf("open journal %s: %w", *journal, err)
 	}
 	defer func() { _ = store.Close() }()
 
-	registry, closeBackends, err := harnessRegistry(*model, remotes, modelFn, streamFn, logger, executors, extraBackends)
-	if err != nil {
-		return err
-	}
-	defer closeBackends()
-
 	// Load registrations even with the operator listener off: retired harnesses still run
 	// existing sessions, and a listener setting must not alter session routing on restart.
-	operator, err := session.NewHarnessRegistry(store, registry, registeredPlacer(*model, modelFn, streamFn, logger))
+	operator, err := session.NewHarnessRegistry(store, registry, registeredPlacer(*model, modelFn, streamFn, logger, bindings))
 	if err != nil {
 		return fmt.Errorf("load harness registrations: %w", err)
 	}
@@ -368,6 +383,7 @@ func Run(args []string, opts ...Option) error {
 		"harnesses", registry.Names(),
 		"default_harness", registry.Default(),
 		"model", modelDesc,
+		"model_bindings", len(bindings),
 	)
 
 	var result error
@@ -601,12 +617,20 @@ func checkHost(host string) error {
 	return nil
 }
 
-// remotesNeedModel refuses a harness registered by address when -model is unset: this host answers
-// a remote harness's model calls, and without -model the built-in echo stub would answer them and be
+// remotesNeedModel refuses an unbound harness registered by address without -model: this host answers
+// a remote harness's model calls, and without -model or a binding the echo stub would answer them and be
 // journaled as if a model had.
-func remotesNeedModel(model string, remotes remoteHarnesses) error {
-	if len(remotes) > 0 && model == "" {
-		return fmt.Errorf("-harness %s requires -model: this host answers a remote harness's model calls, and without -model they would go to the built-in echo stub", remotes)
+func remotesNeedModel(model string, remotes remoteHarnesses, bindings modelBindings) error {
+	unbound := remoteHarnesses{}
+	if model == "" {
+		for name, address := range remotes {
+			if _, bound := bindings[name]; !bound {
+				unbound[name] = address
+			}
+		}
+	}
+	if len(unbound) > 0 {
+		return fmt.Errorf("-harness %s requires -model: this host answers a remote harness's model calls, and without -model or a named binding they would go to the built-in echo stub", unbound)
 	}
 	return nil
 }
@@ -616,9 +640,10 @@ func remotesNeedModel(model string, remotes remoteHarnesses) error {
 // harness cannot take "chat" and then collide with it the next time the host starts with -model.
 var reservedHarnesses = []string{"chat", "echo"}
 
-// builtinHarnesses names the harnesses this binary serves itself: echo always, and chat with -model.
-func builtinHarnesses(model string) []string {
-	if model == "" {
+// builtinHarnesses names built-ins: echo always, chat with -model or a chat binding.
+func builtinHarnesses(model string, bindings modelBindings) []string {
+	_, chatBound := bindings["chat"]
+	if model == "" && !chatBound {
 		return []string{"echo"}
 	}
 	return slices.Clone(reservedHarnesses)
@@ -626,11 +651,11 @@ func builtinHarnesses(model string) []string {
 
 // checkRemotes runs the -harness checks that need no side effect, so main can refuse a misconfigured
 // start before it opens the journal. harnessRegistry repeats them as a backstop.
-func checkRemotes(model string, remotes remoteHarnesses) error {
-	if err := remotesNeedModel(model, remotes); err != nil {
+func checkRemotes(model string, remotes remoteHarnesses, bindings modelBindings) error {
+	if err := remotesNeedModel(model, remotes, bindings); err != nil {
 		return err
 	}
-	builtin := builtinHarnesses(model)
+	builtin := builtinHarnesses(model, bindings)
 	// Sorted, so a startup with two colliding names reports the same one every time.
 	for _, name := range remotes.names() {
 		if slices.Contains(builtin, name) {
@@ -643,7 +668,7 @@ func checkRemotes(model string, remotes remoteHarnesses) error {
 // checkBackendHarnesses runs the checks checkRemotes runs, for the names a HarnessBackends build
 // configures, sorted, before Run builds anything. harnessRegistry repeats the model and name checks
 // as a backstop.
-func checkBackendHarnesses(model string, remotes remoteHarnesses, names []string) error {
+func checkBackendHarnesses(model string, remotes remoteHarnesses, names []string, bindings modelBindings) error {
 	for i, name := range names {
 		if name == "" {
 			return errors.New("harness backends: a harness has no name")
@@ -652,10 +677,18 @@ func checkBackendHarnesses(model string, remotes remoteHarnesses, names []string
 			return fmt.Errorf("harness backends: harness %q is configured twice", name)
 		}
 	}
-	if len(names) > 0 && model == "" {
-		return fmt.Errorf("harness %s requires -model: this host answers the harness's model calls, and without -model they would go to the built-in echo stub", strings.Join(names, ","))
+	if model == "" {
+		var unbound []string
+		for _, name := range names {
+			if _, bound := bindings[name]; !bound {
+				unbound = append(unbound, name)
+			}
+		}
+		if len(unbound) > 0 {
+			return fmt.Errorf("harness %s requires -model: this host answers the harness's model calls, and without -model or a named binding they would go to the built-in echo stub", strings.Join(unbound, ","))
+		}
 	}
-	builtin := builtinHarnesses(model)
+	builtin := builtinHarnesses(model, bindings)
 	for _, name := range names {
 		if slices.Contains(builtin, name) {
 			return errNameTaken(name)
@@ -693,7 +726,10 @@ func toolExecutors(remotes remoteHarnesses, f ToolExecutorFunc, sessions *client
 // executors holds the host tool executor for each -harness name that has one; the built-in
 // harnesses and the HarnessBackends ones get none. extra holds the HarnessBackends backends by
 // name, already built, whose names checkBackendHarnesses checked; the caller closes them.
-func harnessRegistry(model string, remotes remoteHarnesses, modelFn controller.ModelFunc, streamFn controller.StreamFunc, logger *slog.Logger, executors map[string]ToolExecutor, extra map[string]placement.Backend) (*placement.Registry, func(), error) {
+func harnessRegistry(model string, remotes remoteHarnesses, modelFn controller.ModelFunc, streamFn controller.StreamFunc, logger *slog.Logger, executors map[string]ToolExecutor, extra map[string]placement.Backend, bindings modelBindings) (*placement.Registry, func(), error) {
+	if err := checkRemotes(model, remotes, bindings); err != nil {
+		return nil, nil, err
+	}
 	echo := local.New(echoagent.Harness{}, local.WithLogger(logger))
 	backends := []*local.Backend{echo}
 	var remoteBackends []*remote.Backend
@@ -705,33 +741,33 @@ func harnessRegistry(model string, remotes remoteHarnesses, modelFn controller.M
 			_ = backend.Close()
 		}
 	}
-	opts := []placement.Option{
-		placement.WithLogger(logger),
-		placement.WithStreamingModel(streamFn),
-	}
-	placers := map[string]*placement.Placer{
-		"echo": placement.New(echo, modelFn, opts...),
-	}
-	// optsFor adds the named harness's host tool executor, if the caller configured one.
-	optsFor := func(name string) []placement.Option {
-		tool := executors[name]
-		if tool.Call == nil {
-			return opts
+	// Each route owns its options. Neither a binding nor a tool executor can contaminate a
+	// sibling's provider, policy, streaming function or durable-dedup declaration.
+	placerFor := func(name string, backend placement.Backend, tool ToolExecutor) *placement.Placer {
+		fn, stream := modelFn, streamFn
+		opts := []placement.Option{placement.WithLogger(logger)}
+		if binding, bound := bindings[name]; bound {
+			fn, stream = binding.model, binding.stream
+			opts = append(opts, placement.WithModelPolicy(binding.policy))
 		}
-		withTool := append(slices.Clone(opts), placement.WithToolExecutor(tool.Call))
-		if tool.DurableDedup != nil {
-			withTool = append(withTool, placement.WithDurableDedup(tool.DurableDedup))
+		opts = append(opts, placement.WithStreamingModel(stream))
+		if tool.Call != nil {
+			opts = append(opts, placement.WithToolExecutor(tool.Call))
+			if tool.DurableDedup != nil {
+				opts = append(opts, placement.WithDurableDedup(tool.DurableDedup))
+			}
 		}
-		return withTool
+		return placement.New(backend, fn, opts...)
 	}
-	if model != "" {
-		chat := local.New(chatagent.Harness{Model: model}, local.WithLogger(logger))
+	placers := map[string]*placement.Placer{"echo": placerFor("echo", echo, ToolExecutor{})}
+	chatModel := model
+	if binding, bound := bindings["chat"]; bound {
+		chatModel = binding.policy.Default
+	}
+	if chatModel != "" {
+		chat := local.New(chatagent.Harness{Model: chatModel}, local.WithLogger(logger))
 		backends = append(backends, chat)
-		placers["chat"] = placement.New(chat, modelFn, opts...)
-	}
-	if err := remotesNeedModel(model, remotes); err != nil {
-		closeBackends()
-		return nil, nil, err
+		placers["chat"] = placerFor("chat", chat, ToolExecutor{})
 	}
 	// Sorted, so a startup with two colliding names reports the same one every time.
 	for _, name := range remotes.names() {
@@ -742,18 +778,18 @@ func harnessRegistry(model string, remotes remoteHarnesses, modelFn controller.M
 		}
 		backend := remote.New(addr, remote.WithLogger(logger))
 		remoteBackends = append(remoteBackends, backend)
-		placers[name] = placement.New(backend, modelFn, optsFor(name)...)
-	}
-	if len(extra) > 0 && model == "" {
-		closeBackends()
-		return nil, nil, errors.New("harness backends require -model: this host answers their model calls")
+		placers[name] = placerFor(name, backend, executors[name])
 	}
 	for _, name := range slices.Sorted(maps.Keys(extra)) {
+		if _, bound := bindings[name]; model == "" && !bound {
+			closeBackends()
+			return nil, nil, errors.New("harness backends require -model or a named model binding: this host answers their model calls")
+		}
 		if _, taken := placers[name]; taken {
 			closeBackends()
 			return nil, nil, errNameTaken(name)
 		}
-		placers[name] = placement.New(extra[name], modelFn, opts...)
+		placers[name] = placerFor(name, extra[name], ToolExecutor{})
 	}
 	// The -harness and HarnessBackends names are static entries, so ReserveStaticHarnessNames
 	// reserves them along with the built-in ones.

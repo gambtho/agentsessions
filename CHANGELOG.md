@@ -9,6 +9,12 @@ not provide.
 
 ### Added
 
+- `agentsessionsd -model-bindings` loads versioned, per-harness provider/policy configuration with
+  explicit Chat Completions or Responses selection, full endpoints, defaults and allowed IDs.
+  Typed host-only credential references use `env` by default; `WithCredentialSource` lets repository
+  hosts supply per-attempt identity tokens without keys or an identity SDK in the daemon. Source and
+  bound provider failure payloads are discarded before API, journal or log delivery. Bound static,
+  registered and extra-backend routes share the same selection; legacy global flags are unchanged.
 - Go embedders can configure `placement.WithModelPolicy(api.ModelPolicy{Default, Allowed})` per
   harness route. New sessions validate `Session.model` at creation (`INVALID_ARGUMENT`) and pass its
   effective default through `Start.Model` and `ExecutionStart.model`. Every new service-created
@@ -17,10 +23,10 @@ not provide.
   `Descriptor.Models` is a subset, never infers its default, and fails closed on a bounded Describe
   failure. Per-call overrides are allowed within policy. An invalid live model request is
   execution-fatal even if caught: no provider call or `MODEL_CALL`, later effects refused,
-  best-effort `ERROR` and no `END`. Daemon binding configuration is not included.
+  best-effort `ERROR` and no `END`.
 - `model/openai.NewResponses` adds an explicit stateless Responses client with function tools,
   opaque encrypted reasoning retention, usage, and text streaming. Existing Chat Completions,
-  daemon/CLI selection, neutral request hashes and journal schemas remain unchanged. Unsupported
+  legacy daemon/CLI model flags, neutral request hashes and journal schemas remain unchanged. Unsupported
   content and controls refuse rather than being dropped. Assistant text history uses `output_text`;
   system/user text uses `input_text`. Model-call diagnostics retain categories, HTTP status and bounded
   provider `error.code`/`error.param` identifiers, not messages or transport URLs/details; see
@@ -55,12 +61,18 @@ not provide.
 
 ### Compatibility
 
+- A session created with model policy cannot shed admission by losing its binding after restart
+  or selecting an unconfigured override. A served route without policy refuses Exec/Resume with
+  `FAILED_PRECONDITION` before compute or journal effects, using the recorded route for recovery.
+  Entirely unserved routes keep existing routing errors. Legacy sessions and unaffected routes
+  retain existing behavior; replay/read, Suspend and Fork remain available. This adds no schema or
+  wire fields. Current binding settings govern new live work, never historical journal contents.
 - SQLite schema v6 adds host-owned model-admission flags: creation-time policy opt-in and an
   independent birth marker for all new sessions, even on unconfigured routes. Genuine pre-policy
   sessions, including zero-event sessions, remain legacy; fork inherits both flags atomically. Existing journal bytes,
   hashes and `ModelCall` format are unchanged. Replay/resume restore the recorded effective default;
   recorded results ignore today's allowlist, while new live effects and unanswered model-intent
-  re-drives check current policy when configured. No policy keeps existing model behavior. Before
+  re-drives check current policy. An unconfigured selected route keeps existing model behavior. Before
   upgrading, stop every older host and embedded CLI writer and back up for rollback, following the
   [rollout order](#sqlite-v4-rollout). Older builds refuse v6 at open, but already-open older writers
   do not enforce model policy. There is no downgrade migration. Policy-enabled remote registration
