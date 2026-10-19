@@ -895,8 +895,10 @@ invokes no harness and stays a no-op without one.
   `FAILED_PRECONDITION`; for a `STATELESS_REPLAY` harness the service reports `INTERNAL` (§13.4). A
   failed `Exec` does not imply that case: when `Create` succeeded and the dial or turn failed, or
   `CreateActor` succeeded and `Create`'s `ResumeActor` failed, the actor remains, since the host
-  calls no `Stop` (`RT-7`), and a later `Suspend` or `Resume` reaches it. `agentsessionsd` itself
-  does not build substrate placements (`REG-2a`).
+  calls no `Stop` (`RT-7`), and a later `Suspend` or `Resume` reaches it. The neutral
+  `agentsessionsd` builds no substrate placement. Its substrate build
+  (`integrations/substrate/cmd/agentsessionsd`) serves one static `-substrate-harness`; neither
+  build accepts a registered `substrate` placement (`REG-2a`).
 - TODO(spike): Should a repeated `Suspend`, or `Resume` without a prior `Suspend`, be refused or be
   a no-op? Current behavior appends a marker each time the backend call succeeds, and no test pins
   it.
@@ -1316,7 +1318,8 @@ address, never on the Sessions listener.
   `INVALID_ARGUMENT`.
 - `REG-2a`: Which placements a host can instantiate is host-defined. A valid spec whose placement
   this host cannot build is `FAILED_PRECONDITION`, with nothing stored. The reference
-  `agentsessionsd` builds `remote` placements and refuses `substrate` this way.
+  `agentsessionsd` builds `remote` placements and refuses `substrate` this way, in its substrate
+  build too, which serves substrate harnesses only from `-substrate-harness`.
 - `REG-3`: `RegisterHarness` is idempotent on `spec_digest` (§7.5): the same spec returns unchanged
   (or reactivated if retired, keeping the uid); a different spec under a taken name is
   `ALREADY_EXISTS`.
@@ -1401,11 +1404,18 @@ The reference implementation protects the integrity of the record, not access to
   Invalid identities/expiry or verifier errors return generic `UNAUTHENTICATED`, never an
   anonymous fallback. Only the interceptors install the private context read by `authn.Caller`.
 - Unary calls authenticate once at admission. Credential expiry does not add a handler deadline,
-  end the call, or remove its verified caller; caller cancellation/deadlines still apply.
+  end the call, or remove its verified caller; caller cancellation/deadlines still apply, but the
+  interceptor preserves the handler's returned result and status.
   Only authenticated stream contexts end at the earlier caller deadline or credential expiry. Expiry
   returns `UNAUTHENTICATED`; caller cancellation/deadlines retain their status codes. Cancellation
   is cooperative: no in-stream refresh, interruption of transport I/O already in progress, or undo
-  of in-flight effects is promised. Authentication alone is not isolation: these interceptors
+  of in-flight effects is promised. If expiry interrupts a running `Exec` harness and it returns an
+  error, the controller journals a best-effort `ERROR`, unless stopped after an approval intent.
+  Retrying `Exec` with inputs and a fresh credential starts a new turn, rather than automatically
+  continuing the interrupted one; pending approvals still follow `OPS-14`. An `ERROR` does not
+  prevent later `Resume` recovery (`EXE-6`). Expiry before the harness runs need not journal an
+  `ERROR`. Verification runs once per RPC, so revocation before `ValidUntil` is not noticed by an
+  admitted unary call or an open stream. Authentication alone is not isolation: these interceptors
   provide neither per-RPC authorization nor TLS, and the daemon has no required-mode switch.
 - Custom Go hosts can opt into `session.WithAuthorization(api.Authorizer)` on `NewService` and
   `session.WithRegistryAuthorization(api.Authorizer)` on `NewHarnessRegistry`. Missing verified
